@@ -29,6 +29,7 @@ from typing import Optional
 
 from config import settings
 from core.agent import agent
+from core.guards import guard_runner
 from core.market_data import MarketData
 from core.regime_detector import regime_detector
 from database import queries as db_queries
@@ -161,6 +162,11 @@ class CryptoBot:
         self._position_mgr = position_mgr if position_mgr is not None \
             else PositionManager(self._market_data)
         self._router = router if router is not None else OrderRouter()
+
+        # Sentiment aggregator — deferred import keeps the constructor light
+        # and avoids any circular-import risk during early boot.
+        from sentiment import sentiment as sentiment_singleton
+        self._sentiment = sentiment_singleton
 
         # Circuit breaker — authoritative for cycle decisions
         self._cb_state = CircuitBreakerState()
@@ -434,6 +440,17 @@ class CryptoBot:
             try:
                 scores = await self._fetch_sentiment()
                 self._signal_engine.update_sentiment(scores)
+
+                # Feed the latest BTC price into BTCGuard's rolling history,
+                # then forward its 30-minute % change to the sentiment
+                # aggregator so its dump guard has live data.
+                btc_price = self._price_for_pair("BTC/USDT")
+                if btc_price is not None:
+                    guard_runner.btc_guard.update_price(btc_price)
+                    pct = guard_runner.btc_guard.change_pct_30m()
+                    if pct is not None:
+                        self._sentiment.set_btc_change_30m(pct)
+
                 # TODO: recompute equity from market_data + open positions
                 #       and feed self._cb_state.current_equity so drawdown stays accurate.
             except Exception as e:

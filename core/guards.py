@@ -72,6 +72,20 @@ class BTCGuard:
     def is_triggered(self) -> bool:
         return self._triggered
 
+    def change_pct_30m(self) -> Optional[float]:
+        """Return the % change between the oldest and newest price within
+        the BTC_CRASH_WINDOW. None if we have fewer than 2 samples.
+
+        Sentiment aggregator consumes this for its 30-min dump guard.
+        """
+        if len(self._price_history) < 2:
+            return None
+        oldest_price = self._price_history[0][1]
+        latest_price = self._price_history[-1][1]
+        if oldest_price == 0:
+            return None
+        return (latest_price - oldest_price) / oldest_price * 100
+
     def status(self) -> str:
         if self._triggered:
             elapsed = (time.time() - (self._trigger_time or 0)) / 60
