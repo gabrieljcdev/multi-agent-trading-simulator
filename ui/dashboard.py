@@ -962,11 +962,11 @@ class Dashboard:
             return 0
 
     def _signals_skipped_count(self) -> int:
-        # No direct query exists yet; the Signal table has user_action='skip'
-        # rows but get_signal_history filters to 'go'. Show 0 until a query
-        # is added.
-        # TODO: queries.get_today_skipped_signals()
-        return 0
+        try:
+            from database import queries as q
+            return len(q.get_today_skipped_signals())
+        except Exception:
+            return 0
 
     def _last_signal_time(self) -> str:
         if self._signal_buffer:
@@ -974,33 +974,32 @@ class Dashboard:
         return "—"
 
     def _peek_pending(self) -> Optional[dict]:
-        """Best-effort peek at the bot's pending-signals queue.
+        """Render-friendly view of the next pending signal, or None if empty.
 
-        asyncio.Queue has no public peek; its underlying deque lives at
-        `_queue`. Falls back to None gracefully if that internal changes.
+        Calls bot.peek_pending() — the bot owns the queue-internal access.
+        Falls back to None on missing method (e.g. test stub) or any error.
         """
-        q = getattr(self._bot, "_pending_signals", None)
-        if q is None:
+        peek = getattr(self._bot, "peek_pending", None)
+        if not callable(peek):
             return None
         try:
-            inner = getattr(q, "_queue", None)
-            if not inner:
-                return None
-            sig = inner[0]
-            return {
-                "pair":      getattr(sig, "pair", "?"),
-                "direction": getattr(sig, "direction", "?"),
-                "score":     float(getattr(sig, "score", 0) or 0),
-                "track":     getattr(sig, "signal_type", "?"),
-                "regime":    "?",
-                "entry":     getattr(sig, "suggested_entry", "—"),
-                "sl":        getattr(sig, "suggested_sl", "—"),
-                "tp":        getattr(sig, "suggested_tp", "—"),
-                "rr":        getattr(sig, "risk_reward", "—"),
-                "reasoning": getattr(sig, "claude_reasoning", "") or "",
-            }
+            sig = peek()
         except Exception:
             return None
+        if sig is None:
+            return None
+        return {
+            "pair":      getattr(sig, "pair", "?"),
+            "direction": getattr(sig, "direction", "?"),
+            "score":     float(getattr(sig, "score", 0) or 0),
+            "track":     getattr(sig, "signal_type", "?"),
+            "regime":    "?",
+            "entry":     getattr(sig, "suggested_entry", "—"),
+            "sl":        getattr(sig, "suggested_sl", "—"),
+            "tp":        getattr(sig, "suggested_tp", "—"),
+            "rr":        getattr(sig, "risk_reward", "—"),
+            "reasoning": getattr(sig, "claude_reasoning", "") or "",
+        }
 
     def _current_session(self, utc: datetime) -> str:
         h = utc.hour

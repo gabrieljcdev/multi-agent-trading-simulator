@@ -236,6 +236,26 @@ class CryptoBot:
         logger.info(f"Trading window approved — {duration}m until {self._window_until.isoformat()}")
         return self._window_until
 
+    def peek_pending(self):
+        """Return the next pending signal without removing it. None if empty.
+
+        Encapsulates the asyncio.Queue internal-deque access so callers
+        (dashboard, future UI prompt loop) don't reach into private state.
+        """
+        q = self._pending_signals
+        if q is None or q.empty():
+            return None
+        # asyncio.Queue has no public peek; its FIFO is backed by collections.deque
+        # at the `_queue` attribute on CPython. Falls back to None if internals
+        # change in a future runtime.
+        inner = getattr(q, "_queue", None)
+        if inner is None or len(inner) == 0:
+            return None
+        try:
+            return inner[0]
+        except Exception:
+            return None
+
     def record_trade_result(self, pnl_pct: float):
         """Update circuit-breaker state from a closed trade's return.
 

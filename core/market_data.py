@@ -5,6 +5,7 @@ Exchange connections, WebSocket streaming, and candle management.
 import asyncio
 import logging
 import os
+import time
 import pandas as pd
 import ta
 import ccxt.async_support as ccxt
@@ -56,13 +57,30 @@ def _compute_indicators(df):
     return df
 
 class MarketData:
-    def __init__(self):
+    def __init__(self, dashboard=None):
         self._exchanges:   dict = {}
         self._candles:     dict = {}
         self._last_price:  dict = {}
         self._callbacks:   list = []
         self._active_pairs: list = []
         self._running = False
+        # Optional Dashboard reference; main.py wires this via set_dashboard
+        # AFTER bot construction (Dashboard needs the bot, bot owns market_data).
+        self._dashboard = dashboard
+
+    def set_dashboard(self, dashboard) -> None:
+        """Late-bind the dashboard so health updates flow once it exists."""
+        self._dashboard = dashboard
+
+    def _report_health(self, exchange: str, latency_ms: float, connected: bool) -> None:
+        """Safely push a health update — a broken dashboard must never break streaming."""
+        dash = self._dashboard
+        if dash is None:
+            return
+        try:
+            dash.update_exchange_health(exchange, latency_ms, connected)
+        except Exception as e:
+            logger.debug(f"dashboard health update failed: {e}")
 
     def on_candle_close(self, fn):
         self._callbacks.append(fn)
@@ -179,16 +197,27 @@ class MarketData:
             try:
                 for pair in self._active_pairs[:20]:
                     for tf in settings.TIMEFRAMES:
+                        t0 = time.perf_counter()
                         try:
-                            ohlcv = await asyncio.wait_for(ex.watch_ohlcv(pair, tf), timeout=10.0)
+                            ohlcv = await asyncio.wait_for(
+                                ex.watch_ohlcv(pair, tf), timeout=10.0)
+                            latency_ms = (time.perf_counter() - t0) * 1000.0
                             if ohlcv:
                                 await self._process_candle(exchange_name, pair, tf, ohlcv[-1])
+                            # Successful tick (or empty payload) — exchange is reachable
+                            self._report_health(exchange_name, latency_ms, connected=True)
                         except asyncio.TimeoutError:
-                            pass
+                            self._report_health(exchange_name,
+                                                (time.perf_counter() - t0) * 1000.0,
+                                                connected=False)
                         except Exception as e:
                             logger.debug(f"Stream {exchange_name} {pair} {tf}: {e}")
+                            self._report_health(exchange_name,
+                                                (time.perf_counter() - t0) * 1000.0,
+                                                connected=False)
             except Exception as e:
                 logger.warning(f"Stream error {exchange_name}: {e}")
+                self._report_health(exchange_name, 0.0, connected=False)
                 await asyncio.sleep(5)
 
     async def _process_candle(self, exchange_name, pair, tf, raw):

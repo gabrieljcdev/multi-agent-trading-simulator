@@ -29,12 +29,13 @@ from utils.logger import setup_logging
 
 
 @click.command()
-@click.option("--profile",  default=None, help="Risk profile: conservative | balanced | aggressive | custom")
-@click.option("--strategy", default=None, help="Strategy: default | arb_only | scalper | custom")
-@click.option("--sim",      is_flag=True, help="Force simulation mode")
-@click.option("--live",     is_flag=True, help="Force live trading mode")
-@click.option("--debug",    is_flag=True, help="Enable debug logging")
-def main(profile, strategy, sim, live, debug):
+@click.option("--profile",   default=None, help="Risk profile: conservative | balanced | aggressive | custom")
+@click.option("--strategy",  default=None, help="Strategy: default | arb_only | scalper | custom")
+@click.option("--sim",       is_flag=True, help="Force simulation mode")
+@click.option("--live",      is_flag=True, help="Force live trading mode")
+@click.option("--debug",     is_flag=True, help="Enable debug logging")
+@click.option("--dashboard", is_flag=True, help="Run the Rich terminal dashboard alongside the bot")
+def main(profile, strategy, sim, live, debug, dashboard):
     """CryptoBot — Claude-powered situational trading assistant."""
 
     # Logging
@@ -63,10 +64,11 @@ def main(profile, strategy, sim, live, debug):
     logger.info(f"  Mode:     {'SIM' if settings.SIM_MODE else 'LIVE'}")
     logger.info(f"  Profile:  {active_profile_name}")
     logger.info(f"  Strategy: {active_strategy_name}")
+    logger.info(f"  Dashboard: {'on' if dashboard else 'off'}")
 
     # Boot the async event loop
     try:
-        asyncio.run(_run(active_profile, active_strategy))
+        asyncio.run(_run(active_profile, active_strategy, dashboard))
     except KeyboardInterrupt:
         logger.info("Shutting down (Ctrl+C)")
     except Exception as e:
@@ -74,14 +76,26 @@ def main(profile, strategy, sim, live, debug):
         sys.exit(1)
 
 
-async def _run(profile, strategy):
+async def _run(profile, strategy, dashboard: bool):
     """Async main — imports are deferred here to keep startup fast."""
     from core.bot import CryptoBot
 
     kill_switch = KillSwitch(sim_mode=settings.SIM_MODE)
     bot = CryptoBot(profile=profile, strategy=strategy, kill_switch=kill_switch)
 
-    await bot.start()
+    if not dashboard:
+        await bot.start()
+        return
+
+    # Dashboard wiring: dashboard needs the bot; market_data (created inside
+    # bot) needs the dashboard for health updates. Construct in that order
+    # and late-bind via set_dashboard().
+    from ui.dashboard import Dashboard
+    dash = Dashboard(bot)
+    if hasattr(bot._market_data, "set_dashboard"):
+        bot._market_data.set_dashboard(dash)
+
+    await asyncio.gather(bot.start(), dash.run(), return_exceptions=True)
 
 
 if __name__ == "__main__":

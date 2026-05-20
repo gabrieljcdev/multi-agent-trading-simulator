@@ -93,6 +93,25 @@ def _make_signal():
 
 
 # ─────────────────────────────────────────────────────────────────────────
+# peek_pending()
+# ─────────────────────────────────────────────────────────────────────────
+
+def test_peek_pending_returns_none_when_empty():
+    bot = _make_bot()
+    assert bot.peek_pending() is None
+
+
+def test_peek_pending_returns_front_without_consuming():
+    bot = _make_bot()
+    sig = _make_signal()
+    bot._pending_signals.put_nowait(sig)
+    # Peek twice — must not drain the queue
+    assert bot.peek_pending() is sig
+    assert bot.peek_pending() is sig
+    assert bot._pending_signals.qsize() == 1
+
+
+# ─────────────────────────────────────────────────────────────────────────
 # CircuitBreakerState unit tests
 # ─────────────────────────────────────────────────────────────────────────
 

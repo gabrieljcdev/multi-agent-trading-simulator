@@ -124,6 +124,23 @@ def get_signals_needing_price_update(hours: int = 24) -> list:
         )
 
 
+def get_today_skipped_signals() -> list:
+    """Return Signal rows with user_action='skip' from today (UTC).
+
+    Signal uses `timestamp` (not created_at). The dashboard's STATUS panel
+    reads len() of this list for its skipped-signals counter.
+    """
+    today_utc = datetime.utcnow().date()
+    with get_session() as s:
+        return (
+            s.query(Signal)
+            .filter(Signal.user_action == "skip",
+                    func.date(Signal.timestamp) == today_utc)
+            .order_by(desc(Signal.timestamp))
+            .all()
+        )
+
+
 def get_signal_history(days: int = 30, signal_type: str = None):
     with get_session() as s:
         q = s.query(Signal).filter(

@@ -56,11 +56,20 @@ def _mock_bot() -> SimpleNamespace:
 
     pending = asyncio.Queue()
 
+    # Mirror CryptoBot.peek_pending() — dashboard calls this instead of
+    # reaching into the asyncio.Queue internals directly.
+    def _peek():
+        inner = getattr(pending, "_queue", None)
+        if not inner:
+            return None
+        return inner[0] if len(inner) > 0 else None
+
     return SimpleNamespace(
         _cb_state=cb_state,
         _sentiment=sentiment,
         _market_data=market,
         _pending_signals=pending,
+        peek_pending=_peek,
         _profile=SimpleNamespace(name="balanced"),
         _strategy=SimpleNamespace(name="default"),
     )
@@ -75,10 +84,12 @@ def _patch_db_queries(monkeypatch):
     fake_q.get_open_trades.return_value = []
     fake_q.get_recent_closed_trades.return_value = []
     fake_q.get_signal_win_rate.return_value = {"total": 0, "win_rate": 0.0}
+    fake_q.get_today_skipped_signals.return_value = []
     monkeypatch.setattr("database.queries.get_today_trades", fake_q.get_today_trades)
     monkeypatch.setattr("database.queries.get_open_trades", fake_q.get_open_trades)
     monkeypatch.setattr("database.queries.get_recent_closed_trades", fake_q.get_recent_closed_trades)
     monkeypatch.setattr("database.queries.get_signal_win_rate", fake_q.get_signal_win_rate)
+    monkeypatch.setattr("database.queries.get_today_skipped_signals", fake_q.get_today_skipped_signals)
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -211,6 +222,24 @@ def test_session_classification():
     assert dash._current_session(datetime(2026, 5, 20, 14, 0)) == "NEW_YORK"
     assert dash._current_session(datetime(2026, 5, 20, 2, 0))  == "ASIA"
     assert dash._current_session(datetime(2026, 5, 20, 22, 0)) == "OFF_HOURS"
+
+
+def test_signals_skipped_count_uses_new_query(monkeypatch):
+    """_signals_skipped_count() calls queries.get_today_skipped_signals
+    and reports its length."""
+    fake = [object(), object(), object()]  # three skipped signal stubs
+    monkeypatch.setattr(
+        "database.queries.get_today_skipped_signals",
+        lambda: fake,
+    )
+    dash = Dashboard(_mock_bot())
+    assert dash._signals_skipped_count() == 3
+
+
+def test_query_module_exports_get_today_skipped_signals():
+    """The query is importable and callable. Smoke test only — doesn't hit DB."""
+    from database import queries
+    assert callable(queries.get_today_skipped_signals)
 
 
 def test_duration_format():
