@@ -1,0 +1,17 @@
+{
+  "name": "custom",
+  "description": "Edit this file to define your own risk parameters.",
+  "max_position_size_pct": 0.03,
+  "max_open_positions": 3,
+  "signal_score_threshold": 65,
+  "require_multi_tf": true,
+  "default_stop_loss_pct": 0.01,
+  "default_take_profit_pct": 0.02,
+  "daily_loss_limit_pct": 0.02,
+  "consecutive_loss_limit": 3,
+  "preferred_strategy": "default",
+  "arb_priority": false,
+  "sentiment_boost_amount": 15,
+  "sentiment_suppress_amount": 20,
+  "claude_temperature": 0.2
+}

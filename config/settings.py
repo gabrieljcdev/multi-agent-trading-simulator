@@ -1,0 +1,465 @@
+"""
+config/settings.py
+
+Every parameter the bot uses lives here.
+Nothing is hardcoded anywhere else — this is the single tuning instrument.
+
+During sim, change freely and restart to test different configurations.
+The goal is to find YOUR optimal settings through data, not guesswork upfront.
+
+APPROVAL MODES
+--------------
+  per_trade   — you approve every individual signal before execution
+  window      — you approve a session brief; Claude trades freely within it
+  autonomous  — Claude runs freely within hard safety limits; no approval needed
+
+Start with per_trade to understand signal quality, then graduate to window
+or autonomous once you trust the signal engine.
+"""
+
+from pathlib import Path
+
+# ── Paths ──────────────────────────────────────────────────────────────────────
+BASE_DIR = Path(__file__).parent.parent
+DATA_DIR = BASE_DIR / "data"
+LOGS_DIR = BASE_DIR / "logs"
+DB_PATH  = DATA_DIR / "cryptobot.db"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CORE MODE
+# ══════════════════════════════════════════════════════════════════════════════
+
+SIM_MODE        = True          # True = paper trading. False = real money.
+ACTIVE_PROFILE  = "balanced"    # conservative | balanced | aggressive | custom
+ACTIVE_STRATEGY = "default"     # default | arb_only | scalper | custom
+
+# How much autonomy Claude has
+# per_trade | window | autonomous
+APPROVAL_MODE = "per_trade"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# APPROVAL MODE SETTINGS
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── Per-trade mode ─────────────────────────────────────────────────────────
+PER_TRADE_SHOW_FULL_REASONING  = True   # Full brief or summary only
+PER_TRADE_AUTO_EXPIRE_SECONDS  = 600    # Signal auto-skips if you don't respond
+
+# ── Window mode ────────────────────────────────────────────────────────────
+# Claude presents a session analysis; you approve; Claude trades freely inside it
+WINDOW_BRIEF_INCLUDES = [
+    "regime", "sentiment", "recommended_pairs",
+    "recommended_strategies", "risk_level",
+    "expected_trade_count", "market_conditions", "news_events",
+]
+WINDOW_DEFAULT_DURATION_MINUTES  = 120   # How long an approved window lasts
+WINDOW_MIN_DURATION_MINUTES      = 15
+WINDOW_MAX_DURATION_MINUTES      = 480   # 8 hours max
+WINDOW_AUTO_RENEW                = False  # Ask to renew when window expires
+WINDOW_PAUSE_ON_CIRCUIT_BREAKER  = True
+WINDOW_MAX_TRADES_PER_HOUR       = 6     # Hard cap within window (0 = unlimited)
+WINDOW_REAPPROVE_ON_REGIME_SHIFT = True  # Re-present brief if regime changes significantly
+
+# ── Autonomous mode ────────────────────────────────────────────────────────
+# No approval required. Claude runs within safety limits only.
+AUTO_MAX_TRADES_PER_HOUR   = 4      # 0 = unlimited
+AUTO_MAX_TRADES_PER_DAY    = 20     # 0 = unlimited
+AUTO_NOTIFY_ON_ENTRY       = True   # Terminal notification on every entry
+AUTO_NOTIFY_ON_EXIT        = True   # Terminal notification on every exit
+AUTO_PAUSE_ON_LOSS_STREAK  = 3      # Alert + pause after N consecutive losses (0 = never)
+AUTO_SUMMARY_INTERVAL_MIN  = 60     # Rolling summary every N minutes (0 = off)
+
+# ── Session floor (window + autonomous) ───────────────────────────────────
+# Claude won't open a window or start autonomous trading unless these pass.
+# Set any to None to disable that check.
+SESSION_MIN_SENTIMENT_SCORE  = 40   # Minimum composite sentiment score
+SESSION_BLOCK_CHOPPY_REGIME  = True
+SESSION_BLOCK_EXTREME_FEAR   = True   # Block if F&G < 15
+SESSION_BLOCK_EXTREME_GREED  = False  # Optionally block if F&G > 88
+SESSION_REQUIRE_CLEAR_NEWS   = True
+SESSION_MIN_ACTIVE_PAIRS     = 2      # Need at least N viable pairs
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CAPITAL
+# ══════════════════════════════════════════════════════════════════════════════
+
+EXCHANGE_BALANCES = {
+    "binance": 100.0,
+    "kraken":  100.0,
+    "bybit":   100.0,
+    "kucoin":  100.0,
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# EXCHANGES
+# ══════════════════════════════════════════════════════════════════════════════
+
+ENABLED_EXCHANGES  = ["binance", "kraken", "bybit", "kucoin"]
+MIN_LIQUIDITY_USD  = 50_000     # Minimum order book depth to trade a pair
+ORDER_BOOK_DEPTH   = 10         # Levels to stream per side for OFI
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PAIR UNIVERSE
+# ══════════════════════════════════════════════════════════════════════════════
+
+PAIR_UNIVERSE        = "auto"   # "auto" = top N by volume | "manual" = list below
+PAIR_UNIVERSE_TOP_N  = 50
+PAIR_MIN_MARKET_CAP  = "large"  # large | mid | all
+
+FALLBACK_PAIRS = [
+    "BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT",
+    "XRP/USDT", "ADA/USDT", "AVAX/USDT", "DOT/USDT",
+    "MATIC/USDT", "LINK/USDT", "UNI/USDT", "ATOM/USDT",
+    "LTC/USDT", "NEAR/USDT", "FIL/USDT", "APT/USDT",
+]
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TIMEFRAMES
+# ══════════════════════════════════════════════════════════════════════════════
+
+TIMEFRAMES      = ["5m", "15m", "1h"]
+FAST_TIMEFRAME  = "5m"
+MID_TIMEFRAME   = "15m"
+SLOW_TIMEFRAME  = "1h"
+CANDLE_LOOKBACK = {"5m": 200, "15m": 200, "1h": 200}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SIGNAL QUALITY GATE
+# ══════════════════════════════════════════════════════════════════════════════
+
+SIGNAL_SCORE_THRESHOLD    = 65   # Minimum score to pass gate     test range: 50–80
+MAX_ACTIVE_SIGNALS        = 3    # Max signals surfaced at once    test range: 1–5
+SIGNAL_EXPIRY_MINUTES     = 10   # Signal expires if not acted on  test range: 5–20
+REQUIRE_MULTI_TF_CONFIRM  = True
+MIN_TF_CONFIRMATIONS      = 2    # TFs that must agree (1, 2, or 3)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# REGIME DETECTION
+# ══════════════════════════════════════════════════════════════════════════════
+
+ADX_TRENDING_MIN   = 25    # test: 20–30
+ADX_STRONG_TREND   = 40    # test: 35–45
+ADX_RANGING_MAX    = 20    # test: 18–25
+ADX_CHOPPY_MAX     = 15    # test: 12–18
+ADX_GRID_MIN       = 15
+ADX_GRID_MAX       = 25
+ADX_GRID_RESET     = 30    # Dynamic grid resets when ADX crosses this
+
+HURST_TRENDING_MIN   = 0.55   # test: 0.52–0.62
+HURST_REVERTING_MAX  = 0.48   # test: 0.42–0.50
+HURST_LOOKBACK_BARS  = 200    # test: 100–300
+HURST_RANDOM_ZONE    = 0.04
+
+ATR_HIGH_VOL_PERCENTILE  = 90   # test: 80–95
+ATR_LOW_VOL_PERCENTILE   = 20
+ATR_PERCENTILE_LOOKBACK  = 100
+
+BB_WIDTH_EXPANDING_FACTOR = 1.3  # test: 1.2–1.5
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ORDER FLOW IMBALANCE (OFI)
+# ══════════════════════════════════════════════════════════════════════════════
+
+OFI_LEVELS             = 5      # Order book levels in OFI calc   test: 3–10
+OFI_EMA_PERIOD         = 20     # Smoothing window                test: 10–30
+OFI_BULLISH_THRESHOLD  = 0.65   # test: 0.60–0.72
+OFI_BEARISH_THRESHOLD  = 0.35   # test: 0.28–0.40
+OFI_BOOST_AMOUNT       = 10     # Score boost when OFI confirms   test: 5–15
+OFI_PENALTY_AMOUNT     = 15     # Score penalty when contradicts  test: 10–20
+VPIN_HIGH_THRESHOLD    = 0.75   # test: 0.65–0.85
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TECHNICAL INDICATORS
+# ══════════════════════════════════════════════════════════════════════════════
+
+RSI_PERIOD            = 14      # test: 9–21
+RSI_MOMENTUM_MIN      = 40      # test: 35–50
+RSI_MOMENTUM_MAX      = 70      # test: 65–75
+RSI_OVERBOUGHT        = 70
+RSI_OVERSOLD          = 30
+
+MACD_FAST             = 12
+MACD_SLOW             = 26
+MACD_SIGNAL           = 9
+
+BB_PERIOD             = 20
+BB_STDDEV             = 2.0     # test: 1.8–2.5
+BB_REVERSION_ENTRY    = 2.0     # σ outside band to trigger reversion
+
+EMA_FAST              = 9
+EMA_SLOW              = 21
+EMA_TREND             = 50
+
+VOLUME_SURGE_MULTIPLIER = 2.0   # test: 1.5–3.0
+VWAP_STRETCH_PCT        = 0.8   # test: 0.5–1.2
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ARBITRAGE
+# ══════════════════════════════════════════════════════════════════════════════
+
+ARB_MIN_GAP_PCT          = 0.35  # test: 0.25–0.50
+ARB_FEE_ESTIMATE_PCT     = 0.20
+ARB_MAX_TRANSFER_SECONDS = 60
+ARB_MIN_LIQUIDITY_MULT   = 2.0
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MOMENTUM SIGNAL (TRACK B)
+# ══════════════════════════════════════════════════════════════════════════════
+
+MOMENTUM_MIN_VOLUME_RATIO   = 2.0   # test: 1.5–3.0
+MOMENTUM_REQUIRE_LARGE_CAP  = True  # Academic finding: only reliable on large caps
+MOMENTUM_REQUIRE_HURST      = True
+MOMENTUM_REQUIRE_OFI        = False  # Stricter — enable once confident
+MOMENTUM_MIN_ADX            = 22    # test: 18–30
+MOMENTUM_BREAKOUT_LOOKBACK  = 20    # test: 10–30
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MEAN REVERSION SIGNAL (TRACK C)
+# ══════════════════════════════════════════════════════════════════════════════
+
+REVERSION_BB_THRESHOLD        = 2.0   # test: 1.5–2.5
+REVERSION_REQUIRE_DIVERGENCE  = True
+REVERSION_REQUIRE_HURST       = True
+REVERSION_MAX_ADX             = 22    # test: 18–28
+REVERSION_VWAP_CONFIRM        = True
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LIQUIDITY SWEEP (TRACK D)
+# ══════════════════════════════════════════════════════════════════════════════
+
+SWEEP_MIN_WICK_PCT        = 0.5   # test: 0.3–0.8
+SWEEP_OFI_FLIP_REQUIRED   = True
+SWEEP_VOLUME_SPIKE_MULT   = 2.5   # test: 2.0–3.5
+SWEEP_REVERSAL_CANDLES    = 3     # test: 2–5
+SWEEP_KEY_LEVEL_LOOKBACK  = 50    # test: 30–100
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DYNAMIC GRID
+# ══════════════════════════════════════════════════════════════════════════════
+
+GRID_ENABLED            = True
+GRID_SPACING_PCT        = 0.5    # test: 0.3–1.0
+GRID_LEVELS_EACH_SIDE   = 5      # test: 3–8
+GRID_ORDER_SIZE_PCT     = 0.5    # Portfolio % per level
+GRID_AUTO_RESET         = True
+GRID_RESET_COOLDOWN_MIN = 30
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SENTIMENT
+# ══════════════════════════════════════════════════════════════════════════════
+
+SENTIMENT_ENABLED                 = True
+SENTIMENT_UPDATE_INTERVAL_SECONDS = 300
+SENTIMENT_LOOKBACK_HOURS          = 4
+
+SENTIMENT_WEIGHTS = {
+    "reddit":        0.30,
+    "telegram":      0.20,
+    "news":          0.20,
+    "fear_greed":    0.15,
+    "google_trends": 0.15,
+}
+
+SENTIMENT_BOOST_THRESHOLD  = 70   # test: 60–80
+SENTIMENT_BLOCK_THRESHOLD  = 30   # test: 20–40
+SENTIMENT_BOOST_AMOUNT     = 15   # test: 5–20
+SENTIMENT_SUPPRESS_AMOUNT  = 20   # test: 10–25
+SENTIMENT_VELOCITY_WINDOW  = 2    # Hours
+SENTIMENT_VELOCITY_BOOST   = True
+
+REDDIT_SUBREDDITS  = [
+    "cryptocurrency", "bitcoin", "ethtrader",
+    "altcoin", "CryptoMarkets", "solana",
+]
+REDDIT_POST_LIMIT  = 100
+
+TELEGRAM_CHANNELS  = [
+    "crypto_news_channel", "bitcoin_signals", "altcoin_alerts",
+]
+
+NEWS_FEEDS = [
+    "https://www.coindesk.com/arc/outboundfeeds/rss/",
+    "https://cointelegraph.com/rss",
+    "https://decrypt.co/feed",
+]
+
+# ══════════════════════════════════════════════════════════════════════════════
+# NEWS GUARD
+# ══════════════════════════════════════════════════════════════════════════════
+
+NEWS_GUARD_ENABLED          = True
+NEWS_GUARD_LOOKBACK_MINUTES = 60
+
+NEWS_GUARD_BLOCK_KEYWORDS = [
+    "hack", "exploit", "breach", "stolen", "rug pull",
+    "SEC", "ban", "shutdown", "bankrupt", "insolvent",
+    "FOMC", "CPI", "rate decision", "fed meeting",
+]
+NEWS_GUARD_WARN_KEYWORDS = [
+    "investigation", "lawsuit", "regulation", "crackdown",
+    "whale", "dump", "selloff", "liquidation cascade",
+]
+NEWS_GUARD_PENALTY_BLOCK = 999   # Effectively blocks signal
+NEWS_GUARD_PENALTY_WARN  = 20
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BTC CORRELATION GUARD
+# ══════════════════════════════════════════════════════════════════════════════
+
+BTC_GUARD_ENABLED        = True
+BTC_CRASH_PCT            = 2.0   # test: 1.5–3.0
+BTC_CRASH_WINDOW_MINUTES = 30    # test: 15–60
+BTC_GUARD_SCORE_PENALTY  = 25    # test: 15–35
+
+# ══════════════════════════════════════════════════════════════════════════════
+# POSITION CORRELATION GUARD
+# ══════════════════════════════════════════════════════════════════════════════
+
+CORR_GUARD_ENABLED    = True
+CORR_HIGH_THRESHOLD   = 0.80   # test: 0.70–0.90
+CORR_PENALTY_AMOUNT   = 15     # test: 10–25
+CORR_BLOCK_THRESHOLD  = 0.95
+CORR_LOOKBACK_HOURS   = 24
+CORR_ARB_EXEMPT       = True
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SESSION TIMING
+# ══════════════════════════════════════════════════════════════════════════════
+
+SESSION_SCORING_ENABLED = True
+
+# All times UTC. Adjust boosts based on what sim data shows.
+SESSION_WINDOWS = {
+    "london_open":  {"start": "07:00", "end": "10:00", "score_boost":  8},
+    "london_ny":    {"start": "13:00", "end": "17:00", "score_boost": 12},
+    "ny_afternoon": {"start": "17:00", "end": "20:00", "score_boost":  4},
+    "asia_open":    {"start": "00:00", "end": "02:00", "score_boost":  2},
+    "dead_zone":    {"start": "02:00", "end": "06:00", "score_boost": -15},
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# RISK MANAGEMENT
+# ══════════════════════════════════════════════════════════════════════════════
+
+MAX_POSITION_SIZE_PCT   = 0.03   # test: 0.01–0.05
+MAX_OPEN_POSITIONS      = 3      # test: 1–5
+DEFAULT_STOP_LOSS_PCT   = 0.01   # test: 0.005–0.02
+DEFAULT_TAKE_PROFIT_PCT = 0.02   # test: 0.01–0.04
+MIN_RISK_REWARD_RATIO   = 1.5    # test: 1.0–2.5
+
+TRAILING_STOP_ENABLED  = False
+TRAILING_STOP_PCT      = 0.008   # test: 0.005–0.015
+TRAILING_STOP_ACTIVATE = 0.01    # Activate after N% profit
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CIRCUIT BREAKERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+CIRCUIT_BREAKERS = {
+    "daily_loss": {
+        "enabled":       True,
+        "threshold_pct": 2.0,    # test: 1.0–4.0
+        "action":        "halt",
+    },
+    "consecutive_loss": {
+        "enabled": True,
+        "count":   3,            # test: 2–5
+        "action":  "pause",
+    },
+    "drawdown": {
+        "enabled":       True,
+        "threshold_pct": 5.0,    # test: 3.0–10.0
+        "action":        "halt",
+    },
+    "rapid_loss": {
+        "enabled":         True,
+        "threshold_pct":   1.5,  # test: 0.5–2.0
+        "window_minutes":  60,
+        "action":          "pause",
+    },
+    "win_rate_floor": {
+        "enabled":       False,  # Enable once you have trade history
+        "min_trades":    10,
+        "threshold_pct": 35.0,   # test: 30–50
+        "action":        "pause",
+    },
+}
+
+CIRCUIT_BREAKER_PAUSE_MINUTES        = 30   # 0 = manual resume only
+CIRCUIT_BREAKER_HALT_REQUIRES_MANUAL = True
+
+# ══════════════════════════════════════════════════════════════════════════════
+# EXECUTION
+# ══════════════════════════════════════════════════════════════════════════════
+
+ORDER_TYPE             = "limit"   # limit | market
+LIMIT_SLIPPAGE_PCT     = 0.05
+ORDER_TIMEOUT_SECONDS  = 30
+ORDER_RETRY_ON_FAIL    = True
+ORDER_RETRY_COUNT      = 2
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CLAUDE AGENT
+# ══════════════════════════════════════════════════════════════════════════════
+
+CLAUDE_MODEL       = "claude-sonnet-4-5"
+CLAUDE_MAX_TOKENS  = 1024
+CLAUDE_TEMPERATURE = 0.2   # test: 0.1–0.4
+
+CLAUDE_CONTEXT = {
+    "include_regime":        True,
+    "include_hurst":         True,
+    "include_ofi":           True,
+    "include_sentiment":     True,
+    "include_session":       True,
+    "include_news_guard":    True,
+    "include_correlation":   True,
+    "include_past_similar":  True,
+    "include_self_review":   True,
+    "past_similar_lookback": 30,
+    "past_similar_count":    5,
+    "self_review_count":     3,
+}
+
+CLAUDE_WINDOW_BRIEF = {
+    "include_regime_all_pairs":    True,
+    "include_strategy_map":        True,
+    "include_sentiment_overview":  True,
+    "include_expected_conditions": True,
+    "include_risk_assessment":     True,
+    "include_recommended_pairs":   True,
+    "max_recommended_pairs":       5,
+}
+
+SELF_REVIEW_ENABLED    = True
+SELF_REVIEW_MAX_TOKENS = 512
+
+CLAUDE_MAX_DAILY_COST_USD = 2.00   # Alert only — does not halt trading
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PREDICTIVE ENGINE (phase 2)
+# ══════════════════════════════════════════════════════════════════════════════
+
+PREDICTIVE_ENABLED              = False
+PREDICTIVE_MIN_TRAINING_TRADES  = 50
+PREDICTIVE_WIN_PROB_THRESHOLD   = 0.55
+PREDICTIVE_RETRAIN_EVERY_N_DAYS = 7
+PREDICTIVE_MODEL_PATH           = DATA_DIR / "model.joblib"
+PREDICTIVE_BOOST_STRONG         = 10
+PREDICTIVE_PENALTY_WEAK         = 15
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LOGGING & UI
+# ══════════════════════════════════════════════════════════════════════════════
+
+LOG_LEVEL    = "INFO"
+LOG_TO_FILE  = True
+LOG_ROTATION = "midnight"
+
+UI_REFRESH_RATE          = 1.0
+UI_MAX_TRADE_LOG_ROWS    = 20
+UI_SHOW_CLAUDE_REASONING = True
+UI_SHOW_REGIME_DETAILS   = True
+UI_SHOW_OFI_BARS         = True
+UI_SHOW_HURST_BARS       = True
+UI_DEFAULT_TAB           = "overview"

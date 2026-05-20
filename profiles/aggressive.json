@@ -1,0 +1,17 @@
+{
+  "name": "aggressive",
+  "description": "Higher risk. 5% per trade. Lower signal threshold. Momentum focus.",
+  "max_position_size_pct": 0.05,
+  "max_open_positions": 4,
+  "signal_score_threshold": 55,
+  "require_multi_tf": false,
+  "default_stop_loss_pct": 0.015,
+  "default_take_profit_pct": 0.03,
+  "daily_loss_limit_pct": 0.035,
+  "consecutive_loss_limit": 4,
+  "preferred_strategy": "scalper",
+  "arb_priority": false,
+  "sentiment_boost_amount": 20,
+  "sentiment_suppress_amount": 15,
+  "claude_temperature": 0.3
+}

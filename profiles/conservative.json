@@ -1,0 +1,17 @@
+{
+  "name": "conservative",
+  "description": "Low risk. Small positions. Arb priority. High signal threshold.",
+  "max_position_size_pct": 0.01,
+  "max_open_positions": 2,
+  "signal_score_threshold": 72,
+  "require_multi_tf": true,
+  "default_stop_loss_pct": 0.008,
+  "default_take_profit_pct": 0.016,
+  "daily_loss_limit_pct": 0.01,
+  "consecutive_loss_limit": 2,
+  "preferred_strategy": "arb_only",
+  "arb_priority": true,
+  "sentiment_boost_amount": 10,
+  "sentiment_suppress_amount": 25,
+  "claude_temperature": 0.1
+}
