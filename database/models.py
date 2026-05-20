@@ -282,6 +282,43 @@ class DailyStats(Base):
     strategy            = Column(String(30))
 
 
+class PortfolioSnapshot(Base):
+    """Aggregated cross-agent state captured every PORTFOLIO_MONITOR_INTERVAL_SEC.
+
+    snapshot_json carries the full stats dict so the analysis dashboard
+    can reconstruct any past portfolio state without joining tables.
+    """
+    __tablename__ = "portfolio_snapshots"
+
+    id                 = Column(Integer, primary_key=True)
+    timestamp          = Column(DateTime, nullable=False, default=datetime.utcnow)
+    total_equity       = Column(Float)
+    total_daily_pnl    = Column(Float)
+    total_exposure_pct = Column(Float)
+    agents_running     = Column(Integer)
+    portfolio_status   = Column(String(20))  # HEALTHY | WARNING | HALTED
+    snapshot_json      = Column(JSON)
+
+    __table_args__ = (
+        Index("ix_portfolio_snapshots_ts", "timestamp"),
+    )
+
+
+class AgentEvent(Base):
+    """Lifecycle event log per agent (STARTED, STOPPED, HALTED, KILLED, ERROR)."""
+    __tablename__ = "agent_events"
+
+    id         = Column(Integer, primary_key=True)
+    timestamp  = Column(DateTime, default=datetime.utcnow)
+    agent_id   = Column(String(30), nullable=False)
+    event_type = Column(String(20))      # STARTED | STOPPED | HALTED | KILLED | ERROR | SKIPPED
+    detail     = Column(Text)
+
+    __table_args__ = (
+        Index("ix_agent_events_lookup", "agent_id", "timestamp"),
+    )
+
+
 class CircuitBreakerLog(Base):
     """Log every time a circuit breaker fires."""
     __tablename__ = "circuit_breaker_log"

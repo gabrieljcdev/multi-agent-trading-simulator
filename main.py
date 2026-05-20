@@ -77,25 +77,34 @@ def main(profile, strategy, sim, live, debug, dashboard):
 
 
 async def _run(profile, strategy, dashboard: bool):
-    """Async main — imports are deferred here to keep startup fast."""
-    from core.bot import CryptoBot
+    """Async main — imports are deferred here to keep startup fast.
 
-    kill_switch = KillSwitch(sim_mode=settings.SIM_MODE)
-    bot = CryptoBot(profile=profile, strategy=strategy, kill_switch=kill_switch)
+    The Coordinator owns every agent (incl. SignalAgent which wraps
+    CryptoBot). Dashboard, if enabled, late-binds to the signal agent's
+    bot via set_dashboard once the agent constructs it.
+
+    `profile` and `strategy` apply to the signal agent only; we set them
+    on settings so SignalAgentWrapper picks them up when it constructs
+    its CryptoBot. (Bypassing the wrapper to inject profile/strategy
+    directly would break agent encapsulation.)
+    """
+    from agents.coordinator import Coordinator
+
+    if profile is not None:
+        settings.ACTIVE_PROFILE = profile.name if hasattr(profile, "name") else profile
+    if strategy is not None:
+        settings.ACTIVE_STRATEGY = strategy.name if hasattr(strategy, "name") else strategy
+
+    coordinator = Coordinator()
 
     if not dashboard:
-        await bot.start()
+        await coordinator.start()
         return
 
-    # Dashboard wiring: dashboard needs the bot; market_data (created inside
-    # bot) needs the dashboard for health updates. Construct in that order
-    # and late-bind via set_dashboard().
     from ui.dashboard import Dashboard
-    dash = Dashboard(bot)
-    if hasattr(bot._market_data, "set_dashboard"):
-        bot._market_data.set_dashboard(dash)
-
-    await asyncio.gather(bot.start(), dash.run(), return_exceptions=True)
+    dash = Dashboard(coordinator=coordinator)
+    coordinator.set_dashboard(dash)
+    await asyncio.gather(coordinator.start(), dash.run(), return_exceptions=True)
 
 
 if __name__ == "__main__":

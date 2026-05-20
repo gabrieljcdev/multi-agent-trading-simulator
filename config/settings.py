@@ -449,6 +449,26 @@ PREDICTIVE_BOOST_STRONG         = 10
 PREDICTIVE_PENALTY_WEAK         = 15
 
 # ══════════════════════════════════════════════════════════════════════════════
+# MULTI-AGENT COORDINATOR
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Per-agent capital allocation (USD). Sum should not exceed total
+# EXCHANGE_BALANCES — the coordinator warns at startup if it does.
+SIGNAL_AGENT_CAPITAL = 280.0     # test: 100–500
+ARB_AGENT_CAPITAL    = 120.0     # test: 50–300
+
+# Portfolio-level circuit breakers — sit on TOP of per-agent breakers.
+# Per-agent CBs (in settings.CIRCUIT_BREAKERS) fire first; these catch
+# the case where every agent drifts just under its own limit but together
+# they punch through a portfolio threshold.
+PORTFOLIO_DAILY_LOSS_HALT_PCT  = 3.0     # test: 2.0–5.0
+PORTFOLIO_MAX_EXPOSURE_PCT     = 80.0    # test: 60–95
+PORTFOLIO_MONITOR_INTERVAL_SEC = 30      # test: 15–120
+
+# Kill switch
+KILL_SWITCH_CONFIRM_REQUIRED = False     # set True in live mode for safety
+
+# ══════════════════════════════════════════════════════════════════════════════
 # PLUGGABLE SENTIMENT AGGREGATOR
 # ══════════════════════════════════════════════════════════════════════════════
 # Composite scores in this system live on -100..+100. The aggregator

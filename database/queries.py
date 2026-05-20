@@ -11,6 +11,7 @@ from .db import get_session
 from .models import (
     Candle, Signal, Trade, SentimentSnapshot, SentimentLog,
     DailyStats, CircuitBreakerLog,
+    PortfolioSnapshot, AgentEvent,
 )
 
 
@@ -308,6 +309,54 @@ def upsert_daily_stats(date_str: str, data: dict):
                 setattr(existing, k, v)
         else:
             s.add(DailyStats(date=date_str, **data))
+
+
+# ── Portfolio + agents ─────────────────────────────────────
+
+def log_portfolio_snapshot(stats: dict) -> None:
+    """Persist one aggregated portfolio state row.
+
+    `stats` is the dict returned by Coordinator.get_portfolio_stats — we
+    store the well-known fields as columns and the whole dict as JSON.
+    """
+    with get_session() as s:
+        s.add(PortfolioSnapshot(
+            total_equity=stats.get("total_equity",       0.0),
+            total_daily_pnl=stats.get("total_daily_pnl", 0.0),
+            total_exposure_pct=stats.get("total_exposure_pct", 0.0),
+            agents_running=stats.get("agents_running", 0),
+            portfolio_status=stats.get("portfolio_status", "?"),
+            snapshot_json=stats,
+        ))
+
+
+def log_agent_event(agent_id: str, event_type: str, detail: str = "") -> None:
+    """Append a lifecycle event for an agent (or 'portfolio' for cross-agent events)."""
+    with get_session() as s:
+        s.add(AgentEvent(
+            agent_id=agent_id,
+            event_type=event_type,
+            detail=detail or "",
+        ))
+
+
+def get_portfolio_history(hours: int = 24) -> list:
+    since = datetime.utcnow() - timedelta(hours=hours)
+    with get_session() as s:
+        return (
+            s.query(PortfolioSnapshot)
+            .filter(PortfolioSnapshot.timestamp >= since)
+            .order_by(PortfolioSnapshot.timestamp)
+            .all()
+        )
+
+
+def get_agent_events(agent_id: Optional[str] = None, limit: int = 50) -> list:
+    with get_session() as s:
+        q = s.query(AgentEvent)
+        if agent_id:
+            q = q.filter(AgentEvent.agent_id == agent_id)
+        return q.order_by(desc(AgentEvent.timestamp)).limit(limit).all()
 
 
 # ── Circuit Breakers ───────────────────────────────────────

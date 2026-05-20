@@ -105,7 +105,9 @@ class Dashboard:
     ARB_BUFFER_MAX     = 15
     INSIGHT_BUFFER_MAX = 3
 
-    def __init__(self, bot, coordinator=None):
+    def __init__(self, bot=None, coordinator=None):
+        # Both are optional. With a coordinator, the primary bot can be
+        # late-bound via set_bot() once the signal agent starts.
         self._bot         = bot
         self._coordinator = coordinator
         self._start_time  = datetime.utcnow()
@@ -184,6 +186,16 @@ class Dashboard:
             connected=connected,
             last_seen=datetime.utcnow(),
         )
+
+    def set_bot(self, bot) -> None:
+        """Late-bind the primary bot.
+
+        Used by the multi-agent coordinator path: at Dashboard construction
+        time the signal agent's CryptoBot may not exist yet. The agent
+        wires its bot in here once it's created so bot-specific panels
+        (status, positions, approval, regime via market_data) can populate.
+        """
+        self._bot = bot
 
     # ── Layout build ────────────────────────────────────────────────────
 
