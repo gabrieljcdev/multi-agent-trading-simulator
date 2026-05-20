@@ -198,6 +198,31 @@ class SentimentSnapshot(Base):
     )
 
 
+class SentimentLog(Base):
+    """Per-source sentiment readings from the pluggable aggregator.
+
+    Every call to a source's fetch() yields one row, regardless of whether
+    it contributed to the composite. The composite_score column stores the
+    aggregator's blended value at the time this source was logged so the
+    composite history is queryable from any single row.
+    """
+    __tablename__ = "sentiment_log"
+
+    id              = Column(Integer, primary_key=True)
+    timestamp       = Column(DateTime, nullable=False, default=datetime.utcnow)
+    source_id       = Column(String(30), nullable=False)
+    score           = Column(Float)            # -100..+100 per source
+    composite_score = Column(Float)            # Aggregator output at log time
+    hard_block      = Column(Boolean, default=False)
+    block_reason    = Column(Text)
+    confidence      = Column(Float)            # 0–1, weights composite
+    raw_data        = Column(JSON)             # Source-specific payload
+
+    __table_args__ = (
+        Index("ix_sentiment_log_lookup", "source_id", "timestamp"),
+    )
+
+
 class Prediction(Base):
     """Predictive model outputs per signal (phase 2 feature)."""
     __tablename__ = "predictions"

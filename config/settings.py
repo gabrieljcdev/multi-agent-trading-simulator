@@ -449,6 +449,27 @@ PREDICTIVE_BOOST_STRONG         = 10
 PREDICTIVE_PENALTY_WEAK         = 15
 
 # ══════════════════════════════════════════════════════════════════════════════
+# PLUGGABLE SENTIMENT AGGREGATOR
+# ══════════════════════════════════════════════════════════════════════════════
+# Composite scores in this system live on -100..+100. The aggregator
+# converts to the 0–100 dict scanners consume in core/bot.py.
+
+SENTIMENT_COMPOSITE_FLOOR    = -60     # test: -50 to -70   (session-block threshold)
+SENTIMENT_FEAR_GREED_FLOOR   = 15      # test: 10–25        (extreme-fear cutoff)
+SENTIMENT_BTC_GUARD_PCT      = -2.0    # test: -1.5 to -3.0 (30m BTC drop trigger)
+SENTIMENT_BTC_GUARD_PENALTY  = -15     # test: -10 to -25   (penalty on alt signals)
+SENTIMENT_NEWS_GUARD_ENABLED = True
+SENTIMENT_REFRESH_INTERVAL_SEC = 300   # test: 60–900       (min between get_current() refreshes)
+SENTIMENT_HTTP_TIMEOUT_SEC   = 10      # test: 5–30
+
+# Per-source weights — override the class defaults at __init__ time
+SENTIMENT_WEIGHT_FEAR_GREED    = 0.4
+SENTIMENT_WEIGHT_CRYPTOPANIC   = 0.25
+SENTIMENT_WEIGHT_REDDIT        = 0.2
+SENTIMENT_WEIGHT_GOOGLE_TRENDS = 0.1
+SENTIMENT_WEIGHT_TELEGRAM      = 0.05
+
+# ══════════════════════════════════════════════════════════════════════════════
 # BOT LOOP TIMING
 # ══════════════════════════════════════════════════════════════════════════════
 

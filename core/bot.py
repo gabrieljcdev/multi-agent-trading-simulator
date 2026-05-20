@@ -264,7 +264,7 @@ class CryptoBot:
             await asyncio.sleep(settings.BOT_LOOP_INTERVAL_SEC)
 
     async def _cycle(self):
-        """One pass: dead-zone gate → CB gate → signal scan."""
+        """One pass: dead-zone gate → CB gate → sentiment session-floor → scan."""
         self._cb_state.reset_if_new_day()
 
         if self._in_dead_zone():
@@ -289,6 +289,19 @@ class CryptoBot:
         if self._cb_state.halted:
             logger.debug(f"Halted ({self._cb_state.halt_reason}) — cycle skipped")
             return
+
+        # Sentiment session floor — extreme fear, hard-block headlines, etc.
+        # Reads cached aggregator state; heartbeat keeps it fresh.
+        try:
+            from sentiment import sentiment as sentiment_agg
+            passes, reason = sentiment_agg.passes_session_floor()
+            if not passes:
+                logger.info(f"Session floor blocked: {reason}")
+                return
+        except Exception as e:
+            # Sentiment is best-effort: a broken aggregator must not stop
+            # the trading loop. Log and continue.
+            logger.debug(f"session_floor check skipped: {e}")
 
         # The engine internally invokes regime, guards, OFI, sentiment via
         # the quality gate, and fires _on_signal for each passing candidate.
@@ -540,22 +553,23 @@ class CryptoBot:
         return None
 
     async def _fetch_sentiment(self) -> dict:
-        """Pull market sentiment. Returns a coin→scores dict for the engine.
+        """Pull market sentiment via the pluggable aggregator.
 
-        TODO: sentiment/* modules are mostly stubs per CLAUDE.md. Only
-        fear_greed is referenced, and even that may not exist yet. Until
-        the sentiment aggregator is real, this returns neutral scores so
-        the engine has something to attach to signals.
+        The aggregator works on a -100..+100 composite. The scanners
+        expect 0..100 (50 = neutral). Translate before returning.
         """
         try:
-            from sentiment.fear_greed import fetch as fg_fetch  # noqa: F401
-            fg = await fg_fetch()
+            from sentiment import sentiment as sentiment_agg
+            data = await sentiment_agg.get_current()
+            composite_0_100 = 50.0 + (data.composite_score / 2.0)
             return {
                 "MARKET": {
-                    "composite": fg.get("score", 50),
-                    "velocity":  fg.get("delta", 0),
-                    "fear_greed": fg.get("score", 50),
+                    "composite":  composite_0_100,
+                    "velocity":   data.sentiment_modifier,
+                    "fear_greed": data.fear_greed_value if data.fear_greed_value is not None else 50,
+                    "hard_block": data.hard_block,
                 }
             }
-        except Exception:
+        except Exception as e:
+            logger.warning(f"sentiment refresh failed: {e}")
             return {"MARKET": {"composite": 50, "velocity": 0}}

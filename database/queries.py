@@ -8,7 +8,10 @@ from typing import Optional
 from sqlalchemy import func, desc
 
 from .db import get_session
-from .models import Candle, Signal, Trade, SentimentSnapshot, DailyStats, CircuitBreakerLog
+from .models import (
+    Candle, Signal, Trade, SentimentSnapshot, SentimentLog,
+    DailyStats, CircuitBreakerLog,
+)
 
 
 # ── Candles ────────────────────────────────────────────────
@@ -234,14 +237,46 @@ def get_latest_sentiment(coin: str = "MARKET") -> Optional[SentimentSnapshot]:
             .first()
         )
 
-def get_sentiment_history(coin: str, hours: int = 24):
+def log_sentiment_result(result, composite_score: float = 0.0):
+    """Persist a SourceResult to the sentiment_log table.
+
+    `result` is a sentiment.base.SourceResult — duck-typed here to avoid
+    a queries→sentiment import cycle. The aggregator passes composite_score
+    so every row carries the blended value at the time it was written.
+    """
+    with get_session() as s:
+        s.add(SentimentLog(
+            source_id=result.source_id,
+            score=result.score,
+            composite_score=composite_score,
+            hard_block=result.hard_block,
+            block_reason=result.block_reason or "",
+            confidence=result.confidence,
+            raw_data=result.raw_data,
+        ))
+
+
+def get_sentiment_history(source_id: str, hours: int = 24):
+    """Per-source history from the new aggregator log table."""
     since = datetime.utcnow() - timedelta(hours=hours)
     with get_session() as s:
         return (
-            s.query(SentimentSnapshot)
-            .filter(SentimentSnapshot.coin == coin,
-                    SentimentSnapshot.timestamp >= since)
-            .order_by(SentimentSnapshot.timestamp)
+            s.query(SentimentLog)
+            .filter(SentimentLog.source_id == source_id,
+                    SentimentLog.timestamp >= since)
+            .order_by(SentimentLog.timestamp)
+            .all()
+        )
+
+
+def get_composite_history(hours: int = 24):
+    """All composite scores ever computed in the lookback window."""
+    since = datetime.utcnow() - timedelta(hours=hours)
+    with get_session() as s:
+        return (
+            s.query(SentimentLog.timestamp, SentimentLog.composite_score)
+            .filter(SentimentLog.timestamp >= since)
+            .order_by(SentimentLog.timestamp)
             .all()
         )
 
