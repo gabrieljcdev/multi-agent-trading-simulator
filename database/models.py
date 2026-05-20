@@ -96,6 +96,14 @@ class Signal(Base):
     # User decision
     user_action       = Column(String(10))  # go | skip | modify | expired
     user_action_at    = Column(DateTime)
+    skip_reason       = Column(Text)        # Why the signal was not acted on (free text)
+
+    # Price evolution after the signal — written by the bot's future-price
+    # tracker loop so we can later evaluate whether passing/skipping was correct.
+    price_at_signal   = Column(Float)
+    price_1h          = Column(Float)
+    price_4h          = Column(Float)
+    price_24h         = Column(Float)
 
     # Outcome (filled when trade closes)
     outcome           = Column(String(10))  # win | loss | breakeven | open
@@ -145,6 +153,9 @@ class Trade(Base):
     hold_minutes    = Column(Float)
 
     exit_reason     = Column(String(20))  # tp_hit | sl_hit | manual | kill_switch
+
+    # Claude's post-trade review (written by the bot's self-review loop)
+    claude_postmortem = Column(Text)
 
     sim_mode        = Column(Boolean, nullable=False, default=True)
     profile         = Column(String(30))

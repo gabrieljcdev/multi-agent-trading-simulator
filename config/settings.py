@@ -449,6 +449,16 @@ PREDICTIVE_BOOST_STRONG         = 10
 PREDICTIVE_PENALTY_WEAK         = 15
 
 # ══════════════════════════════════════════════════════════════════════════════
+# BOT LOOP TIMING
+# ══════════════════════════════════════════════════════════════════════════════
+
+BOT_LOOP_INTERVAL_SEC             = 30      # test: 10–120
+HEARTBEAT_INTERVAL_SEC            = 300     # test: 60–600
+POSITION_WATCHER_INTERVAL_SEC     = 5       # test: 2–15
+FUTURE_PRICE_TRACKER_INTERVAL_SEC = 3600    # test: 1800–7200
+SELF_REVIEW_EVERY_N_TRADES        = 5       # test: 3–10
+
+# ══════════════════════════════════════════════════════════════════════════════
 # LOGGING & UI
 # ══════════════════════════════════════════════════════════════════════════════
 

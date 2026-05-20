@@ -23,8 +23,9 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 
-# IDE
+# IDE / agent state
 .idea/
 .vscode/
+.claude/
 *.swp
 .DS_Store

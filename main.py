@@ -76,10 +76,10 @@ def main(profile, strategy, sim, live, debug):
 
 async def _run(profile, strategy):
     """Async main — imports are deferred here to keep startup fast."""
-    from core.bot import Bot
+    from core.bot import CryptoBot
 
     kill_switch = KillSwitch(sim_mode=settings.SIM_MODE)
-    bot = Bot(profile=profile, strategy=strategy, kill_switch=kill_switch)
+    bot = CryptoBot(profile=profile, strategy=strategy, kill_switch=kill_switch)
 
     await bot.start()
 

@@ -52,6 +52,75 @@ def update_signal_outcome(signal_id: int, outcome: str, pnl_pct: float):
             signal.outcome = outcome
             signal.outcome_pnl_pct = pnl_pct
 
+def update_signal_claude(signal_id: int, fields: dict):
+    """Update Claude evaluation fields on an existing Signal row.
+
+    `fields` may contain: claude_reasoning, claude_suggested_entry,
+    claude_suggested_sl, claude_suggested_tp, claude_suggested_size,
+    claude_risk_reward, claude_api_cost_usd, price_at_signal.
+    Unknown keys are ignored to keep callers loosely coupled to the model.
+    """
+    allowed = {
+        "claude_reasoning",
+        "claude_suggested_entry",
+        "claude_suggested_sl",
+        "claude_suggested_tp",
+        "claude_suggested_size",
+        "claude_risk_reward",
+        "claude_api_cost_usd",
+        "price_at_signal",
+    }
+    with get_session() as s:
+        signal = s.get(Signal, signal_id)
+        if not signal:
+            return
+        for k, v in fields.items():
+            if k in allowed and v is not None:
+                setattr(signal, k, v)
+
+
+def update_signal_skip(signal_id: int, reason: str, price_at_signal: Optional[float] = None):
+    """Mark a signal as skipped with a free-text reason and price snapshot."""
+    with get_session() as s:
+        signal = s.get(Signal, signal_id)
+        if not signal:
+            return
+        signal.user_action = "skip"
+        signal.user_action_at = datetime.utcnow()
+        signal.skip_reason = reason
+        if price_at_signal is not None:
+            signal.price_at_signal = price_at_signal
+
+
+def update_signal_future_prices(signal_id: int, fields: dict):
+    """Set any of price_1h / price_4h / price_24h on a Signal row."""
+    allowed = {"price_1h", "price_4h", "price_24h"}
+    with get_session() as s:
+        signal = s.get(Signal, signal_id)
+        if not signal:
+            return
+        for k, v in fields.items():
+            if k in allowed and v is not None:
+                setattr(signal, k, v)
+
+
+def get_signals_needing_price_update(hours: int = 24) -> list:
+    """Signals from the last N hours that still have any null future-price slot."""
+    since = datetime.utcnow() - timedelta(hours=hours)
+    with get_session() as s:
+        return (
+            s.query(Signal)
+            .filter(
+                Signal.timestamp >= since,
+                # At least one slot still null
+                (Signal.price_1h.is_(None))
+                | (Signal.price_4h.is_(None))
+                | (Signal.price_24h.is_(None)),
+            )
+            .all()
+        )
+
+
 def get_signal_history(days: int = 30, signal_type: str = None):
     with get_session() as s:
         q = s.query(Signal).filter(
@@ -110,6 +179,26 @@ def get_today_pnl_pct() -> float:
         return 0.0
     closed = [t for t in trades if t.pnl_pct is not None]
     return sum(t.pnl_pct for t in closed)
+
+def get_recent_closed_trades(limit: int = 5) -> list:
+    """Most recent N closed trades, newest first. Used by self-review loop."""
+    with get_session() as s:
+        return (
+            s.query(Trade)
+            .filter(Trade.timestamp_close.isnot(None))
+            .order_by(desc(Trade.timestamp_close))
+            .limit(limit)
+            .all()
+        )
+
+
+def save_postmortem(trade_id: int, text: str):
+    """Persist Claude's self-review for a closed trade."""
+    with get_session() as s:
+        trade = s.get(Trade, trade_id)
+        if trade:
+            trade.claude_postmortem = text
+
 
 def get_consecutive_losses() -> int:
     with get_session() as s:
