@@ -11,7 +11,7 @@ from .db import get_session
 from .models import (
     Candle, Signal, Trade, SentimentSnapshot, SentimentLog,
     DailyStats, CircuitBreakerLog,
-    PortfolioSnapshot, AgentEvent,
+    PortfolioSnapshot, AgentEvent, ArbTrade,
 )
 
 
@@ -309,6 +309,95 @@ def upsert_daily_stats(date_str: str, data: dict):
                 setattr(existing, k, v)
         else:
             s.add(DailyStats(date=date_str, **data))
+
+
+# ── Arb engine ─────────────────────────────────────────────
+
+def log_arb_trade(result, sim_mode: bool = True) -> None:
+    """Persist one ArbResult.
+
+    `result` is duck-typed (execution.arb_engine.ArbResult) to avoid a
+    queries→arb_engine import cycle.
+    """
+    opp = result.opportunity
+    with get_session() as s:
+        s.add(ArbTrade(
+            symbol=opp.symbol,
+            buy_exchange=opp.buy_exchange,
+            sell_exchange=opp.sell_exchange,
+            buy_price=opp.buy_price,
+            sell_price=opp.sell_price,
+            buy_fill=result.buy_fill,
+            sell_fill=result.sell_fill,
+            gross_gap_pct=opp.gross_gap_pct,
+            net_gap_pct=opp.net_gap_pct,
+            size_usd=opp.max_size_usd,
+            gross_pnl_usd=result.gross_pnl_usd,
+            net_pnl_usd=result.net_pnl_usd,
+            execution_ms=result.execution_ms,
+            sim_mode=sim_mode,
+            success=result.success,
+            error=result.error,
+        ))
+
+
+def get_arb_trades(hours: int = 24) -> list:
+    since = datetime.utcnow() - timedelta(hours=hours)
+    with get_session() as s:
+        return (
+            s.query(ArbTrade)
+            .filter(ArbTrade.timestamp >= since)
+            .order_by(desc(ArbTrade.timestamp))
+            .all()
+        )
+
+
+def get_arb_pnl_today() -> float:
+    today = datetime.utcnow().date()
+    with get_session() as s:
+        rows = (
+            s.query(ArbTrade.net_pnl_usd)
+            .filter(func.date(ArbTrade.timestamp) == today,
+                    ArbTrade.success == True,  # noqa: E712 (SQLAlchemy idiom)
+                    ArbTrade.net_pnl_usd.isnot(None))
+            .all()
+        )
+    return float(sum(r[0] for r in rows))
+
+
+def get_arb_stats() -> dict:
+    """Aggregate stats for the dashboard: trade count, win rate, avg P&L,
+    best pair, best exchange combination."""
+    with get_session() as s:
+        rows = (
+            s.query(ArbTrade)
+            .filter(ArbTrade.success == True)  # noqa: E712
+            .all()
+        )
+    if not rows:
+        return {"total": 0, "wins": 0, "win_rate": 0.0, "avg_net_pnl": 0.0,
+                "best_pair": None, "best_combo": None}
+    pnls = [r.net_pnl_usd or 0.0 for r in rows]
+    wins = sum(1 for p in pnls if p > 0)
+
+    from collections import defaultdict
+    pair_pnl = defaultdict(float)
+    combo_pnl = defaultdict(float)
+    for r in rows:
+        pair_pnl[r.symbol] += r.net_pnl_usd or 0.0
+        key = f"{r.buy_exchange}->{r.sell_exchange}"
+        combo_pnl[key] += r.net_pnl_usd or 0.0
+    best_pair  = max(pair_pnl.items(),  key=lambda kv: kv[1])[0] if pair_pnl  else None
+    best_combo = max(combo_pnl.items(), key=lambda kv: kv[1])[0] if combo_pnl else None
+
+    return {
+        "total":       len(rows),
+        "wins":        wins,
+        "win_rate":    wins / len(rows),
+        "avg_net_pnl": sum(pnls) / len(pnls),
+        "best_pair":   best_pair,
+        "best_combo":  best_combo,
+    }
 
 
 # ── Portfolio + agents ─────────────────────────────────────

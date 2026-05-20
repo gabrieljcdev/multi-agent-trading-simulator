@@ -37,13 +37,16 @@ class ArbScanner:
             return None
         gap_pct = (price_sell - price_buy) / price_buy * 100
         net_gap = gap_pct - settings.ARB_FEE_ESTIMATE_PCT
-        if net_gap < settings.ARB_MIN_GAP_PCT:
+        # Signal-track arb uses the fallback (0.35%) threshold; the bitget
+        # special-case ARB_MIN_GAP_PCT (0.03%) is reserved for the dedicated
+        # execution/arb_engine.py.
+        if net_gap < settings.ARB_MIN_GAP_PCT_FALLBACK:
             return None
         dedup_key = f"{pair}_{ex_buy}_{ex_sell}"
         if dedup_key in self._last_signals:
             if datetime.utcnow() - self._last_signals[dedup_key] < timedelta(minutes=3):
                 return None
-        raw_score = min(95.0, 50.0 + (net_gap / settings.ARB_MIN_GAP_PCT) * 25)
+        raw_score = min(95.0, 50.0 + (net_gap / settings.ARB_MIN_GAP_PCT_FALLBACK) * 25)
         coin = pair.split("/")[0]
         sentiment = sentiment_scores.get(coin, sentiment_scores.get("MARKET", {}))
         composite = sentiment.get("composite", 50)

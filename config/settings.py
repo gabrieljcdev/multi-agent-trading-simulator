@@ -194,13 +194,44 @@ VOLUME_SURGE_MULTIPLIER = 2.0   # test: 1.5–3.0
 VWAP_STRETCH_PCT        = 0.8   # test: 0.5–1.2
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ARBITRAGE
+# ARBITRAGE (signal track + dedicated arb engine)
 # ══════════════════════════════════════════════════════════════════════════════
+# ARB_MIN_GAP_PCT is the bitget-special-case threshold used by the dedicated
+# arb engine (execution/arb_engine.py). The signal track (signals/arbitrage.py)
+# uses ARB_MIN_GAP_PCT_FALLBACK to keep its original 0.35% behaviour.
 
-ARB_MIN_GAP_PCT          = 0.35  # test: 0.25–0.50
+ARB_MIN_GAP_PCT          = 0.03  # test: 0.02–0.10   (bitget special-case)
+ARB_MIN_GAP_PCT_FALLBACK = 0.35  # test: 0.25–0.50   (non-bitget — also signal track)
 ARB_FEE_ESTIMATE_PCT     = 0.20
 ARB_MAX_TRANSFER_SECONDS = 60
 ARB_MIN_LIQUIDITY_MULT   = 2.0
+
+# Dedicated arb engine
+ARB_SCAN_INTERVAL_MS      = 500       # test: 250–2000
+ARB_MAX_POSITION_USD      = 25.0      # test: 10–100
+ARB_MIN_LIQUIDITY_USD     = 500.0     # test: 250–2000   (sum of top 3 book levels)
+ARB_MAX_CONCURRENT        = 3         # test: 1–5
+ARB_DAILY_LOSS_HALT_USD   = 10.0      # test: 5–50
+ARB_CONSECUTIVE_LOSS_HALT = 5         # test: 3–10
+
+# Pairs the arb engine watches. Distinct from signal-track FALLBACK_PAIRS.
+ARB_WATCH_PAIRS = [
+    "BTC/USDT",  "ETH/USDT",  "SOL/USDT",  "BNB/USDT",
+    "AVAX/USDT", "LINK/USDT", "DOT/USDT",  "MATIC/USDT",
+    "NEAR/USDT", "APT/USDT",  "INJ/USDT",  "ARB/USDT",
+    "OP/USDT",   "SUI/USDT",  "ATOM/USDT", "ADA/USDT",
+]
+
+# Maker+taker effective fee per exchange (fractional, not %). bitget's
+# ultra-low fee is the reason ARB_MIN_GAP_PCT can be set to 0.03%.
+ARB_FEE_MAP = {
+    "bitget":   0.0001,    # 0.01% — game changer
+    "kraken":   0.0026,
+    "bitstamp": 0.0050,
+    "gateio":   0.0020,
+    "bitfinex": 0.0020,
+    "bybit":    0.0010,
+}
 
 # ══════════════════════════════════════════════════════════════════════════════
 # MOMENTUM SIGNAL (TRACK B)

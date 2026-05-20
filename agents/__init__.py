@@ -188,46 +188,93 @@ class ArbAgentWrapper(BaseAgent):
         super().__init__()
         self.capital_allocation = settings.ARB_AGENT_CAPITAL
         self._engine = None
+        self._dashboard = None
 
     def is_available(self) -> bool:
-        # Dedicated arb engine isn't built yet.
+        """ArbEngine importable AND ≥2 exchanges usable.
+
+        Sim mode counts any exchange in ARB_FEE_MAP that ccxt knows about
+        (public endpoints don't need keys). Live mode requires API key + secret.
+        """
         try:
-            from execution import arb_engine  # noqa: F401
+            from execution.arb_engine import ArbEngine  # noqa: F401
         except ImportError:
             return False
-        # Need at least two exchange keys for cross-exchange arb
         if settings.SIM_MODE:
-            return True
+            return len(settings.ARB_FEE_MAP) >= 2
         keyed = sum(
-            1 for ex in settings.ENABLED_EXCHANGES
-            if os.getenv(f"{ex.upper()}_API_KEY")
+            1 for ex in settings.ARB_FEE_MAP
+            if os.getenv(f"{ex.upper()}_API_KEY") and os.getenv(f"{ex.upper()}_SECRET")
         )
         return keyed >= 2
+
+    def set_dashboard(self, dashboard) -> None:
+        self._dashboard = dashboard
+        if self._engine is not None:
+            self._engine.dashboard = dashboard
 
     async def start(self) -> None:
         if not self.is_available():
             self._status = OFFLINE
             return
-        # TODO: wire in real arb engine when execution/arb_engine.py exists
-        self._status = OFFLINE
+        from execution.arb_engine import ArbEngine
+        self._engine = ArbEngine(dashboard=self._dashboard)
+        import time as _time
+        self._status = RUNNING
+        self._start_time = _time.time()
+        logger.info("ArbAgent: starting ArbEngine")
+        await self._engine.start()      # runs forever until stop()
 
     async def stop(self) -> None:
+        if self._engine is not None:
+            try:
+                await self._engine.stop()
+            except Exception as e:
+                logger.warning(f"ArbAgent stop: {e}")
         self._status = STOPPED
 
     async def close_all_positions(self) -> None:
-        # Arb positions close themselves on completion; if a real engine
-        # arrives, route the kill through it here.
-        pass
+        if self._engine is not None:
+            try:
+                await self._engine.close_all_positions()
+            except Exception as e:
+                logger.error(f"ArbAgent close_all: {e}")
 
     async def get_stats(self) -> AgentStats:
+        if self._engine is None:
+            return AgentStats(
+                agent_id=self.agent_id, status=OFFLINE,
+                capital_allocated=self.capital_allocation,
+                capital_deployed=0.0, daily_pnl=0.0, daily_pnl_pct=0.0,
+                total_pnl=0.0, trades_today=0,
+                win_rate_today=0.0, win_rate_alltime=0.0,
+                consecutive_losses=0, last_trade_time=None, error=None,
+            )
+
+        es = self._engine.get_stats()
+        daily_pnl = float(es.get("daily_pnl", 0.0))
+        daily_pnl_pct = (daily_pnl / self.capital_allocation * 100.0) \
+            if self.capital_allocation else 0.0
+        # Today-only win rate from DB
+        try:
+            stats = db_queries.get_arb_stats() or {}
+            wr_alltime = float(stats.get("win_rate", 0.0))
+        except Exception:
+            wr_alltime = 0.0
         return AgentStats(
             agent_id=self.agent_id,
-            status=self._status if self._status != RUNNING else RUNNING,
+            status=es.get("status", OFFLINE),
             capital_allocated=self.capital_allocation,
-            capital_deployed=0.0, daily_pnl=0.0, daily_pnl_pct=0.0,
-            total_pnl=0.0, trades_today=0,
-            win_rate_today=0.0, win_rate_alltime=0.0,
-            consecutive_losses=0, last_trade_time=None, error=None,
+            capital_deployed=0.0,
+            daily_pnl=daily_pnl,
+            daily_pnl_pct=daily_pnl_pct,
+            total_pnl=float(es.get("total_pnl", 0.0)),
+            trades_today=int(es.get("total_trades", 0)),
+            win_rate_today=wr_alltime,
+            win_rate_alltime=wr_alltime,
+            consecutive_losses=int(es.get("consecutive_losses", 0)),
+            last_trade_time=es.get("last_trade_time"),
+            error=None,
         )
 
 

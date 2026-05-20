@@ -282,6 +282,39 @@ class DailyStats(Base):
     strategy            = Column(String(30))
 
 
+class ArbTrade(Base):
+    """One row per arb attempt by execution/arb_engine.py.
+
+    Logged whether or not the trade succeeded; the `success` flag and
+    `error` field tell them apart. P&L columns are USD because arb is
+    flat-quoted in USD-equivalent across exchanges.
+    """
+    __tablename__ = "arb_trades"
+
+    id             = Column(Integer, primary_key=True)
+    timestamp      = Column(DateTime, default=datetime.utcnow)
+    symbol         = Column(String(20), nullable=False)
+    buy_exchange   = Column(String(20))
+    sell_exchange  = Column(String(20))
+    buy_price      = Column(Float)
+    sell_price     = Column(Float)
+    buy_fill       = Column(Float)
+    sell_fill      = Column(Float)
+    gross_gap_pct  = Column(Float)
+    net_gap_pct    = Column(Float)
+    size_usd       = Column(Float)
+    gross_pnl_usd  = Column(Float)
+    net_pnl_usd    = Column(Float)
+    execution_ms   = Column(Float)
+    sim_mode       = Column(Boolean, default=True)
+    success        = Column(Boolean, default=False)
+    error          = Column(Text)
+
+    __table_args__ = (
+        Index("ix_arb_trades_lookup", "symbol", "timestamp"),
+    )
+
+
 class PortfolioSnapshot(Base):
     """Aggregated cross-agent state captured every PORTFOLIO_MONITOR_INTERVAL_SEC.
 
