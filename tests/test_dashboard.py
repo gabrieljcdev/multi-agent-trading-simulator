@@ -248,3 +248,87 @@ def test_duration_format():
     assert dash._fmt_duration(timedelta(seconds=30))  == "30s"
     assert dash._fmt_duration(timedelta(minutes=5))   == "5m00s"
     assert dash._fmt_duration(timedelta(hours=2, minutes=30)) == "2h30m"
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Async coordinator integration
+# ─────────────────────────────────────────────────────────────────────────
+
+def test_panels_do_not_call_async_coordinator_directly():
+    """Regression: portfolio + agents panels used to call async coordinator
+    methods directly from the sync render path, yielding a coroutine object
+    that crashed `.get(...)` with 'coroutine object has no attribute get'.
+
+    Render must touch only the cached data, not the coordinator methods."""
+    coord = MagicMock()
+    coord.get_portfolio_stats = MagicMock(
+        side_effect=AssertionError("must not be called from sync render"))
+    coord.get_agent_stats = MagicMock(
+        side_effect=AssertionError("must not be called from sync render"))
+
+    dash = Dashboard(_mock_bot(), coordinator=coord)
+    layout = dash.render()
+    # Force the layout to materialise — markup errors only surface on print
+    Console(file=open("/dev/null", "w"), width=200, height=80).print(layout)
+
+
+def test_refresh_coordinator_data_caches_async_results():
+    """The async run() helper must await coordinator getters and reshape
+    AgentStats dataclasses into the dict keys the agents panel expects."""
+    from agents.base import AgentStats, RUNNING
+
+    async def fake_portfolio():
+        return {
+            "total_equity":        500.0,
+            "total_daily_pnl_pct": 1.25,
+            "total_exposure_pct":  10.0,
+        }
+
+    async def fake_agents():
+        return [
+            AgentStats(
+                agent_id="signal", status=RUNNING,
+                capital_allocated=400.0, capital_deployed=50.0,
+                daily_pnl=5.0, daily_pnl_pct=1.25,
+                total_pnl=20.0, trades_today=3,
+                win_rate_today=0.66, win_rate_alltime=0.55,
+                consecutive_losses=0, last_trade_time=None, error=None,
+            ),
+        ]
+
+    coord = SimpleNamespace(
+        get_portfolio_stats=fake_portfolio,
+        get_agent_stats=fake_agents,
+    )
+    dash = Dashboard(_mock_bot(), coordinator=coord)
+    asyncio.run(dash._refresh_coordinator_data())
+
+    assert dash._portfolio_cache == {
+        "total_equity":  500.0,
+        "daily_pnl_pct": 1.25,
+    }
+    assert dash._agent_stats_cache == [{
+        "name":    "Signal",
+        "status":  RUNNING,
+        "capital": 400.0,
+        "pnl_pct": 1.25,
+        "trades":  3,
+    }]
+
+    # Panels now render against populated caches without raising
+    layout = dash.render()
+    Console(file=open("/dev/null", "w"), width=200, height=80).print(layout)
+
+
+def test_refresh_coordinator_data_survives_async_errors():
+    """If a coordinator getter raises, the cache stays at its prior value
+    and refresh does not propagate the exception to the live loop."""
+    async def boom():
+        raise RuntimeError("coordinator offline")
+
+    coord = SimpleNamespace(get_portfolio_stats=boom, get_agent_stats=boom)
+    dash = Dashboard(_mock_bot(), coordinator=coord)
+    # Must not raise
+    asyncio.run(dash._refresh_coordinator_data())
+    assert dash._portfolio_cache   is None
+    assert dash._agent_stats_cache == []

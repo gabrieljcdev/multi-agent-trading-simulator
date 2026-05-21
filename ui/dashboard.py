@@ -125,6 +125,11 @@ class Dashboard:
         # 1–5 keyboard select; persists for filtering once agent layer exists.
         self._selected_agent: Optional[int] = None
 
+        # Coordinator.get_*_stats() are async; render() is sync. The async
+        # run() loop refreshes these caches so sync panels can read freely.
+        self._portfolio_cache:   Optional[dict] = None
+        self._agent_stats_cache: list[dict]     = []
+
         self._console = Console()
 
     # ── Push API ────────────────────────────────────────────────────────
@@ -265,11 +270,51 @@ class Dashboard:
         with Live(self.render(), refresh_per_second=2, screen=True,
                   console=self._console) as live:
             while self._running:
+                await self._refresh_coordinator_data()
                 try:
                     live.update(self.render())
                 except Exception as e:
                     logger.debug(f"dashboard live update: {e}")
                 await asyncio.sleep(0.5)
+
+    async def _refresh_coordinator_data(self) -> None:
+        """Pull async coordinator stats into sync-readable caches.
+
+        Render panels are sync (Rich Live drives them), but the coordinator
+        exposes async getters. Awaiting here once per tick keeps panels
+        simple and avoids the unawaited-coroutine .get() crash.
+        """
+        if self._coordinator is None:
+            return
+
+        getter = getattr(self._coordinator, "get_portfolio_stats", None)
+        if callable(getter):
+            try:
+                stats = await getter()
+                if stats:
+                    self._portfolio_cache = {
+                        "total_equity":  stats.get("total_equity",       0.0),
+                        "daily_pnl_pct": stats.get("total_daily_pnl_pct", 0.0),
+                    }
+            except Exception as e:
+                logger.debug(f"dashboard portfolio refresh: {e}")
+
+        getter = getattr(self._coordinator, "get_agent_stats", None)
+        if callable(getter):
+            try:
+                stats_list = await getter() or []
+                self._agent_stats_cache = [
+                    {
+                        "name":    (getattr(s, "agent_id", "?") or "?").title(),
+                        "status":  getattr(s, "status", "OFFLINE"),
+                        "capital": getattr(s, "capital_allocated", 0.0),
+                        "pnl_pct": getattr(s, "daily_pnl_pct",     0.0),
+                        "trades":  getattr(s, "trades_today",      0),
+                    }
+                    for s in stats_list
+                ]
+            except Exception as e:
+                logger.debug(f"dashboard agent stats refresh: {e}")
 
     def stop(self) -> None:
         self._running = False
@@ -313,16 +358,12 @@ class Dashboard:
         equity = getattr(cb, "current_equity", 0.0) if cb else 0.0
         daily  = getattr(cb, "daily_pnl_pct",  0.0) if cb else 0.0
 
-        # coordinator overrides bot stats if it's wired
-        portfolio = None
-        if self._coordinator is not None and hasattr(self._coordinator, "get_portfolio_stats"):
-            try:
-                portfolio = self._coordinator.get_portfolio_stats()
-            except Exception:
-                portfolio = None
-
+        # Coordinator overrides bot stats if its cache is populated. The
+        # async run() loop refreshes _portfolio_cache; we never call the
+        # coroutine from this sync render path.
+        portfolio = self._portfolio_cache
         if portfolio:
-            equity = portfolio.get("total_equity", equity)
+            equity = portfolio.get("total_equity",  equity)
             daily  = portfolio.get("daily_pnl_pct", daily)
 
         trades_today, _, _, wr_today, wr_all = self._read_trade_stats()
@@ -537,12 +578,8 @@ class Dashboard:
         t.add_column("Today P&L", justify="right")
         t.add_column("Trades",    justify="right")
 
-        agent_stats: list[dict] = []
-        if self._coordinator is not None and hasattr(self._coordinator, "get_agent_stats"):
-            try:
-                agent_stats = self._coordinator.get_agent_stats() or []
-            except Exception:
-                agent_stats = []
+        # Populated by the async run() loop — see _refresh_coordinator_data.
+        agent_stats: list[dict] = list(self._agent_stats_cache)
 
         if not agent_stats:
             # Coordinator not wired — show the planned roster as OFFLINE
