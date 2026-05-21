@@ -127,21 +127,37 @@ def get_signals_needing_price_update(hours: int = 24) -> list:
         )
 
 
-def get_today_skipped_signals() -> list:
-    """Return Signal rows with user_action='skip' from today (UTC).
+def get_today_skipped_signals() -> int:
+    """Count signals skipped today (UTC).
 
-    Signal uses `timestamp` (not created_at). The dashboard's STATUS panel
-    reads len() of this list for its skipped-signals counter.
+    Returns an int directly — counters are the only consumer. The
+    previous list-returning shape forced every caller through `len(...)`.
+    A row counts as skipped if `user_action == 'skip'` OR `skip_reason`
+    is populated (the gate writes skip_reason without bumping
+    user_action when the cycle short-circuits before user-facing
+    approval, e.g. on a SENTIMENT_HARD_BLOCK).
     """
     today_utc = datetime.utcnow().date()
     with get_session() as s:
         return (
-            s.query(Signal)
-            .filter(Signal.user_action == "skip",
-                    func.date(Signal.timestamp) == today_utc)
-            .order_by(desc(Signal.timestamp))
-            .all()
+            s.query(func.count(Signal.id))
+            .filter(
+                func.date(Signal.timestamp) == today_utc,
+                (Signal.user_action == "skip") | (Signal.skip_reason.isnot(None)),
+            )
+            .scalar()
+            or 0
         )
+
+
+def get_trade_by_id(trade_id: int):
+    """Single Trade row by primary key, or None if not found.
+
+    Replaces the pattern of scanning today's trades for one id in
+    core/bot.py:_get_trade_by_id — that helper now delegates here.
+    """
+    with get_session() as s:
+        return s.get(Trade, trade_id)
 
 
 def get_signal_history(days: int = 30, signal_type: str = None):

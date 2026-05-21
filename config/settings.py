@@ -341,6 +341,16 @@ BTC_GUARD_ENABLED        = True
 BTC_CRASH_PCT            = 2.0   # test: 1.5–3.0
 BTC_CRASH_WINDOW_MINUTES = 30    # test: 15–60
 BTC_GUARD_SCORE_PENALTY  = 25    # test: 15–35
+# Heartbeat-loop snapshot window — match BTC_CRASH_WINDOW_MINUTES so the
+# guard sees the same horizon end-to-end. Allow a small drift below the
+# target before reusing the older snapshot.
+BTC_GUARD_LOOKBACK_MINUTES = 30  # test: 15-60
+BTC_GUARD_LOOKBACK_DRIFT_MINUTES = 2  # test: 0-5 (acceptable snapshot age slack)
+
+# Skip-reason constants used in logs + Signal.skip_reason column.
+SENTIMENT_HARD_BLOCK_SKIP_REASON = "SENTIMENT_HARD_BLOCK"
+MACRO_HARD_BLOCK_SKIP_REASON     = "MACRO_HARD_BLOCK"
+PRE_EVENT_PAUSE_SKIP_REASON      = "PRE_EVENT_PAUSE"
 
 # ══════════════════════════════════════════════════════════════════════════════
 # POSITION CORRELATION GUARD

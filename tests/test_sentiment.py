@@ -324,3 +324,59 @@ async def test_dashboard_dict_populates(monkeypatch):
     assert latest["reddit_bullish_ratio"] == 0.65
     assert len(latest["top_headlines"]) == 2
     assert latest["sources_active"] == 3
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# get_signal_modifier + is_hard_blocked — quality gate's consumers
+# ─────────────────────────────────────────────────────────────────────────
+
+def test_get_signal_modifier_defaults_to_zero_before_refresh():
+    """Aggregator constructed but never refreshed → modifier 0 so the
+    quality gate's `score += modifier` is a no-op rather than crashing
+    or applying a stale value."""
+    agg = SentimentAggregator(sources=[
+        StubSource("fear_greed", score=0, weight=0.4),
+    ])
+    assert agg.get_signal_modifier() == 0
+
+
+def test_is_hard_blocked_false_before_refresh():
+    agg = SentimentAggregator(sources=[
+        StubSource("fear_greed", score=0, weight=0.4),
+    ])
+    blocked, reason = agg.is_hard_blocked()
+    assert blocked is False
+    assert reason == ""
+
+
+@pytest.mark.asyncio
+async def test_hard_block_propagates_to_aggregator():
+    """A source with hard_block=True triggers is_hard_blocked → True."""
+    agg = SentimentAggregator(sources=[
+        StubSource(
+            "cryptopanic", score=-90, weight=0.25,
+            hard_block=True, block_reason="major_exchange_hack",
+        ),
+        StubSource("fear_greed", score=0, weight=0.4),
+    ])
+    await agg.refresh()
+    blocked, reason = agg.is_hard_blocked()
+    assert blocked is True
+    assert "major_exchange_hack" in reason
+
+
+@pytest.mark.asyncio
+async def test_get_signal_modifier_returns_step_value_after_refresh():
+    """High positive composite (≥+60) maps to +20 per the existing
+    sentiment _composite_to_modifier ladder."""
+    agg = SentimentAggregator(sources=[
+        StubSource("fear_greed", score=+70, weight=1.0),
+    ])
+    await agg.refresh()
+    assert agg.get_signal_modifier() == 20
+
+    agg2 = SentimentAggregator(sources=[
+        StubSource("fear_greed", score=-70, weight=1.0),
+    ])
+    await agg2.refresh()
+    assert agg2.get_signal_modifier() == -20

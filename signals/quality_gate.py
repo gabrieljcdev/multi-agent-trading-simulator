@@ -106,8 +106,31 @@ class QualityGate:
             signal.indicators["ofi_ema"] = ofi.ema_ofi
             signal.indicators["ofi_mod"] = ofi_mod
 
-        # ── 5. Sentiment modifier ─────────────────────────────────────────
-        score += signal.sentiment_mod
+        # ── 5. Sentiment composite + hard block ──────────────────────────
+        # Read from the aggregator singleton — the modifier is computed
+        # once per refresh and shared. signal.sentiment_mod stays on the
+        # Signal dataclass so it's logged to the DB, but the gate's
+        # decision uses the live aggregator value. Hard-block from a
+        # news-guard event short-circuits the signal entirely.
+        try:
+            from sentiment import sentiment as sentiment_aggregator
+
+            blocked, reason = sentiment_aggregator.is_hard_blocked()
+            if blocked:
+                return False, [
+                    f"{settings.SENTIMENT_HARD_BLOCK_SKIP_REASON}: {reason}"
+                ], score
+
+            sentiment_mod = sentiment_aggregator.get_signal_modifier()
+            score += sentiment_mod
+            # Mirror to the Signal field so historical analysis (the
+            # signals row) reflects what the gate actually used.
+            signal.sentiment_mod = float(sentiment_mod)
+        except Exception as e:
+            # Aggregator not constructed yet or broken — fall through to
+            # whatever the scanner pre-populated on signal.sentiment_mod.
+            logger.debug(f"sentiment aggregator skipped: {e}")
+            score += signal.sentiment_mod
 
         # ── 5b. Macro modifier (macro/) ──────────────────────────────────
         # Step-ladder modifier from the macro regime (mirrors the

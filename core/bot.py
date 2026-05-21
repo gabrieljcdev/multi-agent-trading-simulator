@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -185,6 +186,12 @@ class CryptoBot:
 
         self._closed_trade_count: int = 0
         self._running: bool = False
+
+        # BTC 30-minute snapshot for the sentiment aggregator's dump
+        # guard. Discrete sample (not a rolling window — see _heartbeat_loop)
+        # so set_btc_change_30m receives a clean 30m delta per call.
+        self._btc_price_30m_ago:      Optional[float] = None
+        self._btc_price_30m_ago_time: Optional[float] = None
 
         # Wire SignalEngine callback to our handler
         self._signal_engine.on_signal(self._on_signal)
@@ -534,15 +541,16 @@ class CryptoBot:
                 scores = await self._fetch_sentiment()
                 self._signal_engine.update_sentiment(scores)
 
-                # Feed the latest BTC price into BTCGuard's rolling history,
-                # then forward its 30-minute % change to the sentiment
-                # aggregator so its dump guard has live data.
-                btc_price = self._price_for_pair("BTC/USDT")
+                # Feed the latest BTC price into the per-signal guard
+                # (rolling window for guards.btc_guard.apply()) AND into
+                # the bot's discrete 30-minute snapshot tracker (clean
+                # delta for sentiment_aggregator.set_btc_change_30m).
+                btc_price = self._btc_price_with_fallback()
                 if btc_price is not None:
                     guard_runner.btc_guard.update_price(btc_price)
-                    pct = guard_runner.btc_guard.change_pct_30m()
-                    if pct is not None:
-                        self._sentiment.set_btc_change_30m(pct)
+                    delta = self._update_btc_snapshot(btc_price)
+                    if delta is not None:
+                        self._sentiment.set_btc_change_30m(delta)
 
                 # TODO: recompute equity from market_data + open positions
                 #       and feed self._cb_state.current_equity so drawdown stays accurate.
@@ -647,20 +655,69 @@ class CryptoBot:
             pass
         return None
 
-    def _get_trade_by_id(self, trade_id: int):
-        """Look up a single Trade row. Avoids leaking SQLAlchemy session here."""
-        # TODO: queries.get_open_trades returns a session-bound list; for closed
-        # trades we currently scan today's trades. A dedicated get_trade(id)
-        # query in database/queries.py would be cleaner — keeping it here for
-        # now so the bot does not bypass the queries layer.
+    def _btc_price_with_fallback(self) -> Optional[float]:
+        """BTC/USDT price for the heartbeat's BTC-guard snapshot.
+
+        Source priority:
+          1. market_data (the bot's primary feed)
+          2. data_sources singleton — cryptocompare publishes BTC/USD,
+             bybit_derivs publishes BTC/USDT mark price. Lets the
+             heartbeat run even before the WS streams have warmed up.
+          3. None — heartbeat skips the snapshot, no crash.
+        """
+        price = self._price_for_pair("BTC/USDT")
+        if price is not None and price > 0:
+            return price
         try:
-            todays = db_queries.get_today_trades()
-            for t in todays:
-                if t.id == trade_id:
-                    return t
+            from data_sources import data_sources as ds
+            for getter in (
+                lambda: ds.cryptocompare.get_price("BTC"),
+                lambda: ds.bybit_derivs.get_mark_price("BTC/USDT"),
+            ):
+                try:
+                    val = getter()
+                except Exception:
+                    val = None
+                if val is not None and val > 0:
+                    return float(val)
+        except Exception as e:
+            logger.debug(f"data_sources BTC fallback failed: {e}")
+        return None
+
+    def _update_btc_snapshot(self, current_price: float) -> Optional[float]:
+        """Discrete 30-minute snapshot tracker for the dump guard.
+
+        Returns a fresh delta only when the stored snapshot is at least
+        (LOOKBACK - DRIFT) minutes old, then replaces the snapshot with
+        the current price + time. Returns None on the first call (no
+        snapshot yet) and between maturity windows.
+        """
+        now = time.time()
+        if self._btc_price_30m_ago is None or self._btc_price_30m_ago_time is None:
+            self._btc_price_30m_ago = current_price
+            self._btc_price_30m_ago_time = now
+            return None
+
+        age_min = (now - self._btc_price_30m_ago_time) / 60.0
+        target = settings.BTC_GUARD_LOOKBACK_MINUTES
+        drift  = settings.BTC_GUARD_LOOKBACK_DRIFT_MINUTES
+        if age_min < (target - drift):
+            return None
+
+        prev = self._btc_price_30m_ago
+        self._btc_price_30m_ago = current_price
+        self._btc_price_30m_ago_time = now
+        if prev <= 0:
+            return None
+        return (current_price - prev) / prev * 100.0
+
+    def _get_trade_by_id(self, trade_id: int):
+        """Single Trade row by id; delegates to the queries layer."""
+        try:
+            return db_queries.get_trade_by_id(trade_id)
         except Exception as e:
             logger.warning(f"get_trade_by_id: {e}")
-        return None
+            return None
 
     async def _fetch_sentiment(self) -> dict:
         """Pull market sentiment via the pluggable aggregator.

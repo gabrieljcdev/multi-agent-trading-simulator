@@ -1137,7 +1137,7 @@ class Dashboard:
     def _signals_skipped_count(self) -> int:
         try:
             from database import queries as q
-            return len(q.get_today_skipped_signals())
+            return q.get_today_skipped_signals()
         except Exception:
             return 0
 

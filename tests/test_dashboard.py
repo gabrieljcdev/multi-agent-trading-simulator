@@ -84,7 +84,7 @@ def _patch_db_queries(monkeypatch):
     fake_q.get_open_trades.return_value = []
     fake_q.get_recent_closed_trades.return_value = []
     fake_q.get_signal_win_rate.return_value = {"total": 0, "win_rate": 0.0}
-    fake_q.get_today_skipped_signals.return_value = []
+    fake_q.get_today_skipped_signals.return_value = 0
     monkeypatch.setattr("database.queries.get_today_trades", fake_q.get_today_trades)
     monkeypatch.setattr("database.queries.get_open_trades", fake_q.get_open_trades)
     monkeypatch.setattr("database.queries.get_recent_closed_trades", fake_q.get_recent_closed_trades)
@@ -225,12 +225,11 @@ def test_session_classification():
 
 
 def test_signals_skipped_count_uses_new_query(monkeypatch):
-    """_signals_skipped_count() calls queries.get_today_skipped_signals
-    and reports its length."""
-    fake = [object(), object(), object()]  # three skipped signal stubs
+    """_signals_skipped_count() delegates to queries.get_today_skipped_signals,
+    which now returns an int directly (was a list pre-WIRE-3)."""
     monkeypatch.setattr(
         "database.queries.get_today_skipped_signals",
-        lambda: fake,
+        lambda: 3,
     )
     dash = Dashboard(_mock_bot())
     assert dash._signals_skipped_count() == 3

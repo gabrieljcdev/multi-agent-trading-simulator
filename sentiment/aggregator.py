@@ -167,6 +167,28 @@ class SentimentAggregator:
             return await self.refresh()
         return self._data
 
+    def get_signal_modifier(self) -> int:
+        """Step-ladder modifier the quality gate adds to a signal score.
+
+        Mirrors macro_monitor.get_signal_modifier() — consumers don't
+        need to know whether sentiment refreshed yet. Zero before the
+        first refresh; never None so the caller's `score += mod` stays
+        safe.
+        """
+        return int(self._data.sentiment_modifier or 0)
+
+    def is_hard_blocked(self) -> tuple[bool, str]:
+        """True (with reason) when a sentiment source has set a hard
+        block — catastrophic-event keywords from cryptopanic etc. The
+        quality gate short-circuits on this same as macro CRISIS.
+        """
+        d = self._data
+        if d.hard_block:
+            return True, d.block_reason or "sentiment_hard_block"
+        if d.news_guard_active:
+            return True, d.blocking_headline or "news_guard"
+        return False, ""
+
     def passes_session_floor(self) -> tuple[bool, str]:
         """Returns (allowed, reason). Three independent floors must all pass:
 

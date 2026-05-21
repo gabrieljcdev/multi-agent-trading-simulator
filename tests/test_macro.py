@@ -405,7 +405,7 @@ def test_macro_panel_renders_without_regime(monkeypatch):
     monkeypatch.setattr("database.queries.get_signal_win_rate",
                         lambda **kw: {"total": 0, "win_rate": 0.0})
     monkeypatch.setattr("database.queries.get_today_skipped_signals",
-                        lambda: [])
+                        lambda: 0)
 
     dash = Dashboard(_mock_bot())
     panel = dash._panel_macro()
@@ -425,7 +425,7 @@ def test_macro_panel_renders_with_regime(monkeypatch):
     monkeypatch.setattr("database.queries.get_signal_win_rate",
                         lambda **kw: {"total": 0, "win_rate": 0.0})
     monkeypatch.setattr("database.queries.get_today_skipped_signals",
-                        lambda: [])
+                        lambda: 0)
 
     dash = Dashboard(_mock_bot())
     panel = dash._panel_macro()
@@ -455,7 +455,7 @@ def test_pending_events_panel_renders_with_high_impact_soon(monkeypatch):
     monkeypatch.setattr("database.queries.get_signal_win_rate",
                         lambda **kw: {"total": 0, "win_rate": 0.0})
     monkeypatch.setattr("database.queries.get_today_skipped_signals",
-                        lambda: [])
+                        lambda: 0)
 
     dash = Dashboard(_mock_bot())
     panel = dash._panel_pending_events()
