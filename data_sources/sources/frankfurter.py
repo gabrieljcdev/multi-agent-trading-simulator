@@ -33,10 +33,10 @@ from data_sources.base import BaseDataSource, DataPoint
 
 logger = logging.getLogger(__name__)
 
-# v2 is "current" per the API root, but at the time of this change /v2
-# returns 404 on /latest — only the openapi spec is served. v1 is frozen
-# and stable, which is what we want for a data feed.
-BASE = "https://api.frankfurter.dev/v1"
+# Base URL comes from settings so version/host bumps don't require a
+# source-code change. v2 is "current" per the API root but currently
+# 404s on /latest; settings.FRANKFURTER_BASE_URL points at v1 (frozen
+# but stable), which is what we want for a data feed.
 
 # (pair, signed_exponent). Negative exponent for X/USD pairs (EUR/USD,
 # GBP/USD) because a stronger USD lowers those rates while raising DXY.
@@ -199,7 +199,8 @@ class FrankfurterSource(BaseDataSource):
                 continue
             bases.setdefault(base, []).append(quote)
 
-        path = f"{BASE}/latest" if target_date is None else f"{BASE}/{target_date}"
+        base = settings.FRANKFURTER_BASE_URL
+        path = f"{base}/latest" if target_date is None else f"{base}/{target_date}"
 
         out: dict = {}
         timeout = aiohttp.ClientTimeout(total=settings.DATA_SOURCES_HTTP_TIMEOUT_SEC)

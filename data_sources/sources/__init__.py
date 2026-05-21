@@ -33,19 +33,38 @@ handle all of that. fetch_all() should just build DataPoints; on failure
 return DataPoints with .error set, or an empty list.
 """
 
-from data_sources.sources.coinglass     import CoinglassSource
-from data_sources.sources.coingecko     import CoinGeckoSource
-from data_sources.sources.fred          import FREDSource
-from data_sources.sources.alpha_vantage import AlphaVantageSource
-from data_sources.sources.frankfurter   import FrankfurterSource
+from data_sources.sources.coinglass        import CoinglassSource
+from data_sources.sources.coingecko        import CoinGeckoSource
+from data_sources.sources.cryptocompare    import CryptoCompareSource
+from data_sources.sources.fred             import FREDSource
+from data_sources.sources.alpha_vantage    import AlphaVantageSource
+from data_sources.sources.frankfurter      import FrankfurterSource
+from data_sources.sources.binance_futures  import BinanceFuturesSource
+from data_sources.sources.bybit_derivs     import BybitDerivsSource
+from data_sources.sources.cftc_cot         import CFTCCOTSource
+from data_sources.sources.world_bank       import WorldBankSource
+from data_sources.sources.imf              import IMFSource
+from data_sources.sources.ecb              import ECBSource
+from data_sources.sources.us_treasury      import USTreasurySource
 
 
 # Ordered registry — the aggregator iterates this list to expose each
 # instance as data_sources.<source_id>. Append new instances here.
 REGISTERED_SOURCES: list = [
+    # Crypto market + derivatives
     CoinglassSource(),
     CoinGeckoSource(),
+    CryptoCompareSource(),
+    BinanceFuturesSource(),
+    BybitDerivsSource(),
+    CFTCCOTSource(),
+    # Macro / rates / FX
     FREDSource(),
     AlphaVantageSource(),
     FrankfurterSource(),
+    ECBSource(),
+    USTreasurySource(),
+    # Global / slow-moving
+    WorldBankSource(),
+    IMFSource(),
 ]

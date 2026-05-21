@@ -581,6 +581,67 @@ DATA_DXY_WEAK_THRESHOLD   = 95     # test: 92-98
 ALPHA_VANTAGE_DAILY_CALL_BUDGET = 20   # test: 10-25
 ALPHA_VANTAGE_PACE_SEC          = 1.3  # test: 1.1-3.0  (sleep between calls)
 
+# ─── Base URLs (free, no-key APIs unless noted) ─────────────
+# Surfaced as settings so per-host failovers and version bumps don't
+# require touching source files. The Frankfurter "app" host 301-redirects
+# to "dev/v1" (legacy path) — we hit the redirect target directly.
+FRANKFURTER_BASE_URL      = "https://api.frankfurter.dev/v1"
+WORLD_BANK_BASE_URL       = "https://api.worldbank.org/v2"
+IMF_DATAMAPPER_URL        = "https://www.imf.org/external/datamapper/api/v1"
+ECB_BASE_URL              = "https://data-api.ecb.europa.eu/service/data"
+# US Treasury exposes a daily-rates CSV at this base path; we read the
+# current month and pull the most recent row. Mostly redundant with FRED.
+US_TREASURY_BASE_URL      = "https://home.treasury.gov/resource-center/data-chart-center/interest-rates/daily-treasury-rates.csv/all"
+# CFTC publishes the disaggregated COT report via a Socrata-style
+# resource endpoint; the user-provided "exports/json" path is a bulk
+# dataset download, not queryable.
+CFTC_BASE_URL             = "https://publicreporting.cftc.gov/resource/jun7-fc8e.json"
+BINANCE_FUTURES_BASE_URL  = "https://fapi.binance.com"
+BYBIT_BASE_URL            = "https://api.bybit.com"
+CRYPTOCOMPARE_BASE_URL    = "https://min-api.cryptocompare.com/data"
+
+# ─── New-source refresh intervals + watch lists ─────────────
+CRYPTOCOMPARE_REFRESH_SEC = 300   # test: 60-900
+CRYPTOCOMPARE_FSYMS       = ["BTC", "ETH", "SOL", "BNB", "XRP"]
+CRYPTOCOMPARE_TSYM        = "USD"
+
+BINANCE_FUTURES_REFRESH_SEC = 60  # test: 15-300
+BINANCE_FUTURES_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"]
+
+BYBIT_REFRESH_SEC         = 60    # test: 15-300
+BYBIT_SYMBOLS             = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+
+CFTC_REFRESH_SEC          = 3600 * 6   # COT is weekly; check every 6h
+CFTC_CONTRACT             = "BITCOIN - CHICAGO MERCANTILE EXCHANGE"
+
+WORLD_BANK_REFRESH_SEC    = 86400      # yearly data — daily refresh ample
+WORLD_BANK_COUNTRIES      = ["USA", "EUU", "CHN", "JPN", "GBR"]
+WORLD_BANK_INDICATORS = {
+    "gdp_growth_pct":  "NY.GDP.MKTP.KD.ZG",
+    "inflation_pct":   "FP.CPI.TOTL.ZG",
+    "unemployment_pct":"SL.UEM.TOTL.ZS",
+}
+
+IMF_REFRESH_SEC           = 86400      # quarterly data
+IMF_COUNTRIES             = ["USA", "EUR", "CHN", "JPN", "GBR"]
+IMF_INDICATORS = {
+    "gdp_per_capita":     "NGDPDPC",
+    "inflation_yoy_pct":  "PCPIPCH",
+    "unemployment_pct":   "LUR",
+}
+
+ECB_REFRESH_SEC           = 3600       # daily series
+# (dataflow, key, metric_name). MRR_RT.LEV is the main refinancing rate.
+ECB_SERIES = [
+    ("FM",  "D.U2.EUR.4F.KR.MRR_RT.LEV", "refinancing_rate"),
+    ("FM",  "B.U2.EUR.4F.KR.DFR.LEV",    "deposit_facility_rate"),
+    ("EXR", "D.USD.EUR.SP00.A",          "eur_usd_spot"),
+]
+
+US_TREASURY_REFRESH_SEC   = 3600
+
+BTC_FUTURES_FSYM          = "BTC"      # convenience constant for cross-source BTC accessors
+
 # ─── Macro modifiers (quality gate, legacy direct-from-data_sources) ─
 # Used as a fallback if macro/ module is not active. The macro module's
 # step-ladder modifier supersedes these once macro_monitor is wired.

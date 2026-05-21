@@ -25,11 +25,19 @@ from unittest.mock import patch
 import pytest
 
 from data_sources import DataSources, DataPoint, BaseDataSource
-from data_sources.sources.alpha_vantage import AlphaVantageSource
-from data_sources.sources.coingecko     import CoinGeckoSource
-from data_sources.sources.coinglass     import CoinglassSource
-from data_sources.sources.fred          import FREDSource
-from data_sources.sources.frankfurter   import FrankfurterSource
+from data_sources.sources.alpha_vantage    import AlphaVantageSource
+from data_sources.sources.coingecko        import CoinGeckoSource
+from data_sources.sources.coinglass        import CoinglassSource
+from data_sources.sources.cryptocompare    import CryptoCompareSource
+from data_sources.sources.fred             import FREDSource
+from data_sources.sources.frankfurter      import FrankfurterSource
+from data_sources.sources.binance_futures  import BinanceFuturesSource
+from data_sources.sources.bybit_derivs     import BybitDerivsSource
+from data_sources.sources.cftc_cot         import CFTCCOTSource
+from data_sources.sources.world_bank       import WorldBankSource
+from data_sources.sources.imf              import IMFSource
+from data_sources.sources.ecb              import ECBSource
+from data_sources.sources.us_treasury      import USTreasurySource
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -277,6 +285,132 @@ def test_each_source_lists_expected_metrics():
     for m in ("cpi", "yield_10y", "fed_funds", "vix"):
         assert m in fred
 
+    cc = CryptoCompareSource().list_metrics()
+    for m in ("price", "volume_24h", "market_cap", "change_pct_24h"):
+        assert m in cc
+
+    bf = BinanceFuturesSource().list_metrics()
+    for m in ("open_interest", "funding_rate", "long_short_ratio"):
+        assert m in bf
+
+    by = BybitDerivsSource().list_metrics()
+    for m in ("open_interest", "funding_rate", "mark_price"):
+        assert m in by
+
+    cftc = CFTCCOTSource().list_metrics()
+    for m in ("spec_net", "spec_long", "spec_short", "open_interest"):
+        assert m in cftc
+
+    wb = WorldBankSource().list_metrics()
+    for m in ("gdp_growth_pct", "inflation_pct", "unemployment_pct"):
+        assert m in wb
+
+    imf = IMFSource().list_metrics()
+    for m in ("gdp_per_capita", "inflation_yoy_pct", "unemployment_pct"):
+        assert m in imf
+
+    ecb = ECBSource().list_metrics()
+    for m in ("refinancing_rate", "deposit_facility_rate", "eur_usd_spot"):
+        assert m in ecb
+
+    treas = USTreasurySource().list_metrics()
+    for m in ("yield_10y", "yield_2y", "yield_curve_2_10_spread"):
+        assert m in treas
+
+
+def test_cryptocompare_requires_key(monkeypatch):
+    monkeypatch.delenv("CRYPTOCOMPARE_API_KEY", raising=False)
+    assert CryptoCompareSource().is_available() is False
+    monkeypatch.setenv("CRYPTOCOMPARE_API_KEY", "x")
+    assert CryptoCompareSource().is_available() is True
+
+
+def test_no_key_sources_are_available():
+    """Sources that don't gate on a key are always available."""
+    assert BinanceFuturesSource().is_available() is True
+    assert BybitDerivsSource().is_available() is True
+    assert CFTCCOTSource().is_available() is True
+    assert WorldBankSource().is_available() is True
+    assert IMFSource().is_available() is True
+    assert ECBSource().is_available() is True
+    assert USTreasurySource().is_available() is True
+
+
+def test_binance_futures_symbol_format():
+    """Surface BTC/USDT (system pair vocab) from BTCUSDT (exchange API)."""
+    s = BinanceFuturesSource()
+    assert s._fmt("BTCUSDT") == "BTC/USDT"
+    assert s._fmt("ETHUSDC") == "ETH/USDC"
+    assert s._fmt("UNKNOWN") == "UNKNOWN"
+
+
+def test_us_treasury_csv_parsing(monkeypatch):
+    """Treasury endpoint returns CSV; the source must pull the first
+    data row and produce DataPoints per tenor + a 2y/10y spread."""
+    csv_body = (
+        'Date,"1 Mo","3 Mo","6 Mo","1 Yr","2 Yr","5 Yr","10 Yr","20 Yr","30 Yr"\n'
+        '05/20/2026,3.65,3.65,3.75,3.79,4.04,4.22,4.57,5.10,5.11\n'
+        '05/19/2026,3.66,3.66,3.77,3.83,4.13,4.32,4.67,5.19,5.18\n'
+    )
+
+    class _FakeResp:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): pass
+        async def text(self): return csv_body
+
+    class _FakeSession:
+        def __init__(self, *a, **kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): pass
+        def get(self, url, params=None): return _FakeResp()
+
+    monkeypatch.setattr(
+        "data_sources.sources.us_treasury.aiohttp.ClientSession",
+        _FakeSession,
+    )
+
+    s = USTreasurySource()
+    points = asyncio.run(s.fetch_all())
+    by_metric = {p.metric: p.value for p in points}
+    assert by_metric["yield_10y"] == 4.57
+    assert by_metric["yield_2y"] == 4.04
+    assert by_metric["yield_curve_2_10_spread"] == pytest.approx(0.53)
+
+
+def test_cftc_parses_latest_row(monkeypatch):
+    """COT report — pull non-comm long/short, derive net + L/S ratio."""
+    sample = [{
+        "report_date_as_yyyy_mm_dd": "2026-05-12T00:00:00.000",
+        "noncomm_positions_long_all": "18172",
+        "noncomm_positions_short_all": "16942",
+        "open_interest_all": "23981",
+    }]
+
+    class _FakeResp:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): pass
+        async def json(self, content_type=None): return sample
+
+    class _FakeSession:
+        def __init__(self, *a, **kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): pass
+        def get(self, url, params=None): return _FakeResp()
+
+    monkeypatch.setattr(
+        "data_sources.sources.cftc_cot.aiohttp.ClientSession",
+        _FakeSession,
+    )
+
+    s = CFTCCOTSource()
+    points = asyncio.run(s.fetch_all())
+    by_metric = {p.metric: p.value for p in points}
+    assert by_metric["spec_long"] == 18172.0
+    assert by_metric["spec_short"] == 16942.0
+    assert by_metric["spec_net"] == 1230.0
+    assert by_metric["open_interest"] == 23981.0
+    assert by_metric["long_short_ratio"] == pytest.approx(18172 / 16942)
+
 
 # ─────────────────────────────────────────────────────────────────────────
 # Source convenience accessors against a primed cache
@@ -482,7 +616,11 @@ def test_aggregator_never_imports_concrete_sources():
     file that imports concrete classes."""
     import inspect, data_sources
     src = inspect.getsource(data_sources)
-    for klass in ("Coinglass", "CoinGecko", "FRED", "AlphaVantage", "Frankfurter"):
+    for klass in (
+        "Coinglass", "CoinGecko", "FRED", "AlphaVantage", "Frankfurter",
+        "CryptoCompare", "BinanceFutures", "BybitDerivs", "CFTCCOT",
+        "WorldBank", "IMF", "ECB", "USTreasury",
+    ):
         assert klass not in src, f"aggregator must not reference {klass}"
 
 
