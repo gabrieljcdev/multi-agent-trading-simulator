@@ -361,6 +361,35 @@ def test_frankfurter_dxy_strength():
     assert s.is_dxy_weak() is True
 
 
+def test_frankfurter_dxy_proxy_formula():
+    """Geometric ICE-style DXY: 50.14348112 × Π rate^exp.
+
+    With a snapshot near real-world May 2026 rates we expect ~99 — the
+    earlier linear-weighted-sum formula returned 2236, off by 20x. Keep
+    a tolerance band wide enough to absorb the missing index reset but
+    tight enough to catch a regression to the old broken implementation.
+    """
+    s = FrankfurterSource()
+    snapshot = {
+        "EUR/USD": 1.16,
+        "USD/JPY": 159.03,
+        "GBP/USD": 1.34,
+        "USD/CAD": 1.38,
+        "USD/SEK": 9.38,
+        "USD/CHF": 0.79,
+    }
+    dxy = s._dxy_proxy(snapshot)
+    assert dxy is not None
+    assert 95 < dxy < 105, f"DXY proxy {dxy:.2f} not in expected band 95–105"
+
+
+def test_frankfurter_dxy_proxy_missing_leg_returns_none():
+    """Any missing leg → None (caller renders dim '—' rather than NaN)."""
+    s = FrankfurterSource()
+    assert s._dxy_proxy({"EUR/USD": 1.16}) is None
+    assert s._dxy_proxy({}) is None
+
+
 def test_fred_yield_curve_inversion_falls_back_to_legs():
     s = FREDSource()
     assert s.is_yield_curve_inverted() is False

@@ -1,18 +1,29 @@
 """
 data_sources/sources/frankfurter.py
 
-Free FX rates via api.frankfurter.app (ECB reference rates).
+Free FX rates via api.frankfurter.dev (ECB reference rates).
 
-No key, no rate limit. We pull every settings.FRANKFURTER_PAIRS pair in
-two calls (today + yesterday) so we can derive a 24h change and a
-heuristic DXY proxy. The proxy is weighted to mirror ICE's basket but
-calculated against today's rates only (Frankfurter doesn't publish DXY
-directly).
+No key, no rate limit. We pull every settings.FRANKFURTER_PAIRS pair on
+the /latest endpoint plus the previous publication (latest_date - 1
+calendar day) to derive a 24h change. The DXY proxy uses the canonical
+ICE geometric formula:
+
+    DXY = 50.14348112
+        × EURUSD^(-0.576)
+        × USDJPY^( 0.136)
+        × GBPUSD^(-0.119)
+        × USDCAD^( 0.091)
+        × USDSEK^( 0.042)
+        × USDCHF^( 0.036)
+
+X/USD pairs use a negative exponent (so a stronger USD lowers the rate
+and raises the index); USD/X pairs use a positive exponent.
 """
 
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timedelta
 from typing import Optional
 
 import aiohttp
@@ -22,21 +33,27 @@ from data_sources.base import BaseDataSource, DataPoint
 
 logger = logging.getLogger(__name__)
 
-LATEST_ENDPOINT = "https://api.frankfurter.app/latest"
+# v2 is "current" per the API root, but at the time of this change /v2
+# returns 404 on /latest — only the openapi spec is served. v1 is frozen
+# and stable, which is what we want for a data feed.
+BASE = "https://api.frankfurter.dev/v1"
 
-# ICE DXY weights — EUR is ~58% of true DXY weight, so the proxy tracks
-# the real index closely enough for regime classification (RISK_OFF /
-# STRONG / WEAK signals). Not suitable for trading the index itself.
-DXY_WEIGHTS = {
-    "EUR/USD": 0.576,
-    "USD/JPY": 0.136,
-    "GBP/USD": 0.119,
-    "USD/CAD": 0.091,
-    "USD/CHF": 0.036,
-}
+# (pair, signed_exponent). Negative exponent for X/USD pairs (EUR/USD,
+# GBP/USD) because a stronger USD lowers those rates while raising DXY.
+DXY_LEGS: list[tuple[str, float]] = [
+    ("EUR/USD", -0.576),
+    ("USD/JPY",  0.136),
+    ("GBP/USD", -0.119),
+    ("USD/CAD",  0.091),
+    ("USD/SEK",  0.042),
+    ("USD/CHF",  0.036),
+]
 
-# Frankfurter uses USD as the canonical quote — for "USD/JPY" we ask
-# for the JPY rate against USD, for "EUR/USD" we ask for USD against EUR.
+# Calibration constant that anchors the index to 100 at March 1973.
+DXY_BASE = 50.14348112
+
+# Pair → (base, quote) for Frankfurter requests. Frankfurter takes one
+# `from` currency and returns rates against every other listed `to`.
 _PAIR_FETCH: dict[str, tuple[str, str]] = {
     "EUR/USD": ("EUR", "USD"),
     "GBP/USD": ("GBP", "USD"),
@@ -45,6 +62,7 @@ _PAIR_FETCH: dict[str, tuple[str, str]] = {
     "USD/JPY": ("USD", "JPY"),
     "USD/CHF": ("USD", "CHF"),
     "USD/CAD": ("USD", "CAD"),
+    "USD/SEK": ("USD", "SEK"),
 }
 
 
@@ -57,9 +75,9 @@ class FrankfurterSource(BaseDataSource):
 
     METRICS = (
         "fx_rate",        # per-pair rate
-        "fx_change_24h",  # per-pair % change vs yesterday
-        "dxy",            # weighted proxy
-        "dxy_change_24h", # weighted proxy 24h change
+        "fx_change_24h",  # per-pair % change vs previous publication
+        "dxy",            # geometric DXY proxy
+        "dxy_change_24h", # proxy 24h change
     )
 
     def list_metrics(self) -> list[str]:
@@ -69,8 +87,22 @@ class FrankfurterSource(BaseDataSource):
         pairs = list(settings.FRANKFURTER_PAIRS)
 
         try:
-            today = await self._fetch_rates(pairs)
-            yesterday = await self._fetch_rates(pairs, days_ago=1)
+            today = await self._fetch_rates(pairs)  # /latest
+            yesterday = {}
+            latest_date = today.get("_date", "")
+            if latest_date:
+                # Walk back one CALENDAR day from /latest's published
+                # date. Frankfurter returns the latest *available* rates
+                # ≤ the requested date, so weekends/holidays roll back
+                # naturally — what matters is that we don't ask for the
+                # same date /latest already gave us.
+                try:
+                    prev_dt = datetime.strptime(latest_date, "%Y-%m-%d") - timedelta(days=1)
+                    yesterday = await self._fetch_rates(
+                        pairs, target_date=prev_dt.strftime("%Y-%m-%d"),
+                    )
+                except Exception as e:
+                    logger.debug(f"frankfurter previous-day fetch failed: {e}")
         except Exception as e:
             logger.warning(f"frankfurter fetch failed: {e}")
             return [DataPoint(
@@ -88,19 +120,24 @@ class FrankfurterSource(BaseDataSource):
                 source_id=self.source_id, metric="fx_rate",
                 symbol=pair, value=rate, raw_data={"date": today.get("_date")},
             ))
-            if prev:
+            if prev and prev != 0:
                 change_pct = (rate - prev) / prev * 100.0
                 points.append(DataPoint(
                     source_id=self.source_id, metric="fx_change_24h",
                     symbol=pair, value=change_pct,
-                    raw_data={"today": rate, "yesterday": prev},
+                    raw_data={
+                        "today":     rate,
+                        "yesterday": prev,
+                        "today_date":     today.get("_date"),
+                        "yesterday_date": yesterday.get("_date"),
+                    },
                 ))
 
         dxy = self._dxy_proxy(today)
         if dxy is not None:
             points.append(DataPoint(
                 source_id=self.source_id, metric="dxy", value=dxy,
-                raw_data={"weights": DXY_WEIGHTS},
+                raw_data={"legs": [pair for pair, _ in DXY_LEGS]},
             ))
             prev_dxy = self._dxy_proxy(yesterday)
             if prev_dxy and prev_dxy != 0:
@@ -146,11 +183,15 @@ class FrankfurterSource(BaseDataSource):
     async def _fetch_rates(
         self,
         pairs: list[str],
-        days_ago: int = 0,
+        target_date: Optional[str] = None,
     ) -> dict:
-        """Returns {pair: rate, "_date": <date>} for the requested pairs."""
-        # Group pairs by base currency so we minimise round-trips. Each
-        # base hits one Frankfurter call returning N quote rates.
+        """Returns {pair: rate, "_date": <iso>} for the requested pairs.
+
+        target_date is None → /latest. Otherwise /<YYYY-MM-DD>.
+        Pairs are grouped by `from` currency so each `from` only costs
+        one HTTP round-trip.
+        """
+        # Group pairs by base currency so we minimise calls.
         bases: dict[str, list[str]] = {}
         for pair in pairs:
             base, quote = _PAIR_FETCH.get(pair, (None, None))
@@ -158,21 +199,20 @@ class FrankfurterSource(BaseDataSource):
                 continue
             bases.setdefault(base, []).append(quote)
 
-        path = LATEST_ENDPOINT
-        if days_ago > 0:
-            from datetime import datetime, timedelta
-            day = (datetime.utcnow() - timedelta(days=days_ago)).strftime("%Y-%m-%d")
-            path = f"https://api.frankfurter.app/{day}"
+        path = f"{BASE}/latest" if target_date is None else f"{BASE}/{target_date}"
 
         out: dict = {}
         timeout = aiohttp.ClientTimeout(total=settings.DATA_SOURCES_HTTP_TIMEOUT_SEC)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             for base, quotes in bases.items():
-                params = {"from": base, "to": ",".join(set(quotes))}
+                params = {"base": base, "symbols": ",".join(sorted(set(quotes)))}
                 async with session.get(path, params=params) as r:
                     payload = await r.json(content_type=None)
                 rates = payload.get("rates", {}) or {}
-                out["_date"] = payload.get("date", "")
+                # Every response carries the same publication date — keep
+                # the most recently-seen one (they should all match).
+                if payload.get("date"):
+                    out["_date"] = payload.get("date")
                 for pair in pairs:
                     b, q = _PAIR_FETCH.get(pair, (None, None))
                     if b == base and q in rates:
@@ -180,17 +220,17 @@ class FrankfurterSource(BaseDataSource):
         return out
 
     def _dxy_proxy(self, rates: dict) -> Optional[float]:
-        """Weighted geometric-mean-ish proxy. Returns None if any required
-        leg is missing. The formula matches the project spec — it's a
-        rough proxy, not the actual ICE DXY calculation."""
-        legs = []
-        for pair, weight in DXY_WEIGHTS.items():
+        """ICE DXY geometric product. Returns None if any required leg
+        is missing.
+
+        Each leg is rate^exponent — negative exponent for X/USD pairs so
+        a stronger USD raises the index. Product times the calibration
+        constant 50.14348112 anchors the basket to 100 at March 1973.
+        """
+        product = 1.0
+        for pair, exponent in DXY_LEGS:
             rate = rates.get(pair)
             if rate is None or rate <= 0:
                 return None
-            if pair.startswith("USD/"):
-                legs.append(weight * rate)
-            else:
-                # EUR/USD, GBP/USD — invert so a stronger USD raises the proxy.
-                legs.append(weight * (1.0 / rate))
-        return 100.0 * sum(legs)
+            product *= rate ** exponent
+        return DXY_BASE * product

@@ -564,6 +564,7 @@ FRED_SERIES = [
 
 FRANKFURTER_PAIRS = [
     "EUR/USD", "GBP/USD", "USD/JPY", "USD/CHF",
+    "USD/SEK",   # needed for an accurate DXY proxy (~4% basket weight)
     "AUD/USD", "USD/CAD", "NZD/USD",
 ]
 
