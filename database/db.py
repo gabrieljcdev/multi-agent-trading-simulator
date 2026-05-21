@@ -32,7 +32,18 @@ def set_sqlite_pragma(dbapi_conn, _):
     cursor.execute("PRAGMA synchronous=NORMAL")
     cursor.close()
 
-SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+SessionLocal = sessionmaker(
+    bind=engine,
+    autoflush=False,
+    autocommit=False,
+    # Existing query helpers return ORM rows out of `with get_session()`
+    # blocks (queries.get_open_trades, get_data_history, …). The default
+    # expire_on_commit=True would mark every attribute stale at commit,
+    # making `row.value` raise DetachedInstanceError as soon as the
+    # session closes. Keeping attributes populated post-commit matches
+    # how consumers (dashboard panels, tests) actually use the rows.
+    expire_on_commit=False,
+)
 
 
 def init_db():

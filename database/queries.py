@@ -12,6 +12,7 @@ from .models import (
     Candle, Signal, Trade, SentimentSnapshot, SentimentLog,
     DailyStats, CircuitBreakerLog,
     PortfolioSnapshot, AgentEvent, ArbTrade,
+    DataLog,
 )
 
 
@@ -457,6 +458,99 @@ def log_circuit_breaker(reason: str, detail: str, auto_resume_at: datetime = Non
             detail=detail,
             auto_resume_at=auto_resume_at
         ))
+
+
+# ── Data sources (macro / on-chain / fx) ───────────────────
+
+def log_data_point(point) -> None:
+    """Persist a data_sources.base.DataPoint to data_log.
+
+    `point` is duck-typed (DataPoint) to avoid a queries→data_sources
+    import cycle. The DataPoint's own timestamp is float epoch — we store
+    a datetime for DB ergonomics.
+    """
+    from datetime import datetime as _dt
+    ts = _dt.utcfromtimestamp(point.timestamp) if getattr(point, "timestamp", 0) else _dt.utcnow()
+    with get_session() as s:
+        s.add(DataLog(
+            timestamp=ts,
+            source_id=point.source_id,
+            metric=point.metric,
+            symbol=point.symbol,
+            value=point.value,
+            raw_data=point.raw_data,
+            error=point.error,
+        ))
+
+
+def get_data_history(
+    source_id: str,
+    metric: str,
+    symbol: Optional[str] = None,
+    hours: int = 24,
+) -> list:
+    """Chronological list of DataLog rows for a (source, metric[, symbol]).
+
+    Pass symbol=None for global metrics (VIX, DXY, CPI). Newest last so
+    callers can plot directly.
+    """
+    since = datetime.utcnow() - timedelta(hours=hours)
+    with get_session() as s:
+        q = (
+            s.query(DataLog)
+            .filter(DataLog.source_id == source_id,
+                    DataLog.metric    == metric,
+                    DataLog.timestamp >= since)
+        )
+        if symbol is None:
+            q = q.filter(DataLog.symbol.is_(None))
+        else:
+            q = q.filter(DataLog.symbol == symbol)
+        return q.order_by(DataLog.timestamp).all()
+
+
+def get_latest_data_point(
+    source_id: str,
+    metric: str,
+    symbol: Optional[str] = None,
+) -> Optional[DataLog]:
+    """Most recent DataLog row for the key. None if nothing has been logged."""
+    with get_session() as s:
+        q = (
+            s.query(DataLog)
+            .filter(DataLog.source_id == source_id,
+                    DataLog.metric    == metric)
+        )
+        if symbol is None:
+            q = q.filter(DataLog.symbol.is_(None))
+        else:
+            q = q.filter(DataLog.symbol == symbol)
+        return q.order_by(desc(DataLog.timestamp)).first()
+
+
+def get_data_at_time(
+    source_id: str,
+    metric: str,
+    timestamp: datetime,
+    symbol: Optional[str] = None,
+) -> Optional[DataLog]:
+    """Closest DataLog row at or before the given timestamp.
+
+    Used for retrospective analysis — "what was VIX when this trade
+    opened?". Returns None if nothing was logged before that instant.
+    """
+    with get_session() as s:
+        q = (
+            s.query(DataLog)
+            .filter(DataLog.source_id == source_id,
+                    DataLog.metric    == metric,
+                    DataLog.timestamp <= timestamp)
+        )
+        if symbol is None:
+            q = q.filter(DataLog.symbol.is_(None))
+        else:
+            q = q.filter(DataLog.symbol == symbol)
+        return q.order_by(desc(DataLog.timestamp)).first()
 
 
 # ── Analytics helpers (used by predictive engine) ──────────

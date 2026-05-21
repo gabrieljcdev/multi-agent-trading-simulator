@@ -223,6 +223,30 @@ class SentimentLog(Base):
     )
 
 
+class DataLog(Base):
+    """Every DataPoint observed by data_sources/.
+
+    One row per (source_id, metric, symbol, timestamp). Same pattern as
+    SentimentLog — every fetch is preserved so retrospective analysis
+    can ask "what was VIX when this trade opened?" without needing to
+    replay external APIs.
+    """
+    __tablename__ = "data_log"
+
+    id        = Column(Integer, primary_key=True)
+    timestamp = Column(DateTime, nullable=False, default=datetime.utcnow)
+    source_id = Column(String(30), nullable=False)
+    metric    = Column(String(40), nullable=False)
+    symbol    = Column(String(20))           # nullable — global metrics omit it
+    value     = Column(Float)
+    raw_data  = Column(JSON)
+    error     = Column(Text)
+
+    __table_args__ = (
+        Index("ix_data_log_lookup", "source_id", "metric", "symbol", "timestamp"),
+    )
+
+
 class Prediction(Base):
     """Predictive model outputs per signal (phase 2 feature)."""
     __tablename__ = "predictions"

@@ -189,6 +189,19 @@ class CryptoBot:
         # Wire SignalEngine callback to our handler
         self._signal_engine.on_signal(self._on_signal)
 
+        # Macro / on-chain / FX data sources. Pub/sub example: log a
+        # CRITICAL line whenever VIX crosses into the crisis regime. The
+        # filter avoids waking on every routine VIX tick.
+        try:
+            from data_sources import data_sources as ds
+            ds.subscribe(
+                "alpha_vantage.vix",
+                self._on_vix_crisis,
+                filter=lambda dp: dp.value >= settings.DATA_VIX_CRISIS_MIN,
+            )
+        except Exception as e:
+            logger.debug(f"data_sources VIX subscription skipped: {e}")
+
     # ── Public API ──────────────────────────────────────────────────────
 
     async def start(self):
@@ -201,6 +214,18 @@ class CryptoBot:
         logger.info(f"  Strategy: {self._strategy.name}")
         logger.info(f"  Approval: {settings.APPROVAL_MODE}")
 
+        # Data sources are imported lazily so a missing optional dep
+        # never blocks bot startup.
+        try:
+            from data_sources import data_sources as ds
+            data_sources_loop = ds.run_refresh_loop(
+                settings.DATA_SOURCES_REFRESH_LOOP_SEC
+            )
+        except Exception as e:
+            logger.warning(f"data_sources refresh loop disabled: {e}")
+            async def _noop(): return
+            data_sources_loop = _noop()
+
         await asyncio.gather(
             self._market_data.start(),
             self._cycle_loop(),
@@ -208,7 +233,22 @@ class CryptoBot:
             self._position_watcher_loop(),
             self._self_review_loop(),
             self._future_price_tracker_loop(),
+            data_sources_loop,
             return_exceptions=True,
+        )
+
+    def _on_vix_crisis(self, new_point, prev_point) -> None:
+        """data_sources subscriber — fires when VIX clears DATA_VIX_CRISIS_MIN.
+
+        Critical-level log only; the macro modifier in the quality gate
+        already penalises crisis-regime signals automatically. A future
+        agent can hook the same channel to flip its risk regime.
+        """
+        prev_val = getattr(prev_point, "value", None)
+        logger.critical(
+            f"VIX crisis: {new_point.value:.1f} "
+            f"(prev {prev_val if prev_val is not None else 'n/a'}) — "
+            "consider manual review"
         )
 
     async def stop(self):

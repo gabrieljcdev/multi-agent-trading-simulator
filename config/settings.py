@@ -521,6 +521,61 @@ SENTIMENT_WEIGHT_GOOGLE_TRENDS = 0.1
 SENTIMENT_WEIGHT_TELEGRAM      = 0.05
 
 # ══════════════════════════════════════════════════════════════════════════════
+# PLUGGABLE DATA SOURCES (macro / on-chain / fx / etc.)
+# ══════════════════════════════════════════════════════════════════════════════
+# Same plugin pattern as the sentiment aggregator: each source publishes
+# DataPoints into a shared cache; the dashboard, quality gate, and any agent
+# can pull (data_sources.<id>.get_*) or subscribe (pub/sub on DataPoint keys).
+
+# ─── Refresh intervals ──────────────────────
+COINGLASS_REFRESH_SEC     = 300     # test: 60-600
+FRED_REFRESH_SEC          = 3600    # test: 1800-7200
+ALPHA_VANTAGE_REFRESH_SEC = 900     # test: 300-1800
+FRANKFURTER_REFRESH_SEC   = 3600    # test: 1800-7200
+
+DATA_SOURCES_REFRESH_LOOP_SEC = 60  # test: 30-300  (top-level refresh_all tick)
+DATA_SOURCES_HTTP_TIMEOUT_SEC = 10  # test: 5-30
+
+# ─── Watch lists ────────────────────────────
+COINGLASS_WATCH_PAIRS = [
+    "BTC/USDT",  "ETH/USDT",  "SOL/USDT",  "BNB/USDT",
+    "AVAX/USDT", "LINK/USDT", "DOT/USDT",  "MATIC/USDT",
+    "NEAR/USDT", "APT/USDT",  "INJ/USDT",  "ARB/USDT",
+    "OP/USDT",   "SUI/USDT",  "ATOM/USDT", "ADA/USDT",
+]
+
+ALPHA_VANTAGE_SYMBOLS = [
+    "VIX", "SPY", "QQQ", "GLD", "TLT",
+]
+
+FRED_SERIES = [
+    "CPIAUCSL", "DGS10", "DGS2", "DGS30",
+    "DFF",      "M2SL",  "UNRATE", "T10Y2Y",
+]
+
+FRANKFURTER_PAIRS = [
+    "EUR/USD", "GBP/USD", "USD/JPY", "USD/CHF",
+    "AUD/USD", "USD/CAD", "NZD/USD",
+]
+
+# ─── Risk regime thresholds ─────────────────
+DATA_VIX_RISK_ON_MAX     = 15      # test: 12-18
+DATA_VIX_RISK_OFF_MIN    = 25      # test: 22-30
+DATA_VIX_CRISIS_MIN      = 35      # test: 30-40
+DATA_DXY_STRONG_THRESHOLD = 105    # test: 102-108
+DATA_DXY_WEAK_THRESHOLD   = 95     # test: 92-98
+
+# ─── Rate limiting ──────────────────────────
+# Alpha Vantage free tier is 25/day, 5/min. Leave headroom.
+ALPHA_VANTAGE_DAILY_CALL_BUDGET = 20   # test: 10-25
+
+# ─── Macro modifiers (quality gate) ─────────
+MACRO_RISK_OFF_PENALTY        = -5     # test: -10 to -2
+MACRO_CRISIS_PENALTY          = -20    # test: -25 to -15
+MACRO_DXY_STRONG_LONG_PENALTY = -5     # test: -10 to -2
+MACRO_YIELD_INVERTED_PENALTY  = -3     # test: -6 to -1
+
+# ══════════════════════════════════════════════════════════════════════════════
 # BOT LOOP TIMING
 # ══════════════════════════════════════════════════════════════════════════════
 

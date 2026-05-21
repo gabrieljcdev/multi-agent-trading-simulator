@@ -109,6 +109,31 @@ class QualityGate:
         # ── 5. Sentiment modifier ─────────────────────────────────────────
         score += signal.sentiment_mod
 
+        # ── 5b. Macro context (data_sources) ──────────────────────────────
+        # Risk-off / crisis VIX, strong DXY versus longs, yield-curve
+        # inversion. Reads cached values only — never blocks on a fetch.
+        # Missing macro data must never block the signal.
+        try:
+            from data_sources import data_sources as ds
+
+            risk = ds.alpha_vantage.get_risk_sentiment()
+            if risk == "RISK_OFF":
+                score += settings.MACRO_RISK_OFF_PENALTY
+                signal.indicators["macro_risk"] = risk
+            elif risk == "CRISIS":
+                score += settings.MACRO_CRISIS_PENALTY
+                signal.indicators["macro_risk"] = risk
+
+            if signal.direction == "long" and ds.frankfurter.is_dxy_strong():
+                score += settings.MACRO_DXY_STRONG_LONG_PENALTY
+                signal.indicators["macro_dxy_strong"] = True
+
+            if ds.fred.is_yield_curve_inverted():
+                score += settings.MACRO_YIELD_INVERTED_PENALTY
+                signal.indicators["macro_yield_inverted"] = True
+        except Exception as e:
+            logger.debug(f"macro modifier skipped: {e}")
+
         # ── 6. Multi-timeframe confirmation ───────────────────────────────
         if settings.REQUIRE_MULTI_TF_CONFIRM:
             tf_count = signal.timeframe_confirmations

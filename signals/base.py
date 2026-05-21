@@ -75,9 +75,10 @@ class Signal:
 
     def summary(self) -> str:
         """One-line summary for logging."""
+        rsi_str = f"{self.rsi:.0f}" if self.rsi is not None else "n/a"
         return (
             f"{self.signal_type.upper()} {self.pair} {self.direction.upper()} "
-            f"score={self.score:.0f} rsi={self.rsi:.0f if self.rsi else 'n/a'}"
+            f"score={self.score:.0f} rsi={rsi_str}"
         )
 
     def to_db_dict(self) -> dict:

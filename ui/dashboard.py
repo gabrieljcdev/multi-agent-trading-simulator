@@ -505,11 +505,81 @@ class Dashboard:
         return Panel(body, title="[bold]SENTIMENT[/bold]", border_style="cyan")
 
     def _panel_macro(self) -> Panel:
+        """Read DXY/VIX/yields/CPI/Fed funds from data_sources.
+
+        Every read is wrapped — a missing source, missing key, or stale
+        cache renders as "—" rather than crashing the panel. Convenience
+        getters are sync; data_sources.run_refresh_loop keeps the cache
+        warm.
+        """
+        try:
+            from data_sources import data_sources as ds
+        except Exception:
+            ds = None
+
+        # All borders cyan if any datum is live, dim otherwise.
+        live_any = False
+
+        def _safe(fn):
+            nonlocal live_any
+            try:
+                v = fn()
+            except Exception:
+                return None
+            if v is not None:
+                live_any = True
+            return v
+
+        dxy        = _safe(lambda: ds.frankfurter.get_dxy())     if ds else None
+        dxy_chg    = _safe(lambda: ds.frankfurter.get_dxy_change_24h()) if ds else None
+        vix        = _safe(lambda: ds.alpha_vantage.get_vix())   if ds else None
+        ten_y      = _safe(lambda: ds.fred.get_10y_yield())      if ds else None
+        cpi        = _safe(lambda: ds.fred.get_cpi())            if ds else None
+        fed_funds  = _safe(lambda: ds.fred.get_fed_funds())      if ds else None
+        risk       = _safe(lambda: ds.alpha_vantage.get_risk_sentiment()) if ds else None
+
+        # VIX colour ladder mirrors settings.DATA_VIX_*.
+        if vix is None:
+            vix_str = "[dim]—[/dim]"
+        else:
+            if vix < settings.DATA_VIX_RISK_ON_MAX:
+                vix_col = "bright_green"
+            elif vix < settings.DATA_VIX_RISK_OFF_MIN:
+                vix_col = "yellow"
+            elif vix < settings.DATA_VIX_CRISIS_MIN:
+                vix_col = "orange1"
+            else:
+                vix_col = "red blink"
+            vix_str = f"[{vix_col}]{vix:.1f}[/{vix_col}]"
+
+        # DXY arrow keys to the 24h change.
+        if dxy is None:
+            dxy_str = "[dim]—[/dim]"
+        else:
+            if dxy_chg is None:
+                arrow = "→"
+            elif dxy_chg > 0.5:
+                arrow = "↑"
+            elif dxy_chg < -0.5:
+                arrow = "↓"
+            else:
+                arrow = "→"
+            dxy_str = f"{dxy:.2f} {arrow}"
+
         body = Text()
-        for label in ("DXY", "VIX", "BTC dominance", "10yr yield", "Last CPI", "Fed funds"):
-            body.append(f"{label}: —\n", style="dim")
-        body.append("\nNot yet built", style="dim italic")
-        return Panel(body, title="[bold]MACRO[/bold]", border_style="dim")
+        body.append("DXY: ",       style="bold"); body.append(f"{dxy_str}\n")
+        body.append("VIX: ",       style="bold"); body.append(f"{vix_str}\n")
+        body.append("10y: ",       style="bold")
+        body.append(f"{ten_y:.2f}%\n" if ten_y is not None else "—\n")
+        body.append("CPI: ",       style="bold")
+        body.append(f"{cpi:.1f}\n" if cpi is not None else "—\n")
+        body.append("Fed funds: ", style="bold")
+        body.append(f"{fed_funds:.2f}%\n" if fed_funds is not None else "—\n")
+        body.append("Risk: ",      style="bold")
+        body.append(f"{risk or '—'}\n")
+
+        border = "cyan" if live_any else "dim"
+        return Panel(body, title="[bold]MACRO[/bold]", border_style=border)
 
     def _panel_market(self) -> Panel:
         market = getattr(self._bot, "_market_data", None)
