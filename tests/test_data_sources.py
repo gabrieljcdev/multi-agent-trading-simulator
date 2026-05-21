@@ -607,38 +607,12 @@ async def test_multiple_subscribers_same_pattern():
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# Quality gate integration
+# Quality gate ↔ macro_monitor integration
 # ─────────────────────────────────────────────────────────────────────────
-
-@pytest.fixture
-def patch_macro_into_gate(monkeypatch):
-    """Inject the module-level data_sources singleton with controllable
-    state for quality_gate's macro modifier path."""
-    from data_sources import data_sources as ds
-
-    # Stash + reset relevant caches so test ordering is independent.
-    fr_key  = ds.frankfurter._make_key("dxy")
-    fred_keys = [
-        ds.fred._make_key("vix"),
-        ds.fred._make_key("yield_curve_spread"),
-        ds.fred._make_key("yield_10y"),
-        ds.fred._make_key("yield_2y"),
-    ]
-    saved = {
-        fr_key: ds.frankfurter._cache.pop(fr_key, None),
-    }
-    for k in fred_keys:
-        saved[k] = ds.fred._cache.pop(k, None)
-    yield ds
-    # Restore so other tests aren't perturbed.
-    for k, v in saved.items():
-        for src in (ds.frankfurter, ds.fred):
-            cache = src._cache
-            if v is None:
-                cache.pop(k, None)
-            elif k.startswith(src.source_id + "."):
-                cache[k] = v
-
+# The gate's macro modifier path used to read piecemeal from data_sources
+# (MACRO_*_PENALTY constants). It now reads macro_monitor.get_signal_modifier()
+# instead — see tests/test_macro.py for end-to-end regime/modifier coverage.
+# This file keeps one lightweight integration test that proves the wiring.
 
 def _make_signal(direction="long"):
     from signals.base import Signal
@@ -650,59 +624,21 @@ def _make_signal(direction="long"):
     )
 
 
-@pytest.mark.asyncio
-async def test_quality_gate_applies_crisis_vix_penalty(patch_macro_into_gate):
-    ds = patch_macro_into_gate
-    ds.fred._cache[ds.fred._make_key("vix")] = \
-        DataPoint("fred", "vix", 40.0)
+def test_quality_gate_consumes_macro_modifier(monkeypatch):
+    """Gate must add macro_monitor.get_signal_modifier() to the score.
 
+    Uses a stub regime to inject a known modifier without spinning up a
+    full MacroMonitor refresh cycle."""
     from signals.quality_gate import QualityGate
-    from config import settings
-    g = QualityGate()
-    # Bypass regime/guards/dedup paths by patching them away.
-    with patch("signals.quality_gate.regime_detector.get_primary", return_value=None), \
-         patch("signals.quality_gate.guard_runner.apply_all", return_value=(0.0, [])), \
-         patch("signals.ofi.ofi_scorer.get_best", return_value=None):
-        s = _make_signal()
-        s.tf_5m = s.tf_15m = s.tf_1h = True
-        passed, reasons, score = g.evaluate(s, open_positions=[], active_signals=[])
 
-    # Score should be reduced by the crisis penalty.
-    assert score <= 80.0 + settings.MACRO_CRISIS_PENALTY
+    monkeypatch.setattr("macro.macro_monitor.get_signal_modifier",
+                        lambda: -10)
+    # get_current_regime is also consulted to annotate the indicators
+    # dict; returning None keeps the path simple while still exercising
+    # the consume-modifier branch.
+    monkeypatch.setattr("macro.macro_monitor.get_current_regime",
+                        lambda: None)
 
-
-@pytest.mark.asyncio
-async def test_quality_gate_strong_dxy_penalises_longs(patch_macro_into_gate):
-    ds = patch_macro_into_gate
-    ds.frankfurter._cache[ds.frankfurter._make_key("dxy")] = \
-        DataPoint("frankfurter", "dxy", 110.0)
-
-    from signals.quality_gate import QualityGate
-    from config import settings
-    g = QualityGate()
-    with patch("signals.quality_gate.regime_detector.get_primary", return_value=None), \
-         patch("signals.quality_gate.guard_runner.apply_all", return_value=(0.0, [])), \
-         patch("signals.ofi.ofi_scorer.get_best", return_value=None):
-        s = _make_signal(direction="long")
-        s.tf_5m = s.tf_15m = s.tf_1h = True
-        _, _, score_long = g.evaluate(s, [], [])
-
-        s2 = _make_signal(direction="short")
-        s2.tf_5m = s2.tf_15m = s2.tf_1h = True
-        _, _, score_short = g.evaluate(s2, [], [])
-
-    # Long takes the DXY penalty; short does not.
-    assert score_long < score_short
-
-
-@pytest.mark.asyncio
-async def test_quality_gate_yield_inversion_penalty(patch_macro_into_gate):
-    ds = patch_macro_into_gate
-    ds.fred._cache[ds.fred._make_key("yield_curve_spread")] = \
-        DataPoint("fred", "yield_curve_spread", -0.5)
-
-    from signals.quality_gate import QualityGate
-    from config import settings
     g = QualityGate()
     with patch("signals.quality_gate.regime_detector.get_primary", return_value=None), \
          patch("signals.quality_gate.guard_runner.apply_all", return_value=(0.0, [])), \
@@ -710,15 +646,14 @@ async def test_quality_gate_yield_inversion_penalty(patch_macro_into_gate):
         s = _make_signal()
         s.tf_5m = s.tf_15m = s.tf_1h = True
         _, _, score = g.evaluate(s, [], [])
+    assert score == pytest.approx(70.0)  # 80 raw - 10 macro
 
-    assert score <= 80.0 + settings.MACRO_YIELD_INVERTED_PENALTY
 
-
-@pytest.mark.asyncio
-async def test_quality_gate_missing_macro_data_does_not_block(patch_macro_into_gate):
-    # All caches empty by fixture — gate must still pass purely on
-    # technical merit (no macro adjustment applied).
+def test_quality_gate_missing_macro_does_not_block(monkeypatch):
+    """If macro_monitor blows up the gate must still process the signal."""
     from signals.quality_gate import QualityGate
+    monkeypatch.setattr("macro.macro_monitor.get_signal_modifier",
+                        lambda: (_ for _ in ()).throw(RuntimeError("boom")))
     g = QualityGate()
     with patch("signals.quality_gate.regime_detector.get_primary", return_value=None), \
          patch("signals.quality_gate.guard_runner.apply_all", return_value=(0.0, [])), \

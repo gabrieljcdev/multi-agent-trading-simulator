@@ -223,6 +223,64 @@ class SentimentLog(Base):
     )
 
 
+class MacroLog(Base):
+    """One row per MacroMonitor regime computation.
+
+    Mirrors PortfolioSnapshot's shape — well-known fields as columns
+    for cheap filtering, the whole raw blob as JSON for retrospective
+    analysis. Used by tests + future macro-aware backtests.
+    """
+    __tablename__ = "macro_log"
+
+    id               = Column(Integer, primary_key=True)
+    timestamp        = Column(DateTime, nullable=False, default=datetime.utcnow)
+    scenario         = Column(String(25))   # GOLDILOCKS / RISK_OFF / CRISIS / …
+    macro_score      = Column(Float)        # -100 .. +100
+    dollar_strength  = Column(String(10))   # STRONG / NEUTRAL / WEAK
+    risk_appetite    = Column(String(10))   # RISK_ON / NEUTRAL / RISK_OFF
+    rate_environment = Column(String(12))   # TIGHTENING / NEUTRAL / EASING
+    vol_regime       = Column(String(10))   # CALM / ELEVATED / CRISIS
+
+    dxy              = Column(Float)
+    vix              = Column(Float)
+    yield_10y        = Column(Float)
+    yield_2y         = Column(Float)
+    yield_curve      = Column(Float)
+    fed_funds_rate   = Column(Float)
+    cpi_yoy          = Column(Float)
+    confidence       = Column(Float)        # 0..1
+    raw_data         = Column(JSON)
+
+    __table_args__ = (
+        Index("ix_macro_log_ts", "timestamp"),
+    )
+
+
+class CalendarEvent(Base):
+    """Scheduled economic-calendar event (FRED release, etc).
+
+    event_id is the source's stable identifier (e.g. "fred:release_id:date")
+    so refreshes update in place rather than appending duplicates.
+    """
+    __tablename__ = "calendar_events"
+
+    id            = Column(Integer, primary_key=True)
+    event_id      = Column(String(80), nullable=False, unique=True)
+    title         = Column(String(120), nullable=False)
+    country       = Column(String(10))
+    scheduled_utc = Column(DateTime, nullable=False)
+    impact        = Column(String(8))        # HIGH | MEDIUM | LOW
+    actual        = Column(Float)            # populated post-release
+    forecast      = Column(Float)
+    previous      = Column(Float)
+    source_id     = Column(String(30))
+    fetched_at    = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        Index("ix_calendar_events_lookup", "scheduled_utc", "impact"),
+    )
+
+
 class DataLog(Base):
     """Every DataPoint observed by data_sources/.
 

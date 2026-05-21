@@ -13,6 +13,7 @@ from .models import (
     DailyStats, CircuitBreakerLog,
     PortfolioSnapshot, AgentEvent, ArbTrade,
     DataLog,
+    MacroLog, CalendarEvent,
 )
 
 
@@ -551,6 +552,100 @@ def get_data_at_time(
         else:
             q = q.filter(DataLog.symbol == symbol)
         return q.order_by(desc(DataLog.timestamp)).first()
+
+
+# ── Macro regime + calendar ────────────────────────────────
+
+def save_macro_regime(regime) -> None:
+    """Persist a macro.regime.MacroRegime row to macro_log.
+
+    `regime` is duck-typed (macro.MacroRegime) to avoid a queries→macro
+    import cycle. The full regime is also stored as raw_data JSON so the
+    analysis dashboard can reconstruct without joining tables.
+    """
+    # Pull only well-known fields by name; everything else lives in JSON.
+    def _enum_name(v):
+        return getattr(v, "name", str(v) if v is not None else None)
+    raw = getattr(regime, "raw_data", None) or {}
+    with get_session() as s:
+        s.add(MacroLog(
+            scenario=_enum_name(getattr(regime, "scenario", None)),
+            macro_score=getattr(regime, "macro_score", None),
+            dollar_strength=_enum_name(getattr(regime, "dollar", None)),
+            risk_appetite=_enum_name(getattr(regime, "risk", None)),
+            rate_environment=_enum_name(getattr(regime, "rates", None)),
+            vol_regime=_enum_name(getattr(regime, "vol", None)),
+            dxy=getattr(regime, "dxy", None),
+            vix=getattr(regime, "vix", None),
+            yield_10y=getattr(regime, "yield_10y", None),
+            yield_2y=getattr(regime, "yield_2y", None),
+            yield_curve=getattr(regime, "yield_curve", None),
+            fed_funds_rate=getattr(regime, "fed_funds_rate", None),
+            cpi_yoy=getattr(regime, "cpi_yoy", None),
+            confidence=getattr(regime, "confidence", None),
+            raw_data=raw,
+        ))
+
+
+def get_macro_history(hours: int = 24) -> list:
+    """All MacroLog rows from the last `hours`, newest last."""
+    since = datetime.utcnow() - timedelta(hours=hours)
+    with get_session() as s:
+        return (
+            s.query(MacroLog)
+            .filter(MacroLog.timestamp >= since)
+            .order_by(MacroLog.timestamp)
+            .all()
+        )
+
+
+def save_calendar_events(events: list) -> None:
+    """Upsert calendar events keyed on event_id.
+
+    `events` are duck-typed macro.signals.CalendarEvent. event_id is
+    expected to be stable across refreshes — we overwrite forecast /
+    actual / previous in place rather than accumulating duplicates.
+    """
+    if not events:
+        return
+    with get_session() as s:
+        for e in events:
+            existing = (
+                s.query(CalendarEvent)
+                .filter_by(event_id=e.event_id)
+                .first()
+            )
+            payload = dict(
+                event_id=e.event_id,
+                title=e.title,
+                country=getattr(e, "country", None),
+                scheduled_utc=e.scheduled_utc,
+                impact=getattr(getattr(e, "impact", None), "name", None),
+                actual=getattr(e, "actual", None),
+                forecast=getattr(e, "forecast", None),
+                previous=getattr(e, "previous", None),
+                source_id=getattr(e, "source_id", None),
+                fetched_at=datetime.utcnow(),
+            )
+            if existing:
+                for k, v in payload.items():
+                    setattr(existing, k, v)
+            else:
+                s.add(CalendarEvent(**payload))
+
+
+def get_pending_events(hours_ahead: int = 48) -> list:
+    """Upcoming events between now and now+hours_ahead, soonest first."""
+    now = datetime.utcnow()
+    until = now + timedelta(hours=hours_ahead)
+    with get_session() as s:
+        return (
+            s.query(CalendarEvent)
+            .filter(CalendarEvent.scheduled_utc >= now,
+                    CalendarEvent.scheduled_utc <= until)
+            .order_by(CalendarEvent.scheduled_utc)
+            .all()
+        )
 
 
 # ── Analytics helpers (used by predictive engine) ──────────

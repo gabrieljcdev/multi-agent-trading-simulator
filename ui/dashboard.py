@@ -505,96 +505,85 @@ class Dashboard:
         return Panel(body, title="[bold]SENTIMENT[/bold]", border_style="cyan")
 
     def _panel_macro(self) -> Panel:
-        """Read DXY/VIX/yields/CPI/Fed funds from data_sources.
-
-        Every read is wrapped — a missing source, missing key, or stale
-        cache renders as "—" rather than crashing the panel. Convenience
-        getters are sync; data_sources.run_refresh_loop keeps the cache
-        warm.
-        """
+        """Render the MacroRegime — scenario label (colour-coded by
+        severity), composite score bar, DXY/VIX/yield-curve/Fed/CPI,
+        confidence. Reads macro_monitor; missing regime → dim panel
+        with dashes."""
         try:
-            from data_sources import data_sources as ds
+            from macro import macro_monitor
+            regime = macro_monitor.get_current_regime()
         except Exception:
-            ds = None
+            regime = None
 
-        # All borders cyan if any datum is live, dim otherwise.
-        live_any = False
+        if regime is None:
+            body = Text()
+            for label in ("Scenario", "Score", "DXY", "VIX",
+                          "10y-2y", "Fed", "CPI YoY"):
+                body.append(f"{label}: —\n", style="dim")
+            body.append("\nwaiting for first refresh…",
+                        style="dim italic")
+            return Panel(body, title="[bold]MACRO[/bold]",
+                         border_style="dim")
 
-        def _safe(fn):
-            nonlocal live_any
-            try:
-                v = fn()
-            except Exception:
-                return None
-            if v is not None:
-                live_any = True
-            return v
+        # Scenario colour ladder — supportive green, neutral white,
+        # rising severity yellow → orange → red.
+        scenario_colour = {
+            "GOLDILOCKS":       "bright_green",
+            "EASING_CYCLE":     "green",
+            "REFLATION":        "white",
+            "NEUTRAL":          "white",
+            "TIGHTENING_CYCLE": "yellow",
+            "RISK_OFF":         "orange1",
+            "STAGFLATION":      "orange1",
+            "CRISIS":           "red blink",
+        }.get(regime.scenario.name, "white")
 
-        dxy        = _safe(lambda: ds.frankfurter.get_dxy())              if ds else None
-        dxy_chg    = _safe(lambda: ds.frankfurter.get_dxy_change_24h())   if ds else None
-        vix        = _safe(lambda: ds.fred.get_vix())                     if ds else None
-        ten_y      = _safe(lambda: ds.fred.get_10y_yield())               if ds else None
-        cpi        = _safe(lambda: ds.fred.get_cpi())                     if ds else None
-        fed_funds  = _safe(lambda: ds.fred.get_fed_funds())               if ds else None
-        risk       = _safe(lambda: ds.fred.get_risk_sentiment())          if ds else None
-        btc_dom    = _safe(lambda: ds.coingecko.get_btc_dominance())      if ds else None
-        mcap_chg   = _safe(lambda: ds.coingecko.get_market_cap_change_pct_24h()) if ds else None
-
-        # VIX colour ladder mirrors settings.DATA_VIX_*.
-        if vix is None:
+        # VIX colour using the macro thresholds (matches the score curve).
+        if regime.vix is None:
             vix_str = "[dim]—[/dim]"
         else:
-            if vix < settings.DATA_VIX_RISK_ON_MAX:
+            if regime.vix < settings.MACRO_VIX_CALM:
                 vix_col = "bright_green"
-            elif vix < settings.DATA_VIX_RISK_OFF_MIN:
-                vix_col = "yellow"
-            elif vix < settings.DATA_VIX_CRISIS_MIN:
+            elif regime.vix < settings.MACRO_VIX_ELEVATED:
+                vix_col = "green"
+            elif regime.vix < settings.MACRO_VIX_CRISIS:
                 vix_col = "orange1"
             else:
                 vix_col = "red blink"
-            vix_str = f"[{vix_col}]{vix:.1f}[/{vix_col}]"
-
-        # DXY arrow keys to the 24h change.
-        if dxy is None:
-            dxy_str = "[dim]—[/dim]"
-        else:
-            if dxy_chg is None:
-                arrow = "→"
-            elif dxy_chg > 0.5:
-                arrow = "↑"
-            elif dxy_chg < -0.5:
-                arrow = "↓"
-            else:
-                arrow = "→"
-            dxy_str = f"{dxy:.2f} {arrow}"
+            vix_str = f"[{vix_col}]{regime.vix:.1f}[/{vix_col}]"
 
         body = Text()
-        body.append("DXY: ",       style="bold"); body.append(f"{dxy_str}\n")
-        body.append("VIX: ",       style="bold"); body.append(f"{vix_str}\n")
-        body.append("BTC dom: ",   style="bold")
-        if btc_dom is None:
-            body.append("—\n", style="dim")
-        else:
-            # Arrow keys off the 24h crypto-mcap change — a useful proxy
-            # for "is the move risk-on (alt-led) or risk-off (BTC-led)".
-            if mcap_chg is None or abs(mcap_chg) < 0.5:
-                tag = "→"
-            elif mcap_chg > 0:
-                tag = "↑"
-            else:
-                tag = "↓"
-            body.append(f"{btc_dom:.1f}% {tag}\n")
-        body.append("10y: ",       style="bold")
-        body.append(f"{ten_y:.2f}%\n" if ten_y is not None else "—\n")
-        body.append("CPI: ",       style="bold")
-        body.append(f"{cpi:.1f}\n" if cpi is not None else "—\n")
-        body.append("Fed funds: ", style="bold")
-        body.append(f"{fed_funds:.2f}%\n" if fed_funds is not None else "—\n")
-        body.append("Risk: ",      style="bold")
-        body.append(f"{risk or '—'}\n")
+        body.append("Scenario: ", style="bold")
+        body.append(f"{regime.scenario.name}\n", style=scenario_colour)
 
-        border = "cyan" if live_any else "dim"
-        return Panel(body, title="[bold]MACRO[/bold]", border_style=border)
+        score_col = _pnl_colour(regime.macro_score)
+        body.append("Score: ", style="bold")
+        body.append(f"{regime.macro_score:+.1f}  ",
+                    style=f"bold {score_col}")
+        body.append_text(self._progress_bar(
+            abs(regime.macro_score), 100.0, 10,
+        ))
+        body.append("\n")
+
+        body.append("DXY: ", style="bold")
+        body.append(f"{regime.dxy:.1f}\n"
+                    if regime.dxy is not None else "—\n")
+        body.append("VIX: ", style="bold")
+        body.append(f"{vix_str}\n")
+        body.append("10y-2y: ", style="bold")
+        body.append(f"{regime.yield_curve:+.2f}\n"
+                    if regime.yield_curve is not None else "—\n")
+        body.append("Fed: ", style="bold")
+        body.append(f"{regime.fed_funds_rate:.2f}%\n"
+                    if regime.fed_funds_rate is not None else "—\n")
+        body.append("CPI YoY: ", style="bold")
+        body.append(f"{regime.cpi_yoy:.1f}%  "
+                    if regime.cpi_yoy is not None else "—  ")
+        body.append(f"conf {regime.confidence*100:.0f}%",
+                    style="dim")
+
+        return Panel(body, title="[bold]MACRO[/bold]",
+                     border_style=scenario_colour)
 
     def _panel_market(self) -> Panel:
         market = getattr(self._bot, "_market_data", None)
@@ -772,11 +761,61 @@ class Dashboard:
         return Panel(body, title="[bold]TOP PERFORMERS[/bold]", border_style="cyan")
 
     def _panel_pending_events(self) -> Panel:
+        """Next 3 upcoming calendar events from macro_monitor.
+
+        Border colour escalates on proximity to a HIGH-impact event:
+        red blinking within 15 min, yellow within 30 min, otherwise cyan.
+        """
+        events: list = []
+        try:
+            from macro import macro_monitor
+            events = macro_monitor.get_pending_events(n=3)
+        except Exception:
+            pass
+
+        if not events:
+            body = Text("No upcoming events", style="dim italic")
+            return Panel(body, title="[bold]PENDING EVENTS[/bold]",
+                         border_style="dim")
+
+        # Border escalates only on HIGH-impact proximity.
+        border = "cyan"
+        soonest_high = None
+        for e in events:
+            if e.impact.name == "HIGH":
+                soonest_high = (
+                    e if soonest_high is None
+                    else min(soonest_high, e, key=lambda x: x.minutes_until)
+                )
+        if soonest_high is not None and 0 <= soonest_high.minutes_until:
+            if soonest_high.minutes_until <= 15:
+                border = "red blink"
+            elif soonest_high.minutes_until <= 30:
+                border = "yellow"
+
+        impact_style = {"HIGH": "red bold", "MEDIUM": "yellow", "LOW": "white"}
+        country_flag = {
+            "US": "🇺🇸", "EU": "🇪🇺", "UK": "🇬🇧",
+            "JP": "🇯🇵", "CN": "🇨🇳", "CA": "🇨🇦",
+        }
+
         body = Text()
-        for _ in range(3):
-            body.append("—\n", style="dim")
-        body.append("\nNot yet built", style="dim italic")
-        return Panel(body, title="[bold]PENDING EVENTS[/bold]", border_style="dim")
+        for ev in events:
+            flag = country_flag.get(ev.country, ev.country or "  ")
+            mins = ev.minutes_until
+            if mins < 60:
+                eta = f"{mins:>3d}m"
+            elif mins < 60 * 24:
+                eta = f"{mins // 60:>3d}h"
+            else:
+                eta = f"{mins // (60*24):>3d}d"
+            style = impact_style.get(ev.impact.name, "white")
+            body.append(f"{flag} ", style="white")
+            body.append(f"{ev.impact.name[:3]:>3s} ", style=style)
+            body.append(f"{eta:>4s}  ", style="dim")
+            body.append(f"{ev.title[:32]}\n")
+        return Panel(body, title="[bold]PENDING EVENTS[/bold]",
+                     border_style=border)
 
     def _panel_positions(self) -> Panel:
         open_trades = []

@@ -39,6 +39,14 @@ _SERIES_TO_METRIC = {
     "VIXCLS":   "vix",
 }
 
+# Series for which we want FRED-computed year-over-year % change rather
+# than the raw level. Maps series_id → public metric name. FRED supports
+# this via the `units=pc1` query parameter (percent change from year ago)
+# so we don't need a year of history in our own DB.
+_YOY_SERIES_TO_METRIC = {
+    "CPIAUCSL": "cpi_yoy",
+}
+
 
 class FREDSource(BaseDataSource):
     source_id        = "fred"
@@ -50,8 +58,11 @@ class FREDSource(BaseDataSource):
 
     def list_metrics(self) -> list[str]:
         # Order matches settings.FRED_SERIES.
-        return [_SERIES_TO_METRIC[s] for s in settings.FRED_SERIES
+        base = [_SERIES_TO_METRIC[s] for s in settings.FRED_SERIES
                 if s in _SERIES_TO_METRIC]
+        yoy = [_YOY_SERIES_TO_METRIC[s] for s in settings.FRED_SERIES
+               if s in _YOY_SERIES_TO_METRIC]
+        return base + yoy
 
     async def fetch_all(self) -> list[DataPoint]:
         api_key = os.getenv(self.api_key_env_var, "")
@@ -83,6 +94,30 @@ class FREDSource(BaseDataSource):
                         source_id=self.source_id, metric=metric,
                         value=0.0, error=str(e),
                     ))
+            # YoY series — same fetch path but with FRED's units=pc1 to
+            # have the server compute % change vs the year-ago value.
+            for series_id, yoy_metric in _YOY_SERIES_TO_METRIC.items():
+                if series_id not in settings.FRED_SERIES:
+                    continue
+                try:
+                    value, observation_date = await self._fetch_latest(
+                        session, series_id, api_key, units="pc1",
+                    )
+                    if value is None:
+                        continue
+                    points.append(DataPoint(
+                        source_id=self.source_id, metric=yoy_metric,
+                        value=value,
+                        raw_data={"series_id": series_id,
+                                  "date": observation_date,
+                                  "units": "pc1"},
+                    ))
+                except Exception as e:
+                    logger.debug(f"fred YoY fetch {series_id}: {e}")
+                    points.append(DataPoint(
+                        source_id=self.source_id, metric=yoy_metric,
+                        value=0.0, error=str(e),
+                    ))
         return points
 
     async def _fetch_latest(
@@ -90,6 +125,7 @@ class FREDSource(BaseDataSource):
         session: aiohttp.ClientSession,
         series_id: str,
         api_key: str,
+        units: Optional[str] = None,
     ) -> tuple[Optional[float], str]:
         params = {
             "series_id":         series_id,
@@ -98,6 +134,8 @@ class FREDSource(BaseDataSource):
             "sort_order":        "desc",
             "limit":             5,         # latest may be ".", grab a few
         }
+        if units:
+            params["units"] = units
         async with session.get(OBS_ENDPOINT, params=params) as r:
             payload = await r.json(content_type=None)
         for obs in payload.get("observations") or []:
@@ -114,6 +152,10 @@ class FREDSource(BaseDataSource):
 
     def get_cpi(self) -> Optional[float]:
         return self.cached_value("cpi")
+
+    def get_cpi_yoy(self) -> Optional[float]:
+        """CPI year-over-year % change. Computed by FRED via units=pc1."""
+        return self.cached_value("cpi_yoy")
 
     def get_10y_yield(self) -> Optional[float]:
         return self.cached_value("yield_10y")

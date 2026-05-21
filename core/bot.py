@@ -226,6 +226,15 @@ class CryptoBot:
             async def _noop(): return
             data_sources_loop = _noop()
 
+        # Macro monitor — reads from data_sources, so launch after.
+        try:
+            from macro import macro_monitor
+            macro_loop = macro_monitor.run_refresh_loop()
+        except Exception as e:
+            logger.warning(f"macro_monitor refresh loop disabled: {e}")
+            async def _noop_m(): return
+            macro_loop = _noop_m()
+
         await asyncio.gather(
             self._market_data.start(),
             self._cycle_loop(),
@@ -234,6 +243,7 @@ class CryptoBot:
             self._self_review_loop(),
             self._future_price_tracker_loop(),
             data_sources_loop,
+            macro_loop,
             return_exceptions=True,
         )
 
@@ -368,6 +378,29 @@ class CryptoBot:
             # Sentiment is best-effort: a broken aggregator must not stop
             # the trading loop. Log and continue.
             logger.debug(f"session_floor check skipped: {e}")
+
+        # Macro hard block — CRISIS scenario short-circuits every signal,
+        # same shape as the sentiment news guard. Soft-fail on any error.
+        try:
+            from macro import macro_monitor
+            if macro_monitor.is_hard_blocked():
+                regime = macro_monitor.get_current_regime()
+                scenario = regime.scenario.name if regime else "CRISIS"
+                logger.info(f"Macro hard block: scenario={scenario}")
+                return
+            # Pre-event pause — skip the cycle if a HIGH-impact event
+            # is inside MACRO_PRE_EVENT_PAUSE_MINUTES.
+            for ev in macro_monitor.get_pending_events(n=5):
+                if ev.impact.name != "HIGH":
+                    continue
+                if 0 <= ev.minutes_until <= settings.MACRO_PRE_EVENT_PAUSE_MINUTES:
+                    logger.info(
+                        f"PRE_EVENT_PAUSE: {ev.title} "
+                        f"in {ev.minutes_until}m"
+                    )
+                    return
+        except Exception as e:
+            logger.debug(f"macro pre-cycle check skipped: {e}")
 
         # The engine internally invokes regime, guards, OFI, sentiment via
         # the quality gate, and fires _on_signal for each passing candidate.

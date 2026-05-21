@@ -162,6 +162,13 @@ class BaseDataSource(ABC):
         self._last_fetch_time = time.time()
         for point in points:
             previous = self._cache.get(point.key)
+            # Don't clobber a good cached value with an error-state
+            # placeholder — the last known good reading is more useful
+            # to consumers (macro modifier, dashboard) than zero. Error
+            # points still enter the cache on a first-ever fetch so
+            # cached_value can report None rather than the wrong value.
+            if point.error and previous is not None and previous.error is None:
+                continue
             self._cache[point.key] = point
 
             # Fire subscribers only when the underlying value changed —
@@ -192,11 +199,13 @@ class BaseDataSource(ABC):
         symbol: Optional[str] = None,
         default: Optional[float] = None,
     ) -> Optional[float]:
-        """Sync float accessor — None if no reading yet, or the cached
-        value (even if the last fetch errored, we keep returning the
-        last good value)."""
+        """Sync float accessor — None if no reading yet, the last good
+        cached value if available, or the default when the only cached
+        point has an error set (treat error placeholders as 'missing')."""
         p = self.cached(metric, symbol)
-        return default if p is None else p.value
+        if p is None or p.error is not None:
+            return default
+        return p.value
 
     def latest_points(self) -> list[DataPoint]:
         """Every cached DataPoint, in insertion order. Used by the

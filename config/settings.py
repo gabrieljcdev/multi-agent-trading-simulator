@@ -581,11 +581,49 @@ DATA_DXY_WEAK_THRESHOLD   = 95     # test: 92-98
 ALPHA_VANTAGE_DAILY_CALL_BUDGET = 20   # test: 10-25
 ALPHA_VANTAGE_PACE_SEC          = 1.3  # test: 1.1-3.0  (sleep between calls)
 
-# ─── Macro modifiers (quality gate) ─────────
+# ─── Macro modifiers (quality gate, legacy direct-from-data_sources) ─
+# Used as a fallback if macro/ module is not active. The macro module's
+# step-ladder modifier supersedes these once macro_monitor is wired.
 MACRO_RISK_OFF_PENALTY        = -5     # test: -10 to -2
 MACRO_CRISIS_PENALTY          = -20    # test: -25 to -15
 MACRO_DXY_STRONG_LONG_PENALTY = -5     # test: -10 to -2
 MACRO_YIELD_INVERTED_PENALTY  = -3     # test: -6 to -1
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MACRO REGIME MONITOR (macro/)
+# ══════════════════════════════════════════════════════════════════════════════
+# Reads from data_sources singleton + calendar plugin, computes a regime
+# (scenario label + numeric score + dimensional flags), exposes a step-
+# ladder signal modifier mirroring the sentiment aggregator's shape.
+
+MACRO_REFRESH_INTERVAL_SEC     = 300    # test: 60-600
+MACRO_PRE_EVENT_PAUSE_MINUTES  = 30     # test: 15-60
+MACRO_CONFIDENCE_STALE_HOURS   = 4      # test: 1-12
+MACRO_RATE_LOOKBACK_DAYS       = 90     # test: 30-180 (rate-env change window)
+
+# Dimensional thresholds — used to label DollarStrength, VolRegime,
+# RateEnvironment. These mirror DATA_VIX_* / DATA_DXY_* with macro-tuned
+# defaults; the macro module reads MACRO_* exclusively.
+MACRO_DXY_STRONG               = 104.0  # test: 102-106
+MACRO_DXY_WEAK                 = 99.0   # test: 97-101
+MACRO_VIX_CALM                 = 15.0   # test: 12-18
+MACRO_VIX_ELEVATED             = 25.0   # test: 20-30
+MACRO_VIX_CRISIS               = 35.0   # test: 30-40
+MACRO_YIELD_CURVE_INVERSION    = 0.0    # test: -0.5 to 0.5  (10y - 2y)
+MACRO_RATE_CHANGE_TIGHTENING   = 0.25   # test: 0.1-0.5      (fed funds Δ%)
+MACRO_RATE_CHANGE_EASING       = -0.25  # test: -0.5 to -0.1
+
+# Inflation bands (CPI YoY %). 2.5% is roughly the Fed's tolerance band
+# top; > 4% is the territory that historically forces tightening cycles.
+MACRO_INFLATION_LOW            = 2.5    # test: 1.5-3.5
+MACRO_INFLATION_HIGH           = 4.0    # test: 3.0-6.0
+
+# Composite-score component weights — must sum to 1.0.
+MACRO_WEIGHT_VIX               = 0.30   # test: 0.2-0.4
+MACRO_WEIGHT_DOLLAR            = 0.25   # test: 0.15-0.35
+MACRO_WEIGHT_YIELD_CURVE       = 0.20   # test: 0.1-0.3
+MACRO_WEIGHT_RATE_ENV          = 0.15   # test: 0.1-0.2
+MACRO_WEIGHT_INFLATION         = 0.10   # test: 0.05-0.15
 
 # ══════════════════════════════════════════════════════════════════════════════
 # BOT LOOP TIMING
