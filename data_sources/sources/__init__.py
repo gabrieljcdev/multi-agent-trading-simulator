@@ -34,6 +34,7 @@ return DataPoints with .error set, or an empty list.
 """
 
 from data_sources.sources.coinglass     import CoinglassSource
+from data_sources.sources.coingecko     import CoinGeckoSource
 from data_sources.sources.fred          import FREDSource
 from data_sources.sources.alpha_vantage import AlphaVantageSource
 from data_sources.sources.frankfurter   import FrankfurterSource
@@ -43,6 +44,7 @@ from data_sources.sources.frankfurter   import FrankfurterSource
 # instance as data_sources.<source_id>. Append new instances here.
 REGISTERED_SOURCES: list = [
     CoinglassSource(),
+    CoinGeckoSource(),
     FREDSource(),
     AlphaVantageSource(),
     FrankfurterSource(),

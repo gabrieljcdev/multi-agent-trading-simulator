@@ -529,9 +529,15 @@ SENTIMENT_WEIGHT_TELEGRAM      = 0.05
 
 # ─── Refresh intervals ──────────────────────
 COINGLASS_REFRESH_SEC     = 300     # test: 60-600
+COINGECKO_REFRESH_SEC     = 300     # test: 60-900
 FRED_REFRESH_SEC          = 3600    # test: 1800-7200
 ALPHA_VANTAGE_REFRESH_SEC = 900     # test: 300-1800
 FRANKFURTER_REFRESH_SEC   = 3600    # test: 1800-7200
+
+# ─── CoinGecko tier ─────────────────────────
+# Public free + demo key both live on api.coingecko.com. Set True to
+# route through pro-api.coingecko.com (changes the auth header name too).
+COINGECKO_USE_PRO = False           # test: True/False
 
 DATA_SOURCES_REFRESH_LOOP_SEC = 60  # test: 30-300  (top-level refresh_all tick)
 DATA_SOURCES_HTTP_TIMEOUT_SEC = 10  # test: 5-30

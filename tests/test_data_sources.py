@@ -26,6 +26,7 @@ import pytest
 
 from data_sources import DataSources, DataPoint, BaseDataSource
 from data_sources.sources.alpha_vantage import AlphaVantageSource
+from data_sources.sources.coingecko     import CoinGeckoSource
 from data_sources.sources.coinglass     import CoinglassSource
 from data_sources.sources.fred          import FREDSource
 from data_sources.sources.frankfurter   import FrankfurterSource
@@ -151,6 +152,112 @@ def test_fred_requires_key(monkeypatch):
 
 def test_coinglass_no_key_required():
     assert CoinglassSource().is_available() is True
+
+
+def test_coingecko_works_without_key():
+    """Public tier means available even with no key set."""
+    assert CoinGeckoSource().is_available() is True
+
+
+def test_coingecko_auth_picks_right_header(monkeypatch):
+    """Empty env → no auth header. Demo key → x-cg-demo-api-key on the
+    public base. Pro flag flipped → x-cg-pro-api-key on the pro base."""
+    s = CoinGeckoSource()
+    monkeypatch.delenv("COINGECKO_API_KEY", raising=False)
+    monkeypatch.setattr("config.settings.COINGECKO_USE_PRO", False)
+    base, headers = s._auth()
+    assert base.endswith(".coingecko.com/api/v3")
+    assert "pro" not in base
+    assert headers == {}
+
+    monkeypatch.setenv("COINGECKO_API_KEY", "CG-demo-test")
+    base, headers = s._auth()
+    assert "pro-api" not in base
+    assert headers == {"x-cg-demo-api-key": "CG-demo-test"}
+
+    monkeypatch.setattr("config.settings.COINGECKO_USE_PRO", True)
+    base, headers = s._auth()
+    assert "pro-api" in base
+    assert headers == {"x-cg-pro-api-key": "CG-demo-test"}
+
+
+def test_coingecko_metrics_and_convenience_methods():
+    s = CoinGeckoSource()
+    assert "btc_dominance" in s.list_metrics()
+    assert "eth_dominance" in s.list_metrics()
+    assert "total_market_cap" in s.list_metrics()
+
+    # Empty cache → all None.
+    assert s.get_btc_dominance() is None
+    assert s.get_total_market_cap() is None
+
+    s._cache[s._make_key("btc_dominance")] = DataPoint(
+        "coingecko", "btc_dominance", 55.4,
+    )
+    assert s.get_btc_dominance() == 55.4
+
+
+@pytest.mark.asyncio
+async def test_coingecko_parses_global_payload(monkeypatch):
+    """Wire a fake aiohttp response into the source and verify it shapes
+    the /global JSON into the expected DataPoints."""
+    sample = {
+        "data": {
+            "market_cap_percentage": {"btc": 58.2, "eth": 9.6, "sol": 2.1},
+            "total_market_cap":      {"usd": 2_662_000_000_000},
+            "total_volume":          {"usd": 79_000_000_000},
+            "market_cap_change_percentage_24h_usd": 0.13,
+        }
+    }
+
+    class _FakeResp:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): pass
+        async def json(self, content_type=None): return sample
+
+    class _FakeSession:
+        def __init__(self, *a, **kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): pass
+        def get(self, url): return _FakeResp()
+
+    monkeypatch.setattr("aiohttp.ClientSession", _FakeSession)
+
+    s = CoinGeckoSource()
+    points = await s.fetch_all()
+    by_metric = {p.metric: p for p in points}
+    assert by_metric["btc_dominance"].value == 58.2
+    assert by_metric["eth_dominance"].value == 9.6
+    assert by_metric["total_market_cap"].value == 2_662_000_000_000
+    assert by_metric["total_volume_24h"].value == 79_000_000_000
+    assert by_metric["market_cap_change_pct_24h"].value == 0.13
+    # No DataPoint should carry an error on a happy-path response.
+    assert all(p.error is None for p in points)
+
+
+@pytest.mark.asyncio
+async def test_coingecko_returns_error_point_on_empty_payload(monkeypatch):
+    """Status-message responses (rate-limited, bad key, etc.) must be
+    surfaced as a DataPoint with .error set — never propagate."""
+    sample = {"status": {"error_message": "rate_limit_exceeded"}}
+
+    class _FakeResp:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): pass
+        async def json(self, content_type=None): return sample
+
+    class _FakeSession:
+        def __init__(self, *a, **kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): pass
+        def get(self, url): return _FakeResp()
+
+    monkeypatch.setattr("aiohttp.ClientSession", _FakeSession)
+
+    s = CoinGeckoSource()
+    points = await s.fetch_all()
+    assert len(points) == 1
+    assert points[0].error and "rate_limit" in points[0].error
 
 
 def test_each_source_lists_expected_metrics():
@@ -295,7 +402,7 @@ def test_aggregator_never_imports_concrete_sources():
     file that imports concrete classes."""
     import inspect, data_sources
     src = inspect.getsource(data_sources)
-    for klass in ("Coinglass", "FRED", "AlphaVantage", "Frankfurter"):
+    for klass in ("Coinglass", "CoinGecko", "FRED", "AlphaVantage", "Frankfurter"):
         assert klass not in src, f"aggregator must not reference {klass}"
 
 

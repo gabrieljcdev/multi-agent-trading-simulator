@@ -530,13 +530,15 @@ class Dashboard:
                 live_any = True
             return v
 
-        dxy        = _safe(lambda: ds.frankfurter.get_dxy())     if ds else None
-        dxy_chg    = _safe(lambda: ds.frankfurter.get_dxy_change_24h()) if ds else None
-        vix        = _safe(lambda: ds.alpha_vantage.get_vix())   if ds else None
-        ten_y      = _safe(lambda: ds.fred.get_10y_yield())      if ds else None
-        cpi        = _safe(lambda: ds.fred.get_cpi())            if ds else None
-        fed_funds  = _safe(lambda: ds.fred.get_fed_funds())      if ds else None
+        dxy        = _safe(lambda: ds.frankfurter.get_dxy())              if ds else None
+        dxy_chg    = _safe(lambda: ds.frankfurter.get_dxy_change_24h())   if ds else None
+        vix        = _safe(lambda: ds.alpha_vantage.get_vix())            if ds else None
+        ten_y      = _safe(lambda: ds.fred.get_10y_yield())               if ds else None
+        cpi        = _safe(lambda: ds.fred.get_cpi())                     if ds else None
+        fed_funds  = _safe(lambda: ds.fred.get_fed_funds())               if ds else None
         risk       = _safe(lambda: ds.alpha_vantage.get_risk_sentiment()) if ds else None
+        btc_dom    = _safe(lambda: ds.coingecko.get_btc_dominance())      if ds else None
+        mcap_chg   = _safe(lambda: ds.coingecko.get_market_cap_change_pct_24h()) if ds else None
 
         # VIX colour ladder mirrors settings.DATA_VIX_*.
         if vix is None:
@@ -569,6 +571,19 @@ class Dashboard:
         body = Text()
         body.append("DXY: ",       style="bold"); body.append(f"{dxy_str}\n")
         body.append("VIX: ",       style="bold"); body.append(f"{vix_str}\n")
+        body.append("BTC dom: ",   style="bold")
+        if btc_dom is None:
+            body.append("—\n", style="dim")
+        else:
+            # Arrow keys off the 24h crypto-mcap change — a useful proxy
+            # for "is the move risk-on (alt-led) or risk-off (BTC-led)".
+            if mcap_chg is None or abs(mcap_chg) < 0.5:
+                tag = "→"
+            elif mcap_chg > 0:
+                tag = "↑"
+            else:
+                tag = "↓"
+            body.append(f"{btc_dom:.1f}% {tag}\n")
         body.append("10y: ",       style="bold")
         body.append(f"{ten_y:.2f}%\n" if ten_y is not None else "—\n")
         body.append("CPI: ",       style="bold")
