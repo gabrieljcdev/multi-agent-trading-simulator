@@ -532,11 +532,11 @@ class Dashboard:
 
         dxy        = _safe(lambda: ds.frankfurter.get_dxy())              if ds else None
         dxy_chg    = _safe(lambda: ds.frankfurter.get_dxy_change_24h())   if ds else None
-        vix        = _safe(lambda: ds.alpha_vantage.get_vix())            if ds else None
+        vix        = _safe(lambda: ds.fred.get_vix())                     if ds else None
         ten_y      = _safe(lambda: ds.fred.get_10y_yield())               if ds else None
         cpi        = _safe(lambda: ds.fred.get_cpi())                     if ds else None
         fed_funds  = _safe(lambda: ds.fred.get_fed_funds())               if ds else None
-        risk       = _safe(lambda: ds.alpha_vantage.get_risk_sentiment()) if ds else None
+        risk       = _safe(lambda: ds.fred.get_risk_sentiment())          if ds else None
         btc_dom    = _safe(lambda: ds.coingecko.get_btc_dominance())      if ds else None
         mcap_chg   = _safe(lambda: ds.coingecko.get_market_cap_change_pct_24h()) if ds else None
 

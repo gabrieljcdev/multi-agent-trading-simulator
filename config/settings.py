@@ -551,12 +551,15 @@ COINGLASS_WATCH_PAIRS = [
 ]
 
 ALPHA_VANTAGE_SYMBOLS = [
-    "VIX", "SPY", "QQQ", "GLD", "TLT",
+    # VIX intentionally excluded — Alpha Vantage's GLOBAL_QUOTE doesn't
+    # cover non-tradeable indices. VIX lives at FRED (series VIXCLS).
+    "SPY", "QQQ", "GLD", "TLT",
 ]
 
 FRED_SERIES = [
-    "CPIAUCSL", "DGS10", "DGS2", "DGS30",
-    "DFF",      "M2SL",  "UNRATE", "T10Y2Y",
+    "CPIAUCSL", "DGS10",  "DGS2",  "DGS30",
+    "DFF",      "M2SL",   "UNRATE", "T10Y2Y",
+    "VIXCLS",   # CBOE VIX (daily, EOD)
 ]
 
 FRANKFURTER_PAIRS = [
@@ -572,8 +575,10 @@ DATA_DXY_STRONG_THRESHOLD = 105    # test: 102-108
 DATA_DXY_WEAK_THRESHOLD   = 95     # test: 92-98
 
 # ─── Rate limiting ──────────────────────────
-# Alpha Vantage free tier is 25/day, 5/min. Leave headroom.
+# Alpha Vantage free tier is 25/day and ~1/sec burst. Leave headroom on
+# the daily budget and pace inter-call sleeps to dodge the per-sec block.
 ALPHA_VANTAGE_DAILY_CALL_BUDGET = 20   # test: 10-25
+ALPHA_VANTAGE_PACE_SEC          = 1.3  # test: 1.1-3.0  (sleep between calls)
 
 # ─── Macro modifiers (quality gate) ─────────
 MACRO_RISK_OFF_PENALTY        = -5     # test: -10 to -2

@@ -23,7 +23,10 @@ logger = logging.getLogger(__name__)
 OBS_ENDPOINT = "https://api.stlouisfed.org/fred/series/observations"
 
 # Series ID → exposed metric name. Keeps the public-facing metric vocab
-# stable even if FRED renames a series.
+# stable even if FRED renames a series. VIXCLS is published EOD by CBOE —
+# daily resolution is plenty for regime classification and gives us VIX
+# without burning Alpha Vantage's 25/day budget (or hitting its empty
+# GLOBAL_QUOTE response on non-tradeable indices).
 _SERIES_TO_METRIC = {
     "CPIAUCSL": "cpi",
     "DGS10":    "yield_10y",
@@ -33,6 +36,7 @@ _SERIES_TO_METRIC = {
     "M2SL":     "m2",
     "UNRATE":   "unemployment",
     "T10Y2Y":   "yield_curve_spread",
+    "VIXCLS":   "vix",
 }
 
 
@@ -145,3 +149,24 @@ class FREDSource(BaseDataSource):
     def is_yield_curve_inverted(self) -> bool:
         spread = self.get_yield_curve_spread()
         return spread is not None and spread < 0
+
+    def get_vix(self) -> Optional[float]:
+        """CBOE VIX from series VIXCLS. Lives here (not Alpha Vantage)
+        because GLOBAL_QUOTE returns empty for non-tradeable indices."""
+        return self.cached_value("vix")
+
+    def get_risk_sentiment(self) -> str:
+        """Coarse market-risk regime label from VIX, thresholds in
+        settings.DATA_VIX_*. Returns one of:
+            RISK_ON, NEUTRAL, RISK_OFF, CRISIS, UNKNOWN
+        UNKNOWN when VIX hasn't been populated yet."""
+        vix = self.get_vix()
+        if vix is None or vix <= 0:
+            return "UNKNOWN"
+        if vix < settings.DATA_VIX_RISK_ON_MAX:
+            return "RISK_ON"
+        if vix < settings.DATA_VIX_RISK_OFF_MIN:
+            return "NEUTRAL"
+        if vix < settings.DATA_VIX_CRISIS_MIN:
+            return "RISK_OFF"
+        return "CRISIS"

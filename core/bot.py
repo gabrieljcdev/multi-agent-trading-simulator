@@ -195,7 +195,7 @@ class CryptoBot:
         try:
             from data_sources import data_sources as ds
             ds.subscribe(
-                "alpha_vantage.vix",
+                "fred.vix",
                 self._on_vix_crisis,
                 filter=lambda dp: dp.value >= settings.DATA_VIX_CRISIS_MIN,
             )

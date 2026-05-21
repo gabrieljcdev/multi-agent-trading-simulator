@@ -116,7 +116,7 @@ class QualityGate:
         try:
             from data_sources import data_sources as ds
 
-            risk = ds.alpha_vantage.get_risk_sentiment()
+            risk = ds.fred.get_risk_sentiment()
             if risk == "RISK_OFF":
                 score += settings.MACRO_RISK_OFF_PENALTY
                 signal.indicators["macro_risk"] = risk

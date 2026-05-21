@@ -262,8 +262,8 @@ async def test_coingecko_returns_error_point_on_empty_payload(monkeypatch):
 
 def test_each_source_lists_expected_metrics():
     av = AlphaVantageSource().list_metrics()
-    assert "vix" in av
     assert "spy" in av
+    assert "vix" not in av   # moved to FRED
 
     fr = FrankfurterSource().list_metrics()
     assert "dxy" in fr
@@ -274,7 +274,7 @@ def test_each_source_lists_expected_metrics():
         assert m in cg
 
     fred = FREDSource().list_metrics()
-    for m in ("cpi", "yield_10y", "fed_funds"):
+    for m in ("cpi", "yield_10y", "fed_funds", "vix"):
         assert m in fred
 
 
@@ -282,22 +282,73 @@ def test_each_source_lists_expected_metrics():
 # Source convenience accessors against a primed cache
 # ─────────────────────────────────────────────────────────────────────────
 
-def test_alpha_vantage_risk_sentiment_thresholds():
-    s = AlphaVantageSource()
+def test_fred_risk_sentiment_thresholds():
+    """VIX lives on FRED (VIXCLS), not Alpha Vantage. Risk-regime
+    classifier lives next to the data it reads from."""
+    s = FREDSource()
     # Empty cache → UNKNOWN
     assert s.get_risk_sentiment() == "UNKNOWN"
 
-    s._cache[s._make_key("vix")] = DataPoint("alpha_vantage", "vix", 10.0)
+    s._cache[s._make_key("vix")] = DataPoint("fred", "vix", 10.0)
     assert s.get_risk_sentiment() == "RISK_ON"
 
-    s._cache[s._make_key("vix")] = DataPoint("alpha_vantage", "vix", 20.0)
+    s._cache[s._make_key("vix")] = DataPoint("fred", "vix", 20.0)
     assert s.get_risk_sentiment() == "NEUTRAL"
 
-    s._cache[s._make_key("vix")] = DataPoint("alpha_vantage", "vix", 28.0)
+    s._cache[s._make_key("vix")] = DataPoint("fred", "vix", 28.0)
     assert s.get_risk_sentiment() == "RISK_OFF"
 
-    s._cache[s._make_key("vix")] = DataPoint("alpha_vantage", "vix", 40.0)
+    s._cache[s._make_key("vix")] = DataPoint("fred", "vix", 40.0)
     assert s.get_risk_sentiment() == "CRISIS"
+
+
+def test_alpha_vantage_does_not_carry_vix():
+    """VIX intentionally not in Alpha Vantage's metric list — its
+    GLOBAL_QUOTE endpoint returns empty for non-tradeable indices."""
+    s = AlphaVantageSource()
+    assert "vix" not in s.list_metrics()
+    assert not hasattr(s, "get_vix")
+    assert not hasattr(s, "get_risk_sentiment")
+
+
+@pytest.mark.asyncio
+async def test_alpha_vantage_paces_calls_between_symbols(monkeypatch):
+    """Free tier blocks >1 call/sec. Verify the source sleeps between
+    consecutive symbol fetches (but not before the first one)."""
+    sleeps: list[float] = []
+
+    async def _fake_sleep(seconds):
+        sleeps.append(seconds)
+
+    monkeypatch.setattr("data_sources.sources.alpha_vantage.asyncio.sleep", _fake_sleep)
+    monkeypatch.setenv("ALPHA_VANTAGE_API_KEY", "test-key")
+    monkeypatch.setattr("config.settings.ALPHA_VANTAGE_SYMBOLS", ["SPY", "QQQ", "GLD"])
+    monkeypatch.setattr("config.settings.ALPHA_VANTAGE_PACE_SEC", 1.3)
+
+    # Fake the HTTP layer — return a minimal valid GLOBAL_QUOTE payload.
+    sample = {"Global Quote": {"05. price": "1.0", "10. change percent": "0.5%"}}
+
+    class _FakeResp:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): pass
+        async def json(self, content_type=None): return sample
+
+    class _FakeSession:
+        def __init__(self, *a, **kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): pass
+        def get(self, url, params=None): return _FakeResp()
+
+    monkeypatch.setattr(
+        "data_sources.sources.alpha_vantage.aiohttp.ClientSession",
+        _FakeSession,
+    )
+
+    s = AlphaVantageSource()
+    await s.fetch_all()
+
+    # 3 symbols → 2 inter-call sleeps of PACE_SEC each.
+    assert sleeps == [1.3, 1.3]
 
 
 def test_frankfurter_dxy_strength():
@@ -537,23 +588,22 @@ def patch_macro_into_gate(monkeypatch):
     from data_sources import data_sources as ds
 
     # Stash + reset relevant caches so test ordering is independent.
-    av_key = ds.alpha_vantage._make_key("vix")
-    fr_key = ds.frankfurter._make_key("dxy")
-    yc_keys = [
+    fr_key  = ds.frankfurter._make_key("dxy")
+    fred_keys = [
+        ds.fred._make_key("vix"),
         ds.fred._make_key("yield_curve_spread"),
         ds.fred._make_key("yield_10y"),
         ds.fred._make_key("yield_2y"),
     ]
     saved = {
-        av_key: ds.alpha_vantage._cache.pop(av_key, None),
         fr_key: ds.frankfurter._cache.pop(fr_key, None),
     }
-    for k in yc_keys:
+    for k in fred_keys:
         saved[k] = ds.fred._cache.pop(k, None)
     yield ds
     # Restore so other tests aren't perturbed.
     for k, v in saved.items():
-        for src in (ds.alpha_vantage, ds.frankfurter, ds.fred):
+        for src in (ds.frankfurter, ds.fred):
             cache = src._cache
             if v is None:
                 cache.pop(k, None)
@@ -574,8 +624,8 @@ def _make_signal(direction="long"):
 @pytest.mark.asyncio
 async def test_quality_gate_applies_crisis_vix_penalty(patch_macro_into_gate):
     ds = patch_macro_into_gate
-    ds.alpha_vantage._cache[ds.alpha_vantage._make_key("vix")] = \
-        DataPoint("alpha_vantage", "vix", 40.0)
+    ds.fred._cache[ds.fred._make_key("vix")] = \
+        DataPoint("fred", "vix", 40.0)
 
     from signals.quality_gate import QualityGate
     from config import settings

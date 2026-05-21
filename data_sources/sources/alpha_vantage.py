@@ -1,19 +1,22 @@
 """
 data_sources/sources/alpha_vantage.py
 
-Alpha Vantage proxies for traditional-market context: VIX, SPY, QQQ, GLD,
-TLT. Free tier is 25 calls/day and 5/min — we rate-limit aggressively via
-ALPHA_VANTAGE_DAILY_CALL_BUDGET. Once the budget is exhausted the source
-returns the last cached values with error="rate_limit_exhausted" so the
-quality gate and dashboard can degrade gracefully.
+Alpha Vantage proxies for traditional-market context: SPY, QQQ, GLD, TLT.
 
-Symbol-to-endpoint mapping:
-  VIX  → TIME_SERIES_DAILY function on ^VIX
-  SPY/QQQ/GLD/TLT → GLOBAL_QUOTE function
+Free tier is 25 calls/day, ~1/sec burst — we rate-limit aggressively via
+ALPHA_VANTAGE_DAILY_CALL_BUDGET (daily) and ALPHA_VANTAGE_PACE_SEC
+(per-call sleep). Once the daily budget is exhausted the source returns
+the last cached values with error="rate_limit_exhausted" so the quality
+gate and dashboard degrade gracefully.
+
+VIX deliberately not here — Alpha Vantage's GLOBAL_QUOTE returns empty
+for non-tradeable indices. VIX lives at FRED (series VIXCLS), and the
+risk-regime classifier is on FREDSource.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from datetime import datetime, timezone
@@ -48,7 +51,7 @@ class AlphaVantageSource(BaseDataSource):
 
     def list_metrics(self) -> list[str]:
         return [
-            "vix", "spy", "spy_change_pct",
+            "spy", "spy_change_pct",
             "qqq", "qqq_change_pct",
             "gld", "tlt",
         ]
@@ -81,7 +84,12 @@ class AlphaVantageSource(BaseDataSource):
         points: list[DataPoint] = []
         timeout = aiohttp.ClientTimeout(total=settings.DATA_SOURCES_HTTP_TIMEOUT_SEC)
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            for symbol in symbols:
+            for i, symbol in enumerate(symbols):
+                # Spread calls — free tier blocks >1/sec hard. The sleep
+                # only happens between calls (not before the first or
+                # after the last) so a single-symbol fetch stays fast.
+                if i > 0:
+                    await asyncio.sleep(settings.ALPHA_VANTAGE_PACE_SEC)
                 try:
                     points.extend(await self._fetch_symbol(session, symbol, api_key))
                 except Exception as e:
@@ -135,7 +143,6 @@ class AlphaVantageSource(BaseDataSource):
 
     def _metric_for(self, symbol: str) -> str:
         return {
-            "VIX": "vix",
             "SPY": "spy",
             "QQQ": "qqq",
             "GLD": "gld",
@@ -150,9 +157,6 @@ class AlphaVantageSource(BaseDataSource):
 
     # ── Sync convenience accessors ───────────────────────────────────────
 
-    def get_vix(self) -> Optional[float]:
-        return self.cached_value("vix")
-
     def get_spy(self) -> Optional[float]:
         return self.cached_value("spy")
 
@@ -164,20 +168,3 @@ class AlphaVantageSource(BaseDataSource):
 
     def get_gold(self) -> Optional[float]:
         return self.cached_value("gld")
-
-    def get_risk_sentiment(self) -> str:
-        """Coarse market-risk regime label, thresholds from settings.
-
-        Returns one of: RISK_ON, NEUTRAL, RISK_OFF, CRISIS, UNKNOWN
-        (UNKNOWN when VIX hasn't been populated yet).
-        """
-        vix = self.get_vix()
-        if vix is None or vix <= 0:
-            return "UNKNOWN"
-        if vix < settings.DATA_VIX_RISK_ON_MAX:
-            return "RISK_ON"
-        if vix < settings.DATA_VIX_RISK_OFF_MIN:
-            return "NEUTRAL"
-        if vix < settings.DATA_VIX_CRISIS_MIN:
-            return "RISK_OFF"
-        return "CRISIS"
