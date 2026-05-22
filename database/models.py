@@ -320,6 +320,13 @@ class ScalpObservationModel(Base):
     pnl_bps               = Column(Float, default=0.0)   # GROSS (pre-fee)
     pnl_usd               = Column(Float, default=0.0)   # GROSS
     observation_only      = Column(Boolean, default=True)
+    # Micro price tracker backfills — let analysis ask "did the signal
+    # predict the direction even when the position was exited early?".
+    # 0.0 means "not sampled yet"; tracker loop fills them as age elapses.
+    price_30s             = Column(Float, default=0.0)
+    price_1m              = Column(Float, default=0.0)
+    price_3m              = Column(Float, default=0.0)
+    price_5m              = Column(Float, default=0.0)
     created_at            = Column(DateTime, default=datetime.utcnow)
 
     __table_args__ = (

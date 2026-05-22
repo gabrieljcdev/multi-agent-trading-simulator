@@ -569,6 +569,28 @@ SCALP_POSITION_SIZE_USD   = 25.0   # test: 10-50     (per-trade size USD)
 SCALP_DAILY_LOSS_HALT     = 5.0    # test: 2-10      (daily loss halt USD)
 SCALP_CONSEC_LOSS_PAUSE   = 4      # test: 3-6       (consecutive loss pause count)
 
+# Session window — scalp edge depends on tight spreads + active flow,
+# both of which thin out outside London/NY overlap. The main bot's
+# dead zone (02:00-06:00 UTC) is contained inside this window — these
+# are additive gates, not redundant.
+SCALP_SESSION_START_UTC   = 7      # test: 6-9       (London open)
+SCALP_SESSION_END_UTC     = 17     # test: 15-20     (NY afternoon)
+
+# News guard — when the sentiment aggregator's news_guard_active fires,
+# scalp setups stop being reliable (correlated cross-pair flows + spread
+# widening). Optional; falls through cleanly if sentiment isn't wired.
+SCALP_RESPECT_NEWS_GUARD  = True   # test: True/False
+
+# BTC correlation guard — alts gap when BTC moves sharply. Catches the
+# fast move before the spread API ticks. Only applies to non-BTC symbols.
+SCALP_BTC_GUARD_PCT       = 0.3    # test: 0.2-0.6   (block if |BTC 1m change| > N%)
+
+# Micro price tracker — backfills price_30s/1m/3m/5m on closed
+# observations so retrospective analysis can compare "did the signal
+# predict correctly" vs "what was the realised P&L at exit". Same
+# spirit as the main bot's future_price_tracker but on a tighter window.
+SCALP_TRACKER_INTERVAL_SEC = 15    # test: 10-30
+
 # Depth weights for multi-level OFI (exponential decay ~λ=0.3).
 SCALP_DEPTH_WEIGHTS       = {0: 1.0, 1: 0.70, 2: 0.50, 3: 0.35, 4: 0.25}
 

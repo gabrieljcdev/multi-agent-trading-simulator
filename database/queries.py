@@ -734,13 +734,23 @@ def save_scalp_observations(obs_list: list) -> None:
                 exit_reason=o.exit_reason,
                 hold_sec=o.hold_sec, pnl_bps=o.pnl_bps, pnl_usd=o.pnl_usd,
                 observation_only=o.observation_only,
+                price_30s=getattr(o, "price_30s", 0.0),
+                price_1m=getattr(o,  "price_1m",  0.0),
+                price_3m=getattr(o,  "price_3m",  0.0),
+                price_5m=getattr(o,  "price_5m",  0.0),
             )
             if existing is None:
                 s.add(ScalpObservationModel(**payload))
             else:
-                # Only overwrite once exit data has actually arrived so a
-                # second open-row write doesn't blank out earlier values.
-                if o.exit_price > 0:
+                # Overwrite when exit data has arrived OR when any micro
+                # price slot has been filled — the tracker flushes a row
+                # purely to backfill price_30s / 1m / 3m / 5m even before
+                # the position closes, and we don't want to drop those.
+                price_backfill = any((
+                    payload["price_30s"] > 0, payload["price_1m"] > 0,
+                    payload["price_3m"]  > 0, payload["price_5m"] > 0,
+                ))
+                if o.exit_price > 0 or price_backfill:
                     for k, v in payload.items():
                         setattr(existing, k, v)
 
@@ -849,6 +859,8 @@ def get_scalp_observations(
             "exit_reason": r.exit_reason, "hold_sec": r.hold_sec,
             "pnl_bps": r.pnl_bps, "pnl_usd": r.pnl_usd,
             "observation_only": r.observation_only,
+            "price_30s": r.price_30s, "price_1m": r.price_1m,
+            "price_3m":  r.price_3m,  "price_5m": r.price_5m,
         }
         for r in rows
     ]
@@ -890,6 +902,37 @@ def get_scalp_observations(
 #   FROM scalp_observations
 #   WHERE would_entry = 1 AND exit_price > 0
 #   GROUP BY exchange, exit_reason ORDER BY exchange, n DESC;
+#
+# Did OFI predict direction correctly, regardless of exit reason?
+# Uses the micro-tracker price_1m / price_3m backfills — answers
+# "was the signal right even when OFI_EXHAUSTED cut us out early?"
+#   SELECT exchange, direction,
+#          ROUND(AVG(CASE
+#              WHEN direction='LONG'  AND price_1m > entry_price THEN 1.0
+#              WHEN direction='SHORT' AND price_1m < entry_price THEN 1.0
+#              ELSE 0.0 END), 3) as directional_accuracy_1m,
+#          ROUND(AVG(CASE
+#              WHEN direction='LONG'  AND price_3m > entry_price THEN 1.0
+#              WHEN direction='SHORT' AND price_3m < entry_price THEN 1.0
+#              ELSE 0.0 END), 3) as directional_accuracy_3m,
+#          COUNT(*) as n
+#   FROM scalp_observations
+#   WHERE would_entry = 1 AND price_1m > 0
+#   GROUP BY exchange, direction;
+#
+# Is OFI_EXHAUSTED cutting winners short? Compare net at exit vs net
+# if we'd held to 3 minutes. If "if held 3m" > "at exit" consistently,
+# consider raising SCALP_OFI_Z_EXIT.
+#   SELECT exit_reason,
+#          ROUND(AVG(pnl_bps - round_trip_cost_bps), 3) as avg_net_at_exit,
+#          ROUND(AVG(CASE WHEN direction='LONG'
+#              THEN (price_3m - entry_price)/entry_price*10000 - round_trip_cost_bps
+#              ELSE (entry_price - price_3m)/entry_price*10000 - round_trip_cost_bps
+#              END), 3) as avg_net_if_held_3m,
+#          COUNT(*) as n
+#   FROM scalp_observations
+#   WHERE would_entry = 1 AND exit_price > 0 AND price_3m > 0
+#   GROUP BY exit_reason;
 
 
 # ── Analytics helpers (used by predictive engine) ──────────

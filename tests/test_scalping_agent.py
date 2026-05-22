@@ -220,9 +220,13 @@ def test_direction_persistence_resets():
 # ─────────────────────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_entry_observation_logged_mexc():
+async def test_entry_observation_logged_mexc(monkeypatch):
     """Strong + persistent OFI on MEXC → observation logged with
-    would_entry=True, observation_only=True (capital is 0)."""
+    would_entry=True, observation_only=True (capital is 0).
+
+    Session window patched to 0-24 so the test runs at any UTC hour."""
+    monkeypatch.setattr(settings, "SCALP_SESSION_START_UTC", 0)
+    monkeypatch.setattr(settings, "SCALP_SESSION_END_UTC",   24)
     agent = _agent_with_capital(0.0)
 
     # Stub the four async market-data methods.
@@ -320,3 +324,132 @@ async def test_circuit_breaker_daily_loss():
     await agent._exit_position(pos_key, pos, "SL", exit_price=40_000.0)
     assert agent._halted is True
     assert "daily loss" in agent._halt_reason.lower()
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# ADDITIONAL TESTS (17-20)
+# ─────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_daily_reset_clears_circuit_breaker():
+    """UTC day rollover → daily_loss zeroes, consec_losses zeroes, the
+    halt is lifted (provided it was a daily-loss halt)."""
+    from datetime import timedelta
+    agent = _agent_with_capital(50.0)
+
+    # Force into the halted-by-daily-loss state.
+    pos = ScalpPosition(
+        symbol="BTC/USDT", exchange="mexc", direction="LONG",
+        entry_price=50_000.0, entry_time=time.time(),
+        entry_ofi_z=2.0, entry_tfi=1.0,
+        size_usd=50.0, tp_price=50_015.0, sl_price=40_000.0,
+        tp_bps=3.0, sl_bps=1.9, round_trip_cost_bps=0.0,
+        observation_only=False,
+    )
+    pos_key = "BTC/USDT:mexc"
+    agent._positions[pos_key] = pos
+    await agent._exit_position(pos_key, pos, "SL", exit_price=40_000.0)
+    assert agent._halted is True
+    assert agent._daily_loss < 0
+
+    # Pretend the last reset happened yesterday — the next check fires.
+    from datetime import datetime as _dt
+    agent._last_reset_date = (_dt.utcnow().date() - timedelta(days=1))
+    agent._check_daily_reset()
+
+    assert agent._halted is False
+    assert agent._daily_loss == 0.0
+    assert agent._consec_losses == 0
+
+
+@pytest.mark.asyncio
+async def test_session_gate_blocks_outside_window(monkeypatch):
+    """UTC hour outside [SESSION_START, SESSION_END) → would_entry=False
+    with 'Outside scalp session' skip reason."""
+    from datetime import datetime as _dt
+    import agents.scalping_agent as scalp_mod
+
+    class _FakeDT:
+        @staticmethod
+        def utcnow():
+            # 03:00 UTC — well before the default 7-17 window.
+            return _dt(2026, 5, 22, 3, 0, 0)
+
+    monkeypatch.setattr(scalp_mod, "datetime", _FakeDT)
+
+    agent = _agent_with_capital(0.0)
+    agent._get_mid_price  = AsyncMock(return_value=50_000.0)
+    agent._get_spread_bps = AsyncMock(return_value=1.0)
+    agent._get_regime     = AsyncMock(return_value="TRENDING")
+
+    # OFI ready to fire — so we know the session gate is what blocks us.
+    eng = agent._ofi_engine
+    key = "BTC/USDT:mexc"
+    eng._last_z[key] = settings.SCALP_OFI_Z_ENTRY + 0.5
+    eng._last_tfi[key] = 1.0
+    eng._last_bucket_close[key] = time.time()
+    eng._persist[key] = settings.SCALP_OFI_PERSIST_TICKS
+
+    await agent._evaluate_entry("BTC/USDT", "mexc")
+    assert agent._observations, "should have logged an observation"
+    obs = agent._observations[-1]
+    assert obs.would_entry is False
+    assert "Outside scalp session" in obs.skip_reason
+
+
+@pytest.mark.asyncio
+async def test_news_guard_blocks_entry(monkeypatch):
+    """Sentiment source reports news_guard_active → entry blocked."""
+    monkeypatch.setattr(settings, "SCALP_SESSION_START_UTC", 0)
+    monkeypatch.setattr(settings, "SCALP_SESSION_END_UTC",   24)
+
+    class _FakeSentiment:
+        async def get_composite(self):
+            return {"news_guard_active": True}
+
+    agent = _agent_with_capital(0.0)
+    agent._sentiment_source = _FakeSentiment()
+    agent._get_mid_price  = AsyncMock(return_value=50_000.0)
+    agent._get_spread_bps = AsyncMock(return_value=1.0)
+    agent._get_regime     = AsyncMock(return_value="TRENDING")
+
+    eng = agent._ofi_engine
+    key = "BTC/USDT:mexc"
+    eng._last_z[key] = settings.SCALP_OFI_Z_ENTRY + 0.5
+    eng._last_tfi[key] = 1.0
+    eng._last_bucket_close[key] = time.time()
+    eng._persist[key] = settings.SCALP_OFI_PERSIST_TICKS
+
+    await agent._evaluate_entry("BTC/USDT", "mexc")
+    assert agent._observations
+    obs = agent._observations[-1]
+    assert obs.would_entry is False
+    assert "News guard" in obs.skip_reason
+
+
+@pytest.mark.asyncio
+async def test_micro_price_tracker_backfills_30s():
+    """One pass of the tracker loop fills price_30s on a 35s-old entry
+    but leaves price_1m alone (60s threshold not yet crossed)."""
+    from agents.scalping_agent import ScalpObservation
+    agent = _agent_with_capital(0.0)
+    agent._get_mid_price = AsyncMock(return_value=50_100.0)
+
+    obs = ScalpObservation(
+        symbol="BTC/USDT", exchange="mexc", timestamp=time.time() - 35.0,
+        ofi_z=2.0, direction="LONG", strength="strong",
+        tfi_confirms=True, raw_tfi=1.0, spread_bps=1.0, regime="TRENDING",
+        round_trip_cost_bps=0.0, min_win_rate_required=0.4,
+        tp_bps=3.0, sl_bps=1.9,
+        would_entry=True, skip_reason="",
+        entry_price=50_000.0, observation_only=True,
+    )
+    agent._observations.append(obs)
+
+    await agent._micro_price_tracker_pass()
+    assert obs.price_30s == 50_100.0
+    assert obs.price_1m  == 0.0   # 35s < 60s threshold
+    assert obs.price_3m  == 0.0
+    assert obs.price_5m  == 0.0
+    # Updated obs queued for flush.
+    assert obs in agent._pending_flush

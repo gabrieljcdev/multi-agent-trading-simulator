@@ -49,6 +49,13 @@ TODO comment in this file:
 
 Until wired, FeeManager falls back to SCALP_FEE_OVERRIDES (correct
 MEXC + Bitget values hardcoded) and observation mode hums along.
+
+# TODO (dashboard, Phase 2): expose self._observations[-15:] as a
+# property so ui/dashboard.py can render a "scalp feed" panel alongside
+# the existing signal_feed. Suggested columns: timestamp, symbol:exchange,
+# direction, ofi_z, tp_bps/sl_bps, exit_reason, pnl_net_bps. Slot it in
+# as Panel 19 of dashboard.py — get_observation_summary already returns
+# the aggregate stats that panel header would show.
 """
 
 from __future__ import annotations
@@ -129,6 +136,13 @@ class ScalpObservation:
     pnl_bps:               float = 0.0
     pnl_usd:               float = 0.0
     observation_only:      bool  = True
+    # Micro price tracker backfills these on closed observations so the
+    # analysis SQL can compare "did OFI predict" vs "what did we realise
+    # at exit". 0.0 = not yet sampled.
+    price_30s:             float = 0.0
+    price_1m:              float = 0.0
+    price_3m:              float = 0.0
+    price_5m:              float = 0.0
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -491,7 +505,7 @@ class ScalpingAgent(BaseAgent):
     display_name = "Scalping Agent (OFI)"
     optional     = True
 
-    def __init__(self):
+    def __init__(self, sentiment_source: Optional[Any] = None):
         super().__init__()
         self.capital_allocation = float(settings.SCALP_CAPITAL)
         self._capital           = float(settings.SCALP_CAPITAL)
@@ -502,6 +516,10 @@ class ScalpingAgent(BaseAgent):
             zscore_window=settings.SCALP_ZSCORE_WINDOW,
         )
         self._fee_manager = FeeManager(settings.SCALP_FEE_OVERRIDES)
+
+        # Optional sentiment source — gate 12 reads news_guard_active from
+        # its composite if set. Never blocks the agent if missing or broken.
+        self._sentiment_source = sentiment_source
 
         self._positions:     dict[str, ScalpPosition] = {}
         self._observations:  list[ScalpObservation]   = []
@@ -520,8 +538,9 @@ class ScalpingAgent(BaseAgent):
             "total_pnl":     0.0,
         }
 
-        self._running                       = False
-        self._task: Optional[asyncio.Task]  = None
+        self._running                          = False
+        self._task: Optional[asyncio.Task]     = None
+        self._tracker_task: Optional[asyncio.Task] = None
 
     # ── BaseAgent contract ──────────────────────────────────────────────
 
@@ -541,15 +560,17 @@ class ScalpingAgent(BaseAgent):
             self._capital,
         )
         self._task = asyncio.create_task(self._loop())
+        self._tracker_task = asyncio.create_task(self._micro_price_tracker_loop())
 
     async def stop(self) -> None:
         self._running = False
-        if self._task is not None and not self._task.done():
-            self._task.cancel()
-            try:
-                await self._task
-            except Exception:
-                pass
+        for t in (self._task, self._tracker_task):
+            if t is not None and not t.done():
+                t.cancel()
+                try:
+                    await t
+                except Exception:
+                    pass
         self._status = STOPPED
         log.info("[ScalpingAgent] stopped")
 
@@ -622,6 +643,15 @@ class ScalpingAgent(BaseAgent):
         # TODO Phase 2: execution router's exchange pool.
         return None
 
+    async def _get_btc_1m_change(self) -> float:
+        """BTC 1-minute % change for the correlation guard (gate 13).
+
+        TODO Phase 2: wire to market_data 1m BTC ticker. Returning 0.0
+        in stub mode means the gate always passes — exactly what we
+        want until live BTC data is plumbed through.
+        """
+        return 0.0
+
     async def _place_order(
         self,
         symbol: str,
@@ -672,6 +702,62 @@ class ScalpingAgent(BaseAgent):
     @staticmethod
     def _pos_key(symbol: str, exchange: str) -> str:
         return f"{symbol}:{exchange}"
+
+    # ── Micro price tracker ────────────────────────────────────────────
+
+    async def _micro_price_tracker_loop(self) -> None:
+        """Backfill price_30s/1m/3m/5m on every real entry as its age
+        crosses each threshold.
+
+        Scalp analogue of the main bot's future_price_tracker — lets us
+        ask, retrospectively, "did the OFI signal predict correctly even
+        when the position was exited early by OFI_EXHAUSTED?" without
+        depending on whether the exit reason happened to be TP/SL.
+        Runs every SCALP_TRACKER_INTERVAL_SEC.
+        """
+        while self._running:
+            try:
+                await asyncio.sleep(settings.SCALP_TRACKER_INTERVAL_SEC)
+                await self._micro_price_tracker_pass()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                log.error("[ScalpingAgent] Micro tracker error: %s", e)
+
+    async def _micro_price_tracker_pass(self) -> None:
+        """One sweep of the observation list — extracted so tests can
+        drive a single iteration without sleeping."""
+        now = time.time()
+        updated: list[ScalpObservation] = []
+        for obs in self._observations:
+            if obs.entry_price == 0.0:
+                continue   # not a real entry — nothing to track
+            age = now - obs.timestamp
+            changed = False
+            if age >= 30 and obs.price_30s == 0.0:
+                p = await self._get_mid_price(obs.symbol, obs.exchange)
+                if p > 0.0:
+                    obs.price_30s = p
+                    changed = True
+            if age >= 60 and obs.price_1m == 0.0:
+                p = await self._get_mid_price(obs.symbol, obs.exchange)
+                if p > 0.0:
+                    obs.price_1m = p
+                    changed = True
+            if age >= 180 and obs.price_3m == 0.0:
+                p = await self._get_mid_price(obs.symbol, obs.exchange)
+                if p > 0.0:
+                    obs.price_3m = p
+                    changed = True
+            if age >= 300 and obs.price_5m == 0.0:
+                p = await self._get_mid_price(obs.symbol, obs.exchange)
+                if p > 0.0:
+                    obs.price_5m = p
+                    changed = True
+            if changed:
+                updated.append(obs)
+        if updated:
+            self._pending_flush.extend(updated)
 
     # ── Entry gate ──────────────────────────────────────────────────────
 
@@ -763,6 +849,48 @@ class ScalpingAgent(BaseAgent):
                            rt_bps=rt_bps, min_wr=1.0,
                            spread_bps=spread_bps, regime=regime)
             return
+
+        # 11. Session timing — scalp edge requires tight spreads + active
+        # order flow, both of which only hold during London/NY overlap.
+        hour_utc = datetime.utcnow().hour
+        if not (settings.SCALP_SESSION_START_UTC
+                <= hour_utc < settings.SCALP_SESSION_END_UTC):
+            self._log_skip(symbol, exchange, now, ofi=ofi,
+                           reason=f"Outside scalp session ({hour_utc:02d}:xx UTC)",
+                           rt_bps=rt_bps, min_wr=1.0,
+                           spread_bps=spread_bps, regime=regime)
+            return
+
+        # 12. News guard — read the sentiment aggregator's news_guard flag
+        # if a source was injected. Offline source never blocks the gate
+        # (try/except + None-check).
+        if settings.SCALP_RESPECT_NEWS_GUARD and self._sentiment_source is not None:
+            try:
+                composite = await self._sentiment_source.get_composite()
+                if composite and composite.get("news_guard_active", False):
+                    self._log_skip(symbol, exchange, now, ofi=ofi,
+                                   reason="News guard active — scalp edge unreliable",
+                                   rt_bps=rt_bps, min_wr=1.0,
+                                   spread_bps=spread_bps, regime=regime)
+                    return
+            except Exception as e:
+                log.debug("[ScalpingAgent] news guard check failed: %s", e)
+
+        # 13. BTC correlation guard — alt order books gap when BTC moves
+        # sharply; the spread gate would catch it eventually but this is
+        # a cheaper check against an upstream data source.
+        if symbol != "BTC/USDT":
+            try:
+                btc_change = await self._get_btc_1m_change()
+            except Exception:
+                btc_change = 0.0
+            if abs(btc_change) > settings.SCALP_BTC_GUARD_PCT:
+                self._log_skip(symbol, exchange, now, ofi=ofi,
+                               reason=(f"BTC moving {btc_change:.2f}% in 1m "
+                                       "— alt scalp risky"),
+                               rt_bps=rt_bps, min_wr=1.0,
+                               spread_bps=spread_bps, regime=regime)
+                return
 
         # ── Passed every gate ─────────────────────────────────────────
         entry_price = await self._get_mid_price(symbol, exchange)
@@ -1017,21 +1145,116 @@ class ScalpingAgent(BaseAgent):
     # ── Analysis helper ────────────────────────────────────────────────
 
     def get_observation_summary(self) -> dict:
-        """In-memory mirror of get_scalp_summary — useful for tests +
-        the dashboard before the DB-backed summary is wired."""
-        total   = len(self._observations)
-        entries = [o for o in self._observations if o.would_entry]
-        closed  = [o for o in entries if o.exit_price > 0]
-        wins    = sum(1 for o in closed if (o.pnl_bps or 0) > 0)
-        win_rate = wins / len(closed) if closed else 0.0
-        avg_net = (
-            sum((o.pnl_bps - o.round_trip_cost_bps) for o in closed) / len(closed)
-            if closed else 0.0
-        )
-        return {
-            "total_evaluated": total,
-            "would_enter":     len(entries),
-            "closed":          len(closed),
-            "win_rate":        win_rate,
-            "avg_pnl_net_bps": avg_net,
+        """Snapshot of observation-mode performance for the dashboard
+        and coordinator. Never raises — every branch falls back to
+        zeroed defaults if something is missing.
+
+        See prompts/build_scalping_agent.md → GET_OBSERVATION_SUMMARY
+        SPEC for the full key list. The shape is stable so dashboard /
+        coordinator code can rely on it.
+        """
+        zeroed = {
+            "total_evaluated":   0,
+            "would_enter":       0,
+            "closed":            0,
+            "open":              0,
+            "win_rate":          0.0,
+            "avg_pnl_gross_bps": 0.0,
+            "avg_pnl_net_bps":   0.0,
+            "avg_hold_sec":      0.0,
+            "halted":            bool(self._halted),
+            "halt_reason":       self._halt_reason,
+            "daily_loss_usd":    float(self._daily_loss),
+            "consec_losses":     int(self._consec_losses),
+            "by_exchange":       {},
+            "fee_viability":     {},
+            "top_skip_reasons":  [],
         }
+        try:
+            total   = len(self._observations)
+            entries = [o for o in self._observations if o.would_entry]
+            closed  = [o for o in entries if o.exit_price > 0]
+            wins    = sum(1 for o in closed if (o.pnl_bps or 0) > 0)
+            win_rate = wins / len(closed) if closed else 0.0
+            avg_gross = (
+                sum((o.pnl_bps or 0) for o in closed) / len(closed)
+                if closed else 0.0
+            )
+            avg_net = (
+                sum((o.pnl_bps - o.round_trip_cost_bps) for o in closed) / len(closed)
+                if closed else 0.0
+            )
+            avg_hold = (
+                sum((o.hold_sec or 0) for o in closed) / len(closed)
+                if closed else 0.0
+            )
+
+            # Per-exchange breakdown over closed entries.
+            by_ex: dict[str, dict] = {}
+            for o in closed:
+                agg = by_ex.setdefault(o.exchange, {
+                    "n": 0, "wins": 0, "net_sum": 0.0, "fee_sum": 0.0,
+                })
+                agg["n"] += 1
+                if (o.pnl_bps or 0) > 0:
+                    agg["wins"] += 1
+                agg["net_sum"] += (o.pnl_bps - o.round_trip_cost_bps)
+                agg["fee_sum"] += o.round_trip_cost_bps
+            by_exchange = {
+                ex: {
+                    "n":           agg["n"],
+                    "win_rate":    agg["wins"] / agg["n"] if agg["n"] else 0.0,
+                    "avg_net_bps": agg["net_sum"] / agg["n"] if agg["n"] else 0.0,
+                    "fee_bps":     agg["fee_sum"] / agg["n"] if agg["n"] else 0.0,
+                }
+                for ex, agg in by_ex.items()
+            }
+
+            # Live fee viability per approved scalp exchange — lets the
+            # dashboard show fee health without importing FeeManager.
+            fee_viability: dict[str, dict] = {}
+            for ex in settings.STRATEGY_EXCHANGE_MAP.get("scalp", []):
+                try:
+                    tp, sl = self._fee_manager.compute_tp_sl(ex, settings.SCALP_PAIRS[0])
+                    rt     = self._fee_manager.round_trip_bps(ex, settings.SCALP_PAIRS[0])
+                    be     = self._fee_manager.breakeven_win_rate(
+                        ex, settings.SCALP_PAIRS[0], tp, sl,
+                    )
+                    viable, _ = self._fee_manager.is_viable(ex, settings.SCALP_PAIRS[0])
+                    fee_viability[ex] = {
+                        "viable":       bool(viable),
+                        "breakeven_wr": float(be),
+                        "tp_bps":       float(tp),
+                        "sl_bps":       float(sl),
+                        "rt_bps":       float(rt),
+                    }
+                except Exception:
+                    fee_viability[ex] = {
+                        "viable": False, "breakeven_wr": 1.0,
+                        "tp_bps": 0.0, "sl_bps": 0.0, "rt_bps": 0.0,
+                    }
+
+            # Top-5 skip reasons across all skipped observations.
+            from collections import Counter
+            ctr = Counter(
+                o.skip_reason for o in self._observations
+                if not o.would_entry and o.skip_reason
+            )
+            top_skips = ctr.most_common(5)
+
+            zeroed.update({
+                "total_evaluated":   total,
+                "would_enter":       len(entries),
+                "closed":            len(closed),
+                "open":              len(self._positions),
+                "win_rate":          win_rate,
+                "avg_pnl_gross_bps": avg_gross,
+                "avg_pnl_net_bps":   avg_net,
+                "avg_hold_sec":      avg_hold,
+                "by_exchange":       by_exchange,
+                "fee_viability":     fee_viability,
+                "top_skip_reasons":  top_skips,
+            })
+        except Exception as e:
+            log.debug("[ScalpingAgent] get_observation_summary failed: %s", e)
+        return zeroed
