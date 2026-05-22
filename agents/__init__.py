@@ -320,9 +320,13 @@ class OnChainAgentPlaceholder(PlaceholderAgent):
 # Registry — Coordinator picks this up by default
 # ─────────────────────────────────────────────────────────────────────────
 
+from agents.scalping_agent import ScalpingAgent
+
+
 REGISTERED_AGENTS: list[BaseAgent] = [
     SignalAgentWrapper(),
     ArbAgentWrapper(),
+    ScalpingAgent(),
     MacroAgentPlaceholder(),
     SentimentAgentPlaceholder(),
     OnChainAgentPlaceholder(),
@@ -336,6 +340,7 @@ __all__ = [
     "AgentStats",
     "SignalAgentWrapper",
     "ArbAgentWrapper",
+    "ScalpingAgent",
     "MacroAgentPlaceholder",
     "SentimentAgentPlaceholder",
     "OnChainAgentPlaceholder",

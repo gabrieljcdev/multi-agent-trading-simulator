@@ -14,6 +14,7 @@ from .models import (
     PortfolioSnapshot, AgentEvent, ArbTrade,
     DataLog,
     MacroLog, CalendarEvent,
+    ScalpObservationModel,
 )
 
 
@@ -690,6 +691,205 @@ def get_pending_events(hours_ahead: int = 48) -> list:
             .order_by(CalendarEvent.scheduled_utc)
             .all()
         )
+
+
+# ── Scalping agent (observation logs) ──────────────────────
+
+def save_scalp_observations(obs_list: list) -> None:
+    """Upsert a batch of scalp observations.
+
+    `obs_list` is duck-typed (each row exposes the fields enumerated in
+    the ScalpObservation dataclass). Natural key is
+    (symbol, exchange, timestamp) — first write creates the row, later
+    writes (when the position exits) fill exit_price + exit_reason etc.
+
+    Synchronous on purpose — matches every other query helper. The agent
+    can call this from a worker thread / asyncio.to_thread if it wants.
+    DB failures are non-fatal at the call site; this helper just raises.
+    """
+    if not obs_list:
+        return
+    with get_session() as s:
+        for o in obs_list:
+            existing = (
+                s.query(ScalpObservationModel)
+                .filter_by(
+                    symbol=o.symbol,
+                    exchange=o.exchange,
+                    timestamp=o.timestamp,
+                )
+                .first()
+            )
+            payload = dict(
+                symbol=o.symbol, exchange=o.exchange, timestamp=o.timestamp,
+                ofi_z=o.ofi_z, direction=o.direction, strength=o.strength,
+                tfi_confirms=o.tfi_confirms, raw_tfi=o.raw_tfi,
+                spread_bps=o.spread_bps, regime=o.regime,
+                round_trip_cost_bps=o.round_trip_cost_bps,
+                min_win_rate_required=o.min_win_rate_required,
+                tp_bps=o.tp_bps, sl_bps=o.sl_bps,
+                would_entry=o.would_entry, skip_reason=o.skip_reason,
+                entry_price=o.entry_price,
+                exit_price=o.exit_price, exit_time=o.exit_time,
+                exit_reason=o.exit_reason,
+                hold_sec=o.hold_sec, pnl_bps=o.pnl_bps, pnl_usd=o.pnl_usd,
+                observation_only=o.observation_only,
+            )
+            if existing is None:
+                s.add(ScalpObservationModel(**payload))
+            else:
+                # Only overwrite once exit data has actually arrived so a
+                # second open-row write doesn't blank out earlier values.
+                if o.exit_price > 0:
+                    for k, v in payload.items():
+                        setattr(existing, k, v)
+
+
+def get_scalp_summary(days: int = 7) -> dict:
+    """Aggregate metrics across the last `days` of observations.
+
+    Returns total_evaluated, would_enter, closed (would_entry & exit_price>0),
+    win_rate, avg gross + net pnl_bps, avg hold_sec, plus a per-exchange
+    breakdown. Net pnl is computed in SQL as pnl_bps - round_trip_cost_bps
+    so callers don't carry the convention.
+    """
+    import time as _time
+    cutoff = _time.time() - days * 86400
+    out = {
+        "total_evaluated": 0,
+        "would_enter":     0,
+        "closed":          0,
+        "win_rate":        0.0,
+        "avg_pnl_bps":     0.0,
+        "avg_pnl_net_bps": 0.0,
+        "avg_hold_sec":    0.0,
+        "by_exchange":     {},
+    }
+    with get_session() as s:
+        rows = (
+            s.query(ScalpObservationModel)
+            .filter(ScalpObservationModel.timestamp >= cutoff)
+            .all()
+        )
+    if not rows:
+        return out
+
+    out["total_evaluated"] = len(rows)
+    entries = [r for r in rows if r.would_entry]
+    out["would_enter"]     = len(entries)
+    closed = [r for r in entries if (r.exit_price or 0) > 0]
+    out["closed"]          = len(closed)
+    if not closed:
+        return out
+
+    wins = sum(1 for r in closed if (r.pnl_bps or 0) > 0)
+    out["win_rate"]        = wins / len(closed)
+    out["avg_pnl_bps"]     = sum((r.pnl_bps or 0) for r in closed) / len(closed)
+    out["avg_pnl_net_bps"] = sum(
+        (r.pnl_bps or 0) - (r.round_trip_cost_bps or 0) for r in closed
+    ) / len(closed)
+    out["avg_hold_sec"]    = sum((r.hold_sec or 0) for r in closed) / len(closed)
+
+    by_ex: dict[str, dict] = {}
+    for r in closed:
+        ex = r.exchange
+        agg = by_ex.setdefault(ex, {"n": 0, "wins": 0, "net_sum": 0.0})
+        agg["n"] += 1
+        if (r.pnl_bps or 0) > 0:
+            agg["wins"] += 1
+        agg["net_sum"] += (r.pnl_bps or 0) - (r.round_trip_cost_bps or 0)
+    out["by_exchange"] = {
+        ex: {
+            "n":          agg["n"],
+            "win_rate":   agg["wins"] / agg["n"] if agg["n"] else 0.0,
+            "avg_pnl_net": agg["net_sum"] / agg["n"] if agg["n"] else 0.0,
+        }
+        for ex, agg in by_ex.items()
+    }
+    return out
+
+
+def get_scalp_observations(
+    symbol: Optional[str] = None,
+    exchange: Optional[str] = None,
+    would_entry_only: bool = True,
+    closed_only: bool = True,
+    limit: int = 500,
+) -> list:
+    """Filtered ScalpObservationModel rows as plain dicts. Newest first."""
+    with get_session() as s:
+        q = s.query(ScalpObservationModel)
+        if symbol:
+            q = q.filter(ScalpObservationModel.symbol == symbol)
+        if exchange:
+            q = q.filter(ScalpObservationModel.exchange == exchange)
+        if would_entry_only:
+            q = q.filter(ScalpObservationModel.would_entry.is_(True))
+        if closed_only:
+            q = q.filter(ScalpObservationModel.exit_price > 0)
+        rows = (
+            q.order_by(desc(ScalpObservationModel.timestamp))
+            .limit(limit)
+            .all()
+        )
+    # Detach into plain dicts so callers don't depend on the ORM session.
+    return [
+        {
+            "id": r.id, "symbol": r.symbol, "exchange": r.exchange,
+            "timestamp": r.timestamp,
+            "ofi_z": r.ofi_z, "direction": r.direction, "strength": r.strength,
+            "tfi_confirms": r.tfi_confirms, "raw_tfi": r.raw_tfi,
+            "spread_bps": r.spread_bps, "regime": r.regime,
+            "round_trip_cost_bps": r.round_trip_cost_bps,
+            "min_win_rate_required": r.min_win_rate_required,
+            "tp_bps": r.tp_bps, "sl_bps": r.sl_bps,
+            "would_entry": r.would_entry, "skip_reason": r.skip_reason,
+            "entry_price": r.entry_price,
+            "exit_price": r.exit_price, "exit_time": r.exit_time,
+            "exit_reason": r.exit_reason, "hold_sec": r.hold_sec,
+            "pnl_bps": r.pnl_bps, "pnl_usd": r.pnl_usd,
+            "observation_only": r.observation_only,
+        }
+        for r in rows
+    ]
+
+
+# Analysis SQL — paste into sqlite3 once observations have accumulated.
+# All net P&L is computed live as (pnl_bps - round_trip_cost_bps); stored
+# pnl_bps is gross by design.
+#
+# Core performance — win rate + net P&L by exchange:
+#   SELECT exchange, direction,
+#          COUNT(*) as n,
+#          ROUND(AVG(CASE WHEN pnl_bps > 0 THEN 1.0 ELSE 0.0 END), 3) as win_rate,
+#          ROUND(AVG(pnl_bps), 3) as avg_gross_bps,
+#          ROUND(AVG(pnl_bps - round_trip_cost_bps), 3) as avg_net_bps,
+#          ROUND(AVG(min_win_rate_required), 3) as avg_breakeven_wr
+#   FROM scalp_observations
+#   WHERE would_entry = 1 AND exit_price > 0
+#   GROUP BY exchange, direction;
+#
+# Does higher OFI z predict better net outcomes?
+#   SELECT exchange,
+#          ROUND(ofi_z * 2) / 2 as z_bucket,
+#          COUNT(*) as n,
+#          ROUND(AVG(pnl_bps - round_trip_cost_bps), 3) as avg_net_bps,
+#          ROUND(AVG(CASE WHEN pnl_bps > 0 THEN 1.0 ELSE 0.0 END), 3) as win_rate
+#   FROM scalp_observations
+#   WHERE would_entry = 1 AND exit_price > 0
+#   GROUP BY exchange, z_bucket ORDER BY exchange, z_bucket;
+#
+# Why is the gate blocking entries?
+#   SELECT exchange, skip_reason, COUNT(*) as n
+#   FROM scalp_observations WHERE would_entry = 0
+#   GROUP BY exchange, skip_reason ORDER BY n DESC;
+#
+# Exit-reason breakdown per exchange:
+#   SELECT exchange, exit_reason, COUNT(*) as n,
+#          ROUND(AVG(pnl_bps - round_trip_cost_bps), 3) as avg_net_bps
+#   FROM scalp_observations
+#   WHERE would_entry = 1 AND exit_price > 0
+#   GROUP BY exchange, exit_reason ORDER BY exchange, n DESC;
 
 
 # ── Analytics helpers (used by predictive engine) ──────────

@@ -512,6 +512,66 @@ ARB_AGENT_CAPITAL    = 600.0     # test: 100–1000  (sum of per-exchange budget
 # any single venue can get. 6 configured exchanges × this = ARB_AGENT_CAPITAL.
 ARB_CAPITAL_PER_EXCHANGE = 100.0   # test: 50–200
 
+# ══════════════════════════════════════════════════════════════════════════════
+# STRATEGY → EXCHANGE ROUTING
+# ══════════════════════════════════════════════════════════════════════════════
+# Encodes which exchanges are approved for each strategy type. Scalping
+# is fee-sensitive — only near-zero-fee venues are listed. Adding a new
+# exchange to a strategy = one line change here, no code changes (the
+# agent reads this map directly).
+STRATEGY_EXCHANGE_MAP = {
+    "scalp":     ["mexc", "bitget"],
+    "arb":       ["kraken", "bybit", "bitget", "bitstamp", "gateio", "bitfinex"],
+    "momentum":  ["binance", "bybit", "kraken"],
+    "reversion": ["binance", "bybit", "kraken"],
+    "sweep":     ["binance", "bybit"],
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SCALPING AGENT (agents/scalping_agent.py)
+# ══════════════════════════════════════════════════════════════════════════════
+# SCALP_CAPITAL = 0.0 → observation mode only. No orders placed.
+# Activate: set to e.g. 50.0 AFTER DB confirms edge (win_rate > 52%,
+# avg_net_bps > 0). Also requires MEXC API key in keys.env.
+
+SCALP_CAPITAL             = 0.0     # test: 0-100   ($0 = observation only)
+SCALP_PAIRS               = ["BTC/USDT", "ETH/USDT"]
+
+# Fee-aware profit targeting — TP/SL are computed dynamically, not fixed.
+SCALP_NET_PROFIT_TARGET_BPS  = 3.0   # test: 2.0-8.0   (net profit after fees)
+SCALP_RR_RATIO               = 1.6   # test: 1.3-2.5   (tp_bps / sl_bps)
+SCALP_MAX_BREAKEVEN_WIN_RATE = 0.65  # test: 0.55-0.75 (block if math needs >65% wr)
+
+# Fee management
+SCALP_FEE_DEFAULT_BPS     = 10.0   # fallback if CCXT lookup fails (conservative)
+SCALP_FEE_OVERRIDES       = {      # overrides CCXT data where known to be wrong
+    "mexc":   {"maker": 0.0,  "taker": 0.0},    # 0% confirmed standard rate
+    "bitget": {"maker": 1.0,  "taker": 1.0},    # 0.01% confirmed
+}
+
+# OFI signal parameters
+SCALP_OFI_Z_ENTRY         = 1.5    # test: 1.0-2.5   (z-score entry threshold)
+SCALP_OFI_Z_EXIT          = 0.3    # test: 0.1-0.7   (OFI exhaustion exit)
+SCALP_OFI_Z_CONTRADICT    = -0.8   # test: -0.4 to -1.5 (OFI flip exit)
+SCALP_OFI_PERSIST_TICKS   = 3      # test: 2-6       (consecutive ticks above threshold)
+SCALP_OFI_LEVELS          = 5      # test: 1-10      (book depth levels)
+SCALP_OFI_WINDOW_SEC      = 20     # test: 10-40     (bucket accumulation window seconds)
+SCALP_ZSCORE_WINDOW       = 80     # test: 40-150    (rolling z-score normalisation periods)
+
+# Execution parameters
+SCALP_MAX_SPREAD_BPS      = 3.0    # test: 1.5-6.0   (max bid-ask spread bps)
+SCALP_MAX_HOLD_SEC        = 180    # test: 60-300    (force exit after N seconds)
+SCALP_SCAN_INTERVAL_MS    = 100    # test: 50-500    (main loop interval ms)
+SCALP_MAX_CONCURRENT      = 1      # test: 1-3       (max open scalp positions)
+SCALP_POSITION_SIZE_USD   = 25.0   # test: 10-50     (per-trade size USD)
+
+# Circuit breakers
+SCALP_DAILY_LOSS_HALT     = 5.0    # test: 2-10      (daily loss halt USD)
+SCALP_CONSEC_LOSS_PAUSE   = 4      # test: 3-6       (consecutive loss pause count)
+
+# Depth weights for multi-level OFI (exponential decay ~λ=0.3).
+SCALP_DEPTH_WEIGHTS       = {0: 1.0, 1: 0.70, 2: 0.50, 3: 0.35, 4: 0.25}
+
 # Portfolio-level circuit breakers — sit on TOP of per-agent breakers.
 # Per-agent CBs (in settings.CIRCUIT_BREAKERS) fire first; these catch
 # the case where every agent drifts just under its own limit but together

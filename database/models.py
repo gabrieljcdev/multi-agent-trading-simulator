@@ -281,6 +281,52 @@ class CalendarEvent(Base):
     )
 
 
+class ScalpObservationModel(Base):
+    """One row per evaluated scalp entry — whether or not it actually
+    fired. timestamp + symbol + exchange together form the natural key
+    upserts use to fill exit fields when the position closes.
+
+    pnl_bps is GROSS (pre-fee) by convention; analysis queries compute
+    `pnl_bps - round_trip_cost_bps` for net P&L. Keeping the raw signal
+    clean lets us recompute with different fee assumptions later.
+
+    NOTE: existing databases require manual migration or recreate. Fresh
+    init_db creates this table automatically.
+    """
+    __tablename__ = "scalp_observations"
+
+    id                    = Column(Integer, primary_key=True, autoincrement=True)
+    symbol                = Column(String(20), nullable=False, index=True)
+    exchange              = Column(String(20), nullable=False, index=True)
+    timestamp             = Column(Float,      nullable=False, index=True)
+    ofi_z                 = Column(Float)
+    direction             = Column(String(10))
+    strength              = Column(String(10))
+    tfi_confirms          = Column(Boolean)
+    raw_tfi               = Column(Float)
+    spread_bps            = Column(Float)
+    regime                = Column(String(20))
+    round_trip_cost_bps   = Column(Float)
+    min_win_rate_required = Column(Float)
+    tp_bps                = Column(Float)
+    sl_bps                = Column(Float)
+    would_entry           = Column(Boolean, index=True)
+    skip_reason           = Column(String(160))
+    entry_price           = Column(Float)
+    exit_price            = Column(Float, default=0.0)
+    exit_time             = Column(Float, default=0.0)
+    exit_reason           = Column(String(30))
+    hold_sec              = Column(Float, default=0.0)
+    pnl_bps               = Column(Float, default=0.0)   # GROSS (pre-fee)
+    pnl_usd               = Column(Float, default=0.0)   # GROSS
+    observation_only      = Column(Boolean, default=True)
+    created_at            = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        Index("ix_scalp_obs_lookup", "symbol", "exchange", "timestamp"),
+    )
+
+
 class DataLog(Base):
     """Every DataPoint observed by data_sources/.
 
