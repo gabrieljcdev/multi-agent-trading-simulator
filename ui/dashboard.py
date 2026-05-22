@@ -220,6 +220,7 @@ class Dashboard:
             Layout(name="row9", size=12),
             Layout(self._safe(self._panel_insights,  "insights"),  name="row10", size=4),
             Layout(self._safe(self._panel_footer,    "footer"),    name="row11", size=4),
+            Layout(self._safe(self._panel_cmd_bar,   "cmd_bar"),   name="row12", size=4),
         )
 
         layout["row3"].split_row(
@@ -267,7 +268,10 @@ class Dashboard:
         """Drive Rich.Live until stop() flips _running."""
         import asyncio
         self._running = True
-        with Live(self.render(), refresh_per_second=2, screen=True,
+        # screen=False so the user's stdin echoes are visible below the
+        # dashboard (the alternate-screen buffer swallows them). The
+        # cmd_bar panel echoes each submitted line on the next refresh.
+        with Live(self.render(), refresh_per_second=2, screen=False,
                   console=self._console) as live:
             while self._running:
                 await self._refresh_coordinator_data()
@@ -1098,6 +1102,41 @@ class Dashboard:
                   "[blue][I][/blue] Info  "
                   "[magenta][1-5][/magenta] Select agent")
         return Panel(t, border_style="dim")
+
+    def _panel_cmd_bar(self) -> Panel:
+        """Command bar — bottom-row panel that echoes the most recent
+        input line and shows the last completed command's outcome.
+
+        The actual prompt prints to the terminal below the dashboard
+        (Live runs with screen=False so stdin echo is visible). The
+        ApprovalInputHandler thread writes to bot._cmd_current /
+        _cmd_last_result / _cmd_last_ts on every line — this panel
+        just reads those.
+        """
+        current = getattr(self._bot, "_cmd_current",     "") or ""
+        last    = getattr(self._bot, "_cmd_last_result", "") or ""
+        ts      = getattr(self._bot, "_cmd_last_ts",     None)
+
+        prompt = current if current else "Type command below ↓"
+        prompt_style = "bold green" if current else "dim italic"
+
+        last_line = Text()
+        if last:
+            last_line.append("Last: ", style="bold")
+            last_line.append(last, style="white")
+            if ts:
+                last_line.append(f"  [{ts}]", style="dim")
+            last_line.append("    ")
+        last_line.append(
+            "a=approve  s=skip  w=window  k=kill  p=pause  q=quit  h=help",
+            style="cyan",
+        )
+
+        body = Table.grid(expand=True)
+        body.add_column(justify="left")
+        body.add_row(Text("CMD  > ", style="bold yellow") + Text(prompt, style=prompt_style))
+        body.add_row(Text("      ", style="dim") + last_line)
+        return Panel(body, border_style="yellow", title="[bold yellow]COMMAND[/bold yellow]")
 
     # ════════════════════════════════════════════════════════════════════
     # Helpers

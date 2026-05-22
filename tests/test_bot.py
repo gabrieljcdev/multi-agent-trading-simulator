@@ -488,3 +488,25 @@ async def test_skip_next_pending_records_skip(monkeypatch):
     ok = await bot.skip_next_pending("user_skipped")
     assert ok is True
     assert skipped == [(42, "user_skipped")]
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Pause flag — `p` command target
+# ─────────────────────────────────────────────────────────────────────────
+
+def test_toggle_pause_flips_flag_and_returns_state():
+    bot = _make_bot()
+    assert bot._paused is False
+    assert bot.toggle_pause() is True   and bot._paused is True
+    assert bot.toggle_pause() is False  and bot._paused is False
+
+
+@pytest.mark.asyncio
+async def test_paused_cycle_skips_scan(monkeypatch):
+    """When _paused is True, _cycle returns before reaching the signal
+    engine's run_scan."""
+    bot = _make_bot()
+    bot._paused = True
+    bot._signal_engine.run_scan = AsyncMock()
+    await bot._cycle()
+    bot._signal_engine.run_scan.assert_not_called()

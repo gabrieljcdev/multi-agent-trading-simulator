@@ -404,3 +404,51 @@ def test_approval_panel_pending_shows_pair_score_and_commands():
     assert "score=80" in text
     assert "a=approve" in text
     assert "q=quit" in text
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Command bar — bottom-row input echo panel
+# ─────────────────────────────────────────────────────────────────────────
+
+def test_cmd_bar_idle_shows_hint():
+    """No command typed yet → 'Type command below ↓' prompt + the full
+    hint strip. Bot may not have the cmd-state attrs at all (older
+    constructions) and the panel still renders."""
+    bot = _mock_bot()
+    # Strip any cmd state to simulate a fresh bot before the handler runs.
+    for attr in ("_cmd_current", "_cmd_last_result", "_cmd_last_ts"):
+        if hasattr(bot, attr):
+            delattr(bot, attr)
+    dash = Dashboard(bot)
+    text = _render_to_string(dash._panel_cmd_bar())
+    assert "Type command below" in text
+    assert "a=approve" in text
+    assert "q=quit" in text
+
+
+def test_cmd_bar_echoes_current_input_and_last():
+    """After the input handler writes state, the panel echoes
+    'CMD > <current>' and 'Last: <result>  [HH:MM:SS]'."""
+    bot = _mock_bot()
+    bot._cmd_current     = "approve"
+    bot._cmd_last_result = "skip"
+    bot._cmd_last_ts     = "14:32:01"
+    dash = Dashboard(bot)
+    text = _render_to_string(dash._panel_cmd_bar())
+    assert "approve" in text
+    assert "Last: skip" in text
+    assert "14:32:01" in text
+
+
+def test_full_dashboard_renders_with_cmd_bar(monkeypatch):
+    """Smoke: full render() includes row12 without raising."""
+    monkeypatch.setattr("database.queries.get_today_trades", lambda: [])
+    monkeypatch.setattr("database.queries.get_open_trades", lambda: [])
+    monkeypatch.setattr("database.queries.get_recent_closed_trades",
+                        lambda limit=10: [])
+    monkeypatch.setattr("database.queries.get_signal_win_rate",
+                        lambda **kw: {"total": 0, "win_rate": 0.0})
+    monkeypatch.setattr("database.queries.get_today_skipped_signals", lambda: 0)
+    dash = Dashboard(_mock_bot())
+    layout = dash.render()
+    _render_to_string(layout)   # would raise on bad markup or missing panel

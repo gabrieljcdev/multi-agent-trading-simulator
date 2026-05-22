@@ -214,6 +214,16 @@ class CryptoBot:
         # the loop is running. Stays None outside interactive runs.
         self._approval_input = None
 
+        # Command-bar state — set by ApprovalInputHandler each tick so
+        # the dashboard panel can echo the most recent command. Pure
+        # state, no behaviour change when nothing's connected.
+        self._cmd_current:     str           = ""
+        self._cmd_last_result: str           = ""
+        self._cmd_last_ts:     Optional[str] = None
+        # `p` toggles this; _cycle short-circuits when set so the user
+        # can pause scanning without halting the bot outright.
+        self._paused: bool = False
+
         # Wire SignalEngine callback to our handler
         self._signal_engine.on_signal(self._on_signal)
 
@@ -458,8 +468,17 @@ class CryptoBot:
                 logger.error(f"Cycle error: {e}", exc_info=True)
             await asyncio.sleep(settings.BOT_LOOP_INTERVAL_SEC)
 
+    def toggle_pause(self) -> bool:
+        """Flip the pause flag — `p` command target. Returns the new
+        state so the input handler can echo it back to the dashboard."""
+        self._paused = not self._paused
+        return self._paused
+
     async def _cycle(self):
-        """One pass: dead-zone gate → CB gate → sentiment session-floor → scan."""
+        """One pass: pause → dead-zone → CB → sentiment session-floor → scan."""
+        if self._paused:
+            logger.debug("Paused — cycle skipped")
+            return
         self._cb_state.reset_if_new_day()
 
         if self._in_dead_zone():
