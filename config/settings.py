@@ -35,7 +35,7 @@ ACTIVE_STRATEGY = "default"     # default | arb_only | scalper | custom
 
 # How much autonomy Claude has
 # per_trade | window | autonomous
-APPROVAL_MODE = "autonomus"
+APPROVAL_MODE = "autonomous"
 
 # ══════════════════════════════════════════════════════════════════════════════
 # APPROVAL MODE SETTINGS

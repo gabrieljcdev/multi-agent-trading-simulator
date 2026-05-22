@@ -61,6 +61,11 @@ class MarketData:
         self._exchanges:   dict = {}
         self._candles:     dict = {}
         self._last_price:  dict = {}
+        # Most recent order book per (exchange, pair) — same shape as
+        # _last_price, populated from _stream_orderbooks. Consumed by
+        # get_spread_bps; the scalping agent reads it for its spread
+        # gate. Empty dict on fresh boot.
+        self._last_book:   dict = {}
         self._callbacks:   list = []
         self._active_pairs: list = []
         self._running = False
@@ -99,6 +104,33 @@ class MarketData:
 
     def get_all_prices(self, pair):
         return {ex: price for (ex, p), price in self._last_price.items() if p == pair}
+
+    def get_book(self, exchange, pair):
+        """Most recent order book snapshot for (exchange, pair), or None
+        before any tick has arrived. Shape matches ccxt:
+            {"bids": [(price, size), ...], "asks": [(price, size), ...]}"""
+        return self._last_book.get((exchange, pair))
+
+    def get_spread_bps(self, exchange, pair):
+        """Top-of-book spread in basis points, or None when no book is
+        cached for the pair on this exchange. Scalping agent's gate 9
+        reads this; conservatively returns None on any malformed book."""
+        ob = self._last_book.get((exchange, pair))
+        if not ob:
+            return None
+        bids = ob.get("bids") or []
+        asks = ob.get("asks") or []
+        if not bids or not asks:
+            return None
+        try:
+            best_bid = float(bids[0][0])
+            best_ask = float(asks[0][0])
+        except (IndexError, TypeError, ValueError):
+            return None
+        mid = (best_bid + best_ask) / 2.0
+        if mid <= 0:
+            return None
+        return (best_ask - best_bid) / mid * 10000.0
 
     def active_pairs(self):
         return self._active_pairs
@@ -260,6 +292,10 @@ class MarketData:
                 for pair in self._active_pairs[:20]:
                     try:
                         ob = await asyncio.wait_for(ex.watch_order_book(pair, settings.ORDER_BOOK_DEPTH), timeout=5.0)
+                        # Persist the latest book so consumers (scalping
+                        # agent's spread gate, dashboard) can read it
+                        # without subscribing to ofi_scorer.
+                        self._last_book[(exchange_name, pair)] = ob
                         ofi_scorer.update_book(pair=pair, exchange=exchange_name, bids=ob.get("bids",[]), asks=ob.get("asks",[]))
                     except asyncio.TimeoutError:
                         pass

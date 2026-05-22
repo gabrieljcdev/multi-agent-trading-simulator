@@ -428,6 +428,111 @@ async def test_news_guard_blocks_entry(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_market_data_wired_mid_price():
+    """set_market_data wires _get_mid_price end-to-end via MarketData."""
+    from unittest.mock import MagicMock
+    md = MagicMock()
+    md.get_price.return_value = 50_000.0
+    agent = _agent_with_capital(0.0)
+    agent.set_market_data(md)
+    price = await agent._get_mid_price("BTC/USDT", "mexc")
+    assert price == 50_000.0
+    md.get_price.assert_called_once_with("mexc", "BTC/USDT")
+
+
+@pytest.mark.asyncio
+async def test_market_data_falls_back_to_all_prices():
+    """get_price returns None → _get_mid_price walks get_all_prices."""
+    from unittest.mock import MagicMock
+    md = MagicMock()
+    md.get_price.return_value = None
+    md.get_all_prices.return_value = {"bitget": 50_123.4}
+    agent = _agent_with_capital(0.0)
+    agent.set_market_data(md)
+    assert await agent._get_mid_price("BTC/USDT", "mexc") == 50_123.4
+
+
+@pytest.mark.asyncio
+async def test_market_data_stub_when_unwired():
+    """No injection + no signal agent → 0.0 (stub) so the gate skips
+    silently instead of firing a fake entry."""
+    agent = _agent_with_capital(0.0)
+    # Make the lazy lookup miss: empty registry path.
+    agent._market_data = None
+    import sys
+    fake = type(sys)("agents")
+    fake.REGISTERED_AGENTS = []
+    monkey_orig = sys.modules.get("agents")
+    sys.modules["agents"] = fake
+    try:
+        price = await agent._get_mid_price("BTC/USDT", "mexc")
+    finally:
+        if monkey_orig is not None:
+            sys.modules["agents"] = monkey_orig
+        else:
+            sys.modules.pop("agents", None)
+    assert price == 0.0
+
+
+@pytest.mark.asyncio
+async def test_regime_detector_wired_returns_uppercase():
+    """regime_detector stores lowercase ('choppy' etc); the gate compares
+    against uppercase. _get_regime must uppercase before returning."""
+    from unittest.mock import MagicMock
+    rd = MagicMock()
+    snap = MagicMock()
+    snap.regime = "choppy"
+    rd.get_primary.return_value = snap
+    agent = _agent_with_capital(0.0)
+    agent.set_regime_detector(rd)
+    regime = await agent._get_regime("BTC/USDT")
+    assert regime == "CHOPPY"
+
+
+@pytest.mark.asyncio
+async def test_regime_choppy_blocks_entry(monkeypatch):
+    """Wired regime detector returns 'choppy' → gate 10 fires."""
+    monkeypatch.setattr(settings, "SCALP_SESSION_START_UTC", 0)
+    monkeypatch.setattr(settings, "SCALP_SESSION_END_UTC",   24)
+    from unittest.mock import MagicMock
+    rd = MagicMock()
+    snap = MagicMock(); snap.regime = "choppy"
+    rd.get_primary.return_value = snap
+
+    agent = _agent_with_capital(0.0)
+    agent.set_regime_detector(rd)
+    agent._get_mid_price  = AsyncMock(return_value=50_000.0)
+    agent._get_spread_bps = AsyncMock(return_value=1.0)
+
+    eng = agent._ofi_engine
+    key = "BTC/USDT:mexc"
+    eng._last_z[key] = settings.SCALP_OFI_Z_ENTRY + 0.5
+    eng._last_tfi[key] = 1.0
+    eng._last_bucket_close[key] = time.time()
+    eng._persist[key] = settings.SCALP_OFI_PERSIST_TICKS
+
+    await agent._evaluate_entry("BTC/USDT", "mexc")
+    assert agent._observations
+    obs = agent._observations[-1]
+    assert obs.would_entry is False
+    assert "CHOPPY" in obs.skip_reason
+
+
+def test_market_data_get_spread_bps_math():
+    """MarketData.get_spread_bps math: spread / mid × 10000."""
+    from core.market_data import MarketData
+    md = MarketData()
+    md._last_book[("mexc", "BTC/USDT")] = {
+        "bids": [(99_995.0, 1.0)],
+        "asks": [(100_005.0, 1.0)],
+    }
+    # spread = 10, mid = 100_000 → 10 / 100000 * 10000 = 1.0 bps
+    assert md.get_spread_bps("mexc", "BTC/USDT") == pytest.approx(1.0)
+    # Unknown pair → None (not 0.0).
+    assert md.get_spread_bps("mexc", "ETH/USDT") is None
+
+
+@pytest.mark.asyncio
 async def test_micro_price_tracker_backfills_30s():
     """One pass of the tracker loop fills price_30s on a 35s-old entry
     but leaves price_1m alone (60s threshold not yet crossed)."""

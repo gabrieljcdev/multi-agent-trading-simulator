@@ -505,7 +505,12 @@ class ScalpingAgent(BaseAgent):
     display_name = "Scalping Agent (OFI)"
     optional     = True
 
-    def __init__(self, sentiment_source: Optional[Any] = None):
+    def __init__(
+        self,
+        sentiment_source: Optional[Any] = None,
+        market_data:      Optional[Any] = None,
+        regime_detector:  Optional[Any] = None,
+    ):
         super().__init__()
         self.capital_allocation = float(settings.SCALP_CAPITAL)
         self._capital           = float(settings.SCALP_CAPITAL)
@@ -517,9 +522,13 @@ class ScalpingAgent(BaseAgent):
         )
         self._fee_manager = FeeManager(settings.SCALP_FEE_OVERRIDES)
 
-        # Optional sentiment source — gate 12 reads news_guard_active from
-        # its composite if set. Never blocks the agent if missing or broken.
+        # Optional injected dependencies. Any of these can be None — the
+        # agent then runs in pure-stub mode (or lazy-resolves at first
+        # call). Tests construct the agent without args; the coordinator
+        # populates them at startup via the set_*() methods below.
         self._sentiment_source = sentiment_source
+        self._market_data      = market_data
+        self._regime_detector  = regime_detector
 
         self._positions:     dict[str, ScalpPosition] = {}
         self._observations:  list[ScalpObservation]   = []
@@ -549,6 +558,59 @@ class ScalpingAgent(BaseAgent):
         # fees. Whether it actually trades depends on SCALP_CAPITAL +
         # the wiring TODOs, both checked at evaluation time.
         return True
+
+    # ── Late-binding setters (Optional dependency injection) ────────────
+
+    def set_market_data(self, market_data) -> None:
+        """Late-bind a MarketData reference — used by the coordinator
+        after SignalAgent's bot has constructed it. None-safe."""
+        self._market_data = market_data
+
+    def set_regime_detector(self, regime_detector) -> None:
+        """Late-bind a regime detector. The module singleton is also
+        looked up lazily on first call, so this is mostly for tests."""
+        self._regime_detector = regime_detector
+
+    def set_sentiment_source(self, sentiment_source) -> None:
+        """Match the other setters so all three injectable deps share
+        the same shape. Idempotent."""
+        self._sentiment_source = sentiment_source
+
+    # ── Lazy resolvers ──────────────────────────────────────────────────
+
+    def _resolve_market_data(self):
+        """Return cached / injected market_data, or fish it out of the
+        signal agent's bot if REGISTERED_AGENTS is reachable. None when
+        nothing is wired — caller falls back to stub behaviour."""
+        if self._market_data is not None:
+            return self._market_data
+        try:
+            from agents import REGISTERED_AGENTS
+            for ag in REGISTERED_AGENTS:
+                if getattr(ag, "agent_id", "") != "signal":
+                    continue
+                bot = getattr(ag, "bot", None) or getattr(ag, "_bot", None)
+                if bot is None:
+                    continue
+                md = getattr(bot, "_market_data", None)
+                if md is not None:
+                    self._market_data = md     # cache to skip the walk next time
+                    return md
+        except Exception as e:
+            log.debug("[ScalpingAgent] market_data lookup failed: %s", e)
+        return None
+
+    def _resolve_regime_detector(self):
+        """Return cached / injected detector, else the module singleton."""
+        if self._regime_detector is not None:
+            return self._regime_detector
+        try:
+            from core.regime_detector import regime_detector as _rd
+            self._regime_detector = _rd
+            return _rd
+        except Exception as e:
+            log.debug("[ScalpingAgent] regime_detector import failed: %s", e)
+            return None
 
     async def start(self) -> None:
         self._running = True
@@ -628,27 +690,95 @@ class ScalpingAgent(BaseAgent):
     # ── Market-data stubs — wire in Phase 2 ─────────────────────────────
 
     async def _get_mid_price(self, symbol: str, exchange: str) -> float:
-        # TODO Phase 2: market_data.get_mid_price(symbol, exchange)
+        """Last-known mid price for (symbol, exchange).
+
+        Wired: MarketData.get_price (per-exchange) → get_all_prices
+        (any exchange) fallback. Stub when MarketData is missing or
+        before any tick has arrived → 0.0 (entry gate skips silently).
+        """
+        md = self._resolve_market_data()
+        if md is None:
+            return 0.0
+        try:
+            p = md.get_price(exchange, symbol)
+            if p is not None and float(p) > 0:
+                return float(p)
+            prices = md.get_all_prices(symbol) or {}
+            for v in prices.values():
+                if v is not None and float(v) > 0:
+                    return float(v)
+        except Exception as e:
+            log.debug("[ScalpingAgent] _get_mid_price failed: %s", e)
         return 0.0
 
     async def _get_spread_bps(self, symbol: str, exchange: str) -> float:
-        # TODO Phase 2: market_data.get_spread_bps(symbol, exchange)
-        return 0.0
+        """Top-of-book spread in bps from the cached order book.
+
+        Wired: MarketData.get_spread_bps. Stub when MarketData is
+        missing OR when no book has been received yet → 0.0 (gate 9
+        treats this as "spread fine"; the price gate downstream will
+        skip if the mid is also missing, so we don't fire a bogus
+        entry on cold start).
+        """
+        md = self._resolve_market_data()
+        if md is None or not hasattr(md, "get_spread_bps"):
+            return 0.0
+        try:
+            spread = md.get_spread_bps(exchange, symbol)
+        except Exception as e:
+            log.debug("[ScalpingAgent] _get_spread_bps failed: %s", e)
+            return 0.0
+        return float(spread) if spread is not None else 0.0
 
     async def _get_regime(self, symbol: str) -> str:
-        # TODO Phase 2: regime_detector.get_primary(symbol).regime
-        return "RANGING"
+        """Primary-timeframe regime label, uppercased to match the
+        gate's CHOPPY / TRENDING / RANGING string compare.
+
+        Wired: regime_detector.get_primary(symbol).regime. Stub returns
+        "RANGING" (a permissive default — the gate only blocks on
+        "CHOPPY", so RANGING falls through cleanly).
+        """
+        rd = self._resolve_regime_detector()
+        if rd is None:
+            return "RANGING"
+        try:
+            snap = rd.get_primary(symbol)
+        except Exception as e:
+            log.debug("[ScalpingAgent] _get_regime failed: %s", e)
+            return "RANGING"
+        if snap is None or not getattr(snap, "regime", None):
+            return "RANGING"
+        # regime_detector stores lowercase ("choppy" etc); our gate
+        # compares against uppercase strings.
+        return str(snap.regime).upper()
 
     async def _get_ccxt_exchange(self, exchange_id: str):
-        # TODO Phase 2: execution router's exchange pool.
-        return None
+        """Return a live ccxt client for `exchange_id` from MarketData's
+        connection pool, or None.
+
+        Useful for FeeManager.load_exchange when the venue is already
+        in settings.ENABLED_EXCHANGES (e.g. bitget). MEXC isn't in the
+        pool — FeeManager falls through to SCALP_FEE_OVERRIDES, which
+        is exactly the documented contract.
+        """
+        md = self._resolve_market_data()
+        if md is None:
+            return None
+        try:
+            return getattr(md, "_exchanges", {}).get(exchange_id)
+        except Exception as e:
+            log.debug("[ScalpingAgent] _get_ccxt_exchange failed: %s", e)
+            return None
 
     async def _get_btc_1m_change(self) -> float:
         """BTC 1-minute % change for the correlation guard (gate 13).
 
-        TODO Phase 2: wire to market_data 1m BTC ticker. Returning 0.0
-        in stub mode means the gate always passes — exactly what we
-        want until live BTC data is plumbed through.
+        Still a stub — MarketData doesn't keep a 1-minute price history
+        (TIMEFRAMES = 5m / 15m / 1h). To wire: either add a 1m candle
+        feed in market_data._fetch_candles, or accumulate (timestamp,
+        price) samples on every get_price call and compute the delta
+        over the last ~60s window. Returning 0.0 keeps the gate
+        permissive until that ships.
         """
         return 0.0
 
