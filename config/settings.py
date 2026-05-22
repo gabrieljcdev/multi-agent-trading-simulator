@@ -35,7 +35,7 @@ ACTIVE_STRATEGY = "default"     # default | arb_only | scalper | custom
 
 # How much autonomy Claude has
 # per_trade | window | autonomous
-APPROVAL_MODE = "per_trade"
+APPROVAL_MODE = "autonomus"
 
 # ══════════════════════════════════════════════════════════════════════════════
 # APPROVAL MODE SETTINGS
@@ -429,6 +429,10 @@ CIRCUIT_BREAKERS = {
 CIRCUIT_BREAKER_PAUSE_MINUTES        = 30   # 0 = manual resume only
 CIRCUIT_BREAKER_HALT_REQUIRES_MANUAL = True
 
+# Persist an agent_events row on every shutdown (sigint / `q` / kill).
+# Off by default in tests via monkeypatch; on for normal runs.
+SHUTDOWN_LOG_EVENT = True
+
 # ══════════════════════════════════════════════════════════════════════════════
 # EXECUTION
 # ══════════════════════════════════════════════════════════════════════════════
@@ -493,10 +497,20 @@ PREDICTIVE_PENALTY_WEAK         = 15
 # MULTI-AGENT COORDINATOR
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Per-agent capital allocation (USD). Sum should not exceed total
-# EXCHANGE_BALANCES — the coordinator warns at startup if it does.
-SIGNAL_AGENT_CAPITAL = 280.0     # test: 100–500
-ARB_AGENT_CAPITAL    = 120.0     # test: 50–300
+# Total starting equity for the portfolio. Drives CircuitBreakerState
+# baseline + falls back as initial value when the DB has no prior
+# portfolio_snapshot to recover from (see core/bot.py startup).
+STARTING_CAPITAL     = 1000.0    # test: 200–10000
+
+# Per-agent capital allocation (USD). Sum should match STARTING_CAPITAL;
+# the coordinator warns at startup if their sum exceeds total
+# EXCHANGE_BALANCES.
+SIGNAL_AGENT_CAPITAL = 400.0     # test: 100–800
+ARB_AGENT_CAPITAL    = 600.0     # test: 100–1000  (sum of per-exchange budgets)
+
+# Arb engine reserves this much per exchange leg — caps how aggressive
+# any single venue can get. 6 configured exchanges × this = ARB_AGENT_CAPITAL.
+ARB_CAPITAL_PER_EXCHANGE = 100.0   # test: 50–200
 
 # Portfolio-level circuit breakers — sit on TOP of per-agent breakers.
 # Per-agent CBs (in settings.CIRCUIT_BREAKERS) fire first; these catch

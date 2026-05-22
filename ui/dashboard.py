@@ -539,18 +539,22 @@ class Dashboard:
         }.get(regime.scenario.name, "white")
 
         # VIX colour using the macro thresholds (matches the score curve).
+        # Resolved as (text, style) — Text.append escapes markup, so we
+        # MUST pass style separately rather than embedding [bracket] tags
+        # inside the string. The old `[dim]—[/dim]` shape rendered as
+        # literal text in the panel.
         if regime.vix is None:
-            vix_str = "[dim]—[/dim]"
+            vix_text, vix_style = "—", "dim"
         else:
             if regime.vix < settings.MACRO_VIX_CALM:
-                vix_col = "bright_green"
+                vix_style = "bright_green"
             elif regime.vix < settings.MACRO_VIX_ELEVATED:
-                vix_col = "green"
+                vix_style = "green"
             elif regime.vix < settings.MACRO_VIX_CRISIS:
-                vix_col = "orange1"
+                vix_style = "orange1"
             else:
-                vix_col = "red blink"
-            vix_str = f"[{vix_col}]{regime.vix:.1f}[/{vix_col}]"
+                vix_style = "red blink"
+            vix_text = f"{regime.vix:.1f}"
 
         body = Text()
         body.append("Scenario: ", style="bold")
@@ -569,7 +573,8 @@ class Dashboard:
         body.append(f"{regime.dxy:.1f}\n"
                     if regime.dxy is not None else "—\n")
         body.append("VIX: ", style="bold")
-        body.append(f"{vix_str}\n")
+        body.append(vix_text, style=vix_style)
+        body.append("\n")
         body.append("10y-2y: ", style="bold")
         body.append(f"{regime.yield_curve:+.2f}\n"
                     if regime.yield_curve is not None else "—\n")
@@ -1016,12 +1021,20 @@ class Dashboard:
     def _panel_approval(self) -> Panel:
         pending = self._peek_pending()
         if not pending:
-            return Panel(
-                Align.center("[dim italic]Waiting for signals...[/dim italic]"),
-                title="[bold]APPROVAL[/bold]", border_style="dim",
-            )
+            # Idle — surface the keystroke vocabulary so the user knows
+            # what to type once a signal arrives. ApprovalInputHandler
+            # (ui/prompts.py) is the only consumer of these keys.
+            body = Text()
+            body.append("Waiting for signals…\n\n",
+                        style="dim italic")
+            body.append("Commands: ", style="bold")
+            body.append("a=approve  s=skip  k=kill  q=quit",
+                        style="cyan")
+            return Panel(body, title="[bold]APPROVAL[/bold]",
+                         border_style="dim")
 
         body = Text()
+        body.append("PENDING: ", style="bold yellow")
         body.append(f"{pending.get('pair','?')}  ", style="bold")
         direction = pending.get("direction", "?")
         body.append(f"{direction.upper()}  ",
@@ -1036,7 +1049,10 @@ class Dashboard:
         reasoning = (pending.get("reasoning") or "")[:200]
         if reasoning:
             body.append(f"{reasoning}\n\n", style="italic")
-        body.append("[G]o  [S]kip  [M]odify  [I]nfo  [K]ill",
+        # Single-key vocabulary matches ui.prompts.ApprovalInputHandler.
+        # Keep the legacy [G]/[S]/[M]/[I]/[K] hints out — they were
+        # decorative and confused the user about what actually worked.
+        body.append("a=approve  s=skip  k=kill  q=quit",
                     style="bold yellow")
         return Panel(body, title="[bold yellow]APPROVAL PENDING[/bold yellow]",
                      border_style="yellow")

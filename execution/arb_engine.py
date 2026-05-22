@@ -321,9 +321,14 @@ class ArbEngine:
                     if ask_liq < settings.ARB_MIN_LIQUIDITY_USD or bid_liq < settings.ARB_MIN_LIQUIDITY_USD:
                         continue
 
+                    # Three independent caps: the legacy per-trade max,
+                    # 10% of order-book depth, and the per-exchange
+                    # capital budget (FIX 6 — keeps any single venue's
+                    # exposure bounded by the agent allocation).
                     max_size = min(
                         settings.ARB_MAX_POSITION_USD,
-                        min(ask_liq, bid_liq) * 0.10,   # never > 10% of depth
+                        min(ask_liq, bid_liq) * 0.10,
+                        settings.ARB_CAPITAL_PER_EXCHANGE,
                     )
 
                     candidate = ArbOpportunity(

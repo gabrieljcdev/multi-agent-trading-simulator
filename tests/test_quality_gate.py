@@ -84,6 +84,7 @@ def test_sentiment_composite_modifier_applied(monkeypatch):
     with patch("signals.quality_gate.regime_detector.get_primary", return_value=None), \
          patch("signals.quality_gate.guard_runner.apply_all", return_value=(0.0, [])), \
          patch("signals.ofi.ofi_scorer.get_best", return_value=None), \
+         patch("signals.quality_gate._session_modifier", return_value=0.0), \
          patch("macro.macro_monitor.get_signal_modifier", return_value=0), \
          patch("macro.macro_monitor.get_current_regime", return_value=None):
         s = _make_signal(raw_score=80.0)
@@ -106,6 +107,7 @@ def test_sentiment_default_zero_when_aggregator_blows_up(monkeypatch):
     with patch("signals.quality_gate.regime_detector.get_primary", return_value=None), \
          patch("signals.quality_gate.guard_runner.apply_all", return_value=(0.0, [])), \
          patch("signals.ofi.ofi_scorer.get_best", return_value=None), \
+         patch("signals.quality_gate._session_modifier", return_value=0.0), \
          patch("macro.macro_monitor.get_signal_modifier", return_value=0), \
          patch("macro.macro_monitor.get_current_regime", return_value=None):
         s = _make_signal()

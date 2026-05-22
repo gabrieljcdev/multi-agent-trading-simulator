@@ -780,7 +780,8 @@ def test_quality_gate_consumes_macro_modifier(monkeypatch):
     g = QualityGate()
     with patch("signals.quality_gate.regime_detector.get_primary", return_value=None), \
          patch("signals.quality_gate.guard_runner.apply_all", return_value=(0.0, [])), \
-         patch("signals.ofi.ofi_scorer.get_best", return_value=None):
+         patch("signals.ofi.ofi_scorer.get_best", return_value=None), \
+         patch("signals.quality_gate._session_modifier", return_value=0.0):
         s = _make_signal()
         s.tf_5m = s.tf_15m = s.tf_1h = True
         _, _, score = g.evaluate(s, [], [])

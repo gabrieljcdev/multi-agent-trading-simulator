@@ -331,3 +331,76 @@ def test_refresh_coordinator_data_survives_async_errors():
     asyncio.run(dash._refresh_coordinator_data())
     assert dash._portfolio_cache   is None
     assert dash._agent_stats_cache == []
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# FIX 4 — macro panel no raw markup leak
+# FIX 2 — approval panel surfaces the command vocabulary
+# ─────────────────────────────────────────────────────────────────────────
+
+def _render_to_string(panel) -> str:
+    """Render a Panel to a plain string so we can assert on content."""
+    import io
+    from rich.console import Console
+    buf = io.StringIO()
+    Console(file=buf, width=120, force_terminal=False, color_system=None).print(panel)
+    return buf.getvalue()
+
+
+def test_macro_panel_renders_no_raw_markup_tags(monkeypatch):
+    """VIX cell used to render `[dim]—[/dim]` and `[bright_green]18.1[/bright_green]`
+    as literal text — FIX 4 switches to explicit `style=` args."""
+    from macro.regime import (
+        MacroRegime, MacroScenario, DollarStrength,
+        RiskAppetite, RateEnvironment, VolRegime,
+    )
+    regime = MacroRegime(
+        scenario=MacroScenario.REFLATION,
+        dollar=DollarStrength.NEUTRAL, risk=RiskAppetite.RISK_ON,
+        rates=RateEnvironment.NEUTRAL, vol=VolRegime.CALM,
+        macro_score=15.0,
+        dxy=99.3, vix=18.1, yield_10y=4.6, yield_2y=4.1,
+        yield_curve=0.5, fed_funds_rate=3.6, cpi_yoy=3.7,
+        confidence=1.0,
+    )
+    monkeypatch.setattr("macro.macro_monitor.get_current_regime",
+                        lambda: regime)
+    dash = Dashboard(_mock_bot())
+    text = _render_to_string(dash._panel_macro())
+
+    # No raw markup tags should appear as literal characters.
+    assert "[dim]" not in text
+    assert "[bright_green]" not in text
+    assert "[/" not in text
+    # And the VIX value itself should be rendered.
+    assert "18.1" in text
+
+
+def test_approval_panel_idle_shows_command_vocab():
+    """Idle panel: spec wants the keystroke help visible so users know
+    what to type. FIX 2 keystrokes are a/s/k/q."""
+    dash = Dashboard(_mock_bot())
+    text = _render_to_string(dash._panel_approval())
+    assert "a=approve" in text
+    assert "s=skip" in text
+    assert "k=kill" in text
+    assert "q=quit" in text
+
+
+def test_approval_panel_pending_shows_pair_score_and_commands():
+    """Pending panel: shows the pair + score + same keystroke help."""
+    bot = _mock_bot()
+    sig = SimpleNamespace(
+        pair="BTC/USDT", direction="long", score=80,
+        signal_type="momentum",
+        suggested_entry=100.0, suggested_sl=99.0,
+        suggested_tp=102.0, risk_reward=2.0,
+        claude_reasoning="High-conviction breakout",
+    )
+    bot._pending_signals.put_nowait(sig)
+    dash = Dashboard(bot)
+    text = _render_to_string(dash._panel_approval())
+    assert "BTC/USDT" in text
+    assert "score=80" in text
+    assert "a=approve" in text
+    assert "q=quit" in text

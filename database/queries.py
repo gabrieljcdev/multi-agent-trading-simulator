@@ -423,11 +423,20 @@ def get_arb_stats() -> dict:
 def log_portfolio_snapshot(stats: dict) -> None:
     """Persist one aggregated portfolio state row.
 
-    `stats` is the dict returned by Coordinator.get_portfolio_stats — we
-    store the well-known fields as columns and the whole dict as JSON.
+    `stats` is the dict returned by Coordinator.get_portfolio_stats —
+    well-known fields as columns, whole dict as JSON.
+
+    Timestamp is set explicitly here even though the column has
+    `default=datetime.utcnow`. Explicit set documents intent and
+    protects against any future change that swaps the default to a
+    column-level expression (which SQLite renders as the unix epoch
+    0 / NULL depending on the driver). Stored as a Python datetime —
+    callers using `SELECT timestamp FROM portfolio_snapshots` will see
+    ISO strings, not unix floats.
     """
     with get_session() as s:
         s.add(PortfolioSnapshot(
+            timestamp=datetime.utcnow(),
             total_equity=stats.get("total_equity",       0.0),
             total_daily_pnl=stats.get("total_daily_pnl", 0.0),
             total_exposure_pct=stats.get("total_exposure_pct", 0.0),
@@ -445,6 +454,25 @@ def log_agent_event(agent_id: str, event_type: str, detail: str = "") -> None:
             event_type=event_type,
             detail=detail or "",
         ))
+
+
+def get_last_equity() -> Optional[float]:
+    """Return total_equity from the most recent portfolio_snapshot row,
+    or None when the table is empty.
+
+    Drives the bot's equity recovery on startup — see core/bot.py.
+    Returns None (not 0.0) so the caller can distinguish "fresh DB" from
+    "we genuinely went bust".
+    """
+    with get_session() as s:
+        row = (
+            s.query(PortfolioSnapshot.total_equity)
+            .order_by(desc(PortfolioSnapshot.timestamp))
+            .first()
+        )
+    if row is None or row[0] is None:
+        return None
+    return float(row[0])
 
 
 def get_portfolio_history(hours: int = 24) -> list:

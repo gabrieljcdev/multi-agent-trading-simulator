@@ -357,3 +357,134 @@ def test_btc_price_fallback_returns_none_when_no_source(monkeypatch):
 
     monkeypatch.setattr("builtins.__import__", _boom)
     assert bot._btc_price_with_fallback() is None
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# FIX 1 + FIX 5 + FIX 6 — equity recovery, clean shutdown, capital alloc
+# ─────────────────────────────────────────────────────────────────────────
+
+def test_startup_reads_last_equity_from_db(monkeypatch):
+    """CircuitBreakerState gets seeded from get_last_equity when the DB
+    has a prior snapshot — restart picks up where we left off."""
+    monkeypatch.setattr("core.bot.db_queries.get_last_equity",
+                        lambda: 1234.56)
+    bot = _make_bot()
+    assert bot._cb_state.current_equity == pytest.approx(1234.56)
+
+
+def test_startup_uses_starting_capital_when_db_empty(monkeypatch):
+    """Empty DB → fall through to settings.STARTING_CAPITAL (not the
+    legacy sum(EXCHANGE_BALANCES))."""
+    monkeypatch.setattr("core.bot.db_queries.get_last_equity",
+                        lambda: None)
+    monkeypatch.setattr(settings, "STARTING_CAPITAL", 1000.0)
+    bot = _make_bot()
+    assert bot._cb_state.current_equity == pytest.approx(1000.0)
+
+
+def test_capital_allocation_matches_settings(monkeypatch):
+    """SignalAgent + ArbAgent read their capital_allocation from the
+    settings module (no hardcoded values in the agent files)."""
+    monkeypatch.setattr(settings, "SIGNAL_AGENT_CAPITAL", 400.0)
+    monkeypatch.setattr(settings, "ARB_AGENT_CAPITAL",    600.0)
+    # Re-import the agents module so the wrappers pick up patched values.
+    from agents import SignalAgentWrapper, ArbAgentWrapper
+    sa = SignalAgentWrapper()
+    aa = ArbAgentWrapper()
+    assert sa.capital_allocation == 400.0
+    assert aa.capital_allocation == 600.0
+
+
+@pytest.mark.asyncio
+async def test_clean_shutdown_writes_final_snapshot(monkeypatch):
+    """bot.shutdown writes a portfolio_snapshot with SHUTDOWN status."""
+    snapshots = []
+    monkeypatch.setattr("core.bot.db_queries.log_portfolio_snapshot",
+                        lambda stats: snapshots.append(stats))
+    monkeypatch.setattr("core.bot.db_queries.log_agent_event",
+                        lambda *a, **k: None)
+
+    bot = _make_bot()
+    bot._running = True
+    await bot.shutdown("user_quit")
+
+    assert len(snapshots) == 1
+    assert snapshots[0]["portfolio_status"] == "SHUTDOWN"
+    assert snapshots[0]["reason"] == "user_quit"
+    assert bot._running is False
+
+
+@pytest.mark.asyncio
+async def test_clean_shutdown_logs_agent_event(monkeypatch):
+    """bot.shutdown writes a SHUTDOWN row to agent_events."""
+    events = []
+    monkeypatch.setattr("core.bot.db_queries.log_portfolio_snapshot",
+                        lambda stats: None)
+    monkeypatch.setattr("core.bot.db_queries.log_agent_event",
+                        lambda agent_id, ev, detail="": events.append((agent_id, ev, detail)))
+    monkeypatch.setattr(settings, "SHUTDOWN_LOG_EVENT", True)
+
+    bot = _make_bot()
+    bot._running = True
+    await bot.shutdown("sigint")
+
+    assert ("portfolio", "SHUTDOWN", "sigint") in events
+
+
+@pytest.mark.asyncio
+async def test_shutdown_is_idempotent(monkeypatch):
+    """Calling shutdown twice writes only one snapshot/event."""
+    snapshots = []
+    monkeypatch.setattr("core.bot.db_queries.log_portfolio_snapshot",
+                        lambda s: snapshots.append(s))
+    monkeypatch.setattr("core.bot.db_queries.log_agent_event",
+                        lambda *a, **k: None)
+
+    bot = _make_bot()
+    bot._running = True
+    await bot.shutdown("first")
+    await bot.shutdown("second")          # should be a no-op
+    assert len(snapshots) == 1
+
+
+@pytest.mark.asyncio
+async def test_approve_next_pending_drains_queue_and_executes(monkeypatch):
+    """`a` command calls approve_next_pending → pop sig → _execute_signal."""
+    bot = _make_bot()
+    sig = _make_signal()
+    await bot._pending_signals.put(sig)
+
+    executed = []
+
+    async def _fake_exec(s):
+        executed.append(s)
+
+    monkeypatch.setattr(bot, "_execute_signal", _fake_exec)
+    ok = await bot.approve_next_pending()
+    assert ok is True
+    assert executed == [sig]
+    assert bot._pending_signals.empty()
+
+
+@pytest.mark.asyncio
+async def test_approve_next_pending_when_empty_is_noop():
+    bot = _make_bot()
+    ok = await bot.approve_next_pending()
+    assert ok is False
+
+
+@pytest.mark.asyncio
+async def test_skip_next_pending_records_skip(monkeypatch):
+    bot = _make_bot()
+    sig = _make_signal()
+    sig.db_id = 42
+    await bot._pending_signals.put(sig)
+
+    skipped = []
+    monkeypatch.setattr(
+        "core.bot.db_queries.update_signal_skip",
+        lambda sid, reason, price_at_signal=None: skipped.append((sid, reason)),
+    )
+    ok = await bot.skip_next_pending("user_skipped")
+    assert ok is True
+    assert skipped == [(42, "user_skipped")]

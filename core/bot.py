@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sys
 import time
 from datetime import datetime, timedelta
 from typing import Optional
@@ -56,8 +57,16 @@ class CircuitBreakerState:
     """Tracks daily P&L, consecutive losses, drawdown, peak equity."""
 
     def __init__(self, starting_equity: Optional[float] = None):
-        starting = starting_equity if starting_equity is not None \
-            else sum(settings.EXCHANGE_BALANCES.values())
+        # Resolve order: explicit arg → settings.STARTING_CAPITAL →
+        # legacy sum(EXCHANGE_BALANCES). The middle term lets us set a
+        # single source-of-truth opening figure without juggling per-
+        # exchange balance configs.
+        if starting_equity is not None:
+            starting = starting_equity
+        elif hasattr(settings, "STARTING_CAPITAL"):
+            starting = float(settings.STARTING_CAPITAL)
+        else:
+            starting = sum(settings.EXCHANGE_BALANCES.values())
         self.daily_pnl_pct: float = 0.0
         self.consecutive_losses: int = 0
         self.current_equity: float = starting
@@ -169,8 +178,16 @@ class CryptoBot:
         from sentiment import sentiment as sentiment_singleton
         self._sentiment = sentiment_singleton
 
-        # Circuit breaker — authoritative for cycle decisions
-        self._cb_state = CircuitBreakerState()
+        # Circuit breaker — authoritative for cycle decisions. Seed
+        # equity from the most recent portfolio_snapshot so a restart
+        # picks up where the previous session left off. None → fall
+        # through to settings.STARTING_CAPITAL inside CircuitBreakerState.
+        try:
+            recovered_equity = db_queries.get_last_equity()
+        except Exception as e:
+            logger.debug(f"get_last_equity failed at startup: {e}")
+            recovered_equity = None
+        self._cb_state = CircuitBreakerState(starting_equity=recovered_equity)
 
         # Window-mode state
         self._window_until: Optional[datetime] = None
@@ -192,6 +209,10 @@ class CryptoBot:
         # so set_btc_change_30m receives a clean 30m delta per call.
         self._btc_price_30m_ago:      Optional[float] = None
         self._btc_price_30m_ago_time: Optional[float] = None
+
+        # Keyboard approval handler — late-bound in start() once we know
+        # the loop is running. Stays None outside interactive runs.
+        self._approval_input = None
 
         # Wire SignalEngine callback to our handler
         self._signal_engine.on_signal(self._on_signal)
@@ -220,6 +241,33 @@ class CryptoBot:
         logger.info(f"  Profile:  {self._profile.name}")
         logger.info(f"  Strategy: {self._strategy.name}")
         logger.info(f"  Approval: {settings.APPROVAL_MODE}")
+
+        # Convert Ctrl+C into the same clean shutdown path the `q`
+        # command uses, so Ctrl+C writes a final snapshot rather than
+        # tearing the loop down hard. Windows and non-main threads
+        # don't support add_signal_handler — fall through to
+        # KeyboardInterrupt in main.py in that case.
+        import signal as _signal
+        try:
+            asyncio.get_running_loop().add_signal_handler(
+                _signal.SIGINT,
+                lambda: asyncio.get_running_loop().create_task(
+                    self.shutdown("sigint"),
+                ),
+            )
+        except (NotImplementedError, ValueError, RuntimeError) as e:
+            logger.debug(f"SIGINT handler not installed: {e}")
+
+        # Keyboard approval handler — reads stdin in a daemon thread,
+        # dispatches a/s/k/q onto this loop via run_coroutine_threadsafe.
+        # Disabled when stdin isn't a tty (tests, subprocess runs).
+        if sys.stdin and sys.stdin.isatty():
+            try:
+                from ui.prompts import ApprovalInputHandler
+                self._approval_input = ApprovalInputHandler(self)
+                self._approval_input.start()
+            except Exception as e:
+                logger.warning(f"ApprovalInputHandler not started: {e}")
 
         # Data sources are imported lazily so a missing optional dep
         # never blocks bot startup.
@@ -292,6 +340,70 @@ class CryptoBot:
         self._window_until = datetime.utcnow() + timedelta(minutes=duration)
         logger.info(f"Trading window approved — {duration}m until {self._window_until.isoformat()}")
         return self._window_until
+
+    async def approve_next_pending(self) -> bool:
+        """Pop the next pending signal off the queue and execute it.
+
+        Called from ui.prompts.ApprovalInputHandler on `a`. Returns True
+        if a signal was approved, False if the queue was empty. Prints a
+        terminal message either way so the keyboard user gets feedback.
+        """
+        if self._pending_signals.empty():
+            print("No signal pending")
+            return False
+        signal = self._pending_signals.get_nowait()
+        score = float(getattr(signal, "score", 0) or 0)
+        print(f"Approved {signal.pair} {signal.signal_type.upper()} "
+              f"{signal.direction.upper()} score={score:.0f}")
+        await self._execute_signal(signal)
+        return True
+
+    async def skip_next_pending(self, reason: str = "user_skipped") -> bool:
+        """Pop the next pending signal and mark it skipped."""
+        if self._pending_signals.empty():
+            print("No signal pending")
+            return False
+        signal = self._pending_signals.get_nowait()
+        price = self._price_for(signal)
+        self._record_skip(signal, reason, price)
+        print(f"Skipped {signal.pair} — {reason}")
+        return True
+
+    async def shutdown(self, reason: str = "user_quit") -> None:
+        """Clean shutdown: write final snapshot, log event, stop loops.
+
+        Idempotent — safe to call from both the q-command path and the
+        SIGINT path in main.py. The cooperating loops check _running
+        on their next iteration and exit; market_data is closed in stop().
+        """
+        if not self._running:
+            return
+        self._running = False
+        logger.info(f"CryptoBot shutdown requested ({reason})")
+        # Final portfolio snapshot — best-effort, never blocks exit.
+        try:
+            stats = {
+                "total_equity":       float(self._cb_state.current_equity),
+                "total_daily_pnl":    float(self._cb_state.daily_pnl_pct),
+                "total_exposure_pct": 0.0,
+                "agents_running":     0,
+                "portfolio_status":   "SHUTDOWN",
+                "reason":             reason,
+            }
+            db_queries.log_portfolio_snapshot(stats)
+        except Exception as e:
+            logger.warning(f"final portfolio snapshot failed: {e}")
+        # Lifecycle event so postmortem analysis can find the shutdown.
+        if getattr(settings, "SHUTDOWN_LOG_EVENT", True):
+            try:
+                db_queries.log_agent_event("portfolio", "SHUTDOWN", reason)
+            except Exception as e:
+                logger.debug(f"log shutdown event failed: {e}")
+        # Tell market_data to close its WS streams.
+        try:
+            await self._market_data.stop()
+        except Exception as e:
+            logger.debug(f"market_data.stop on shutdown: {e}")
 
     def peek_pending(self):
         """Return the next pending signal without removing it. None if empty.
