@@ -110,6 +110,36 @@ Switch risk profiles without restarting:
 - **scalper** — short timeframe momentum
 - **custom** — implement your own in strategies/custom.py
 
+## Agents
+
+Trading is split across independent agents under a single coordinator.
+Each agent has its own capital pool, circuit breakers, and lifecycle.
+
+### What's Built
+- **SignalAgent** — wraps the main CryptoBot loop (per-trade approval,
+  arb + momentum + reversion + sweep tracks)
+- **ArbAgent** — dedicated cross-exchange arbitrage engine, fee-aware
+- **ScalpingAgent** — OFI-primary signal, fee-aware TP/SL, exchange
+  routing (observation mode — data collection before activation)
+- **MacroAgent / SentimentAgent / OnChainAgent** — placeholders;
+  reserved slots on the dashboard until implementation lands
+
+### Coordinator diagram
+
+```
+Coordinator
+├── SignalAgent       ($400)     Claude-evaluated, per-trade approval
+├── ArbAgent          ($600)     Cross-exchange arbitrage engine
+├── ScalpingAgent     ($0 obs)   Rule-based, OFI-primary
+├── MacroAgent        (—)        Placeholder
+├── SentimentAgent    (—)        Placeholder
+└── OnChainAgent      (—)        Placeholder
+```
+
+See `GLOSSARY.md` for ScalpingAgent / FeeManager / OFI Engine
+definitions, `PLUGIN_PATTERN.md` for the registry pattern every
+agent follows, and `RUNBOOK.md` for activation checklists.
+
 ## Data & Predictive Engine
 All signals, trades, candles, and sentiment are stored in SQLite.
 After ~4 weeks of sim data, run:
