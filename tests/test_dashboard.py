@@ -85,11 +85,18 @@ def _patch_db_queries(monkeypatch):
     fake_q.get_recent_closed_trades.return_value = []
     fake_q.get_signal_win_rate.return_value = {"total": 0, "win_rate": 0.0}
     fake_q.get_today_skipped_signals.return_value = 0
+    fake_q.get_arb_opportunity_stats.return_value = {
+        "total_detected": 0, "total_executed": 0,
+        "execution_rate_pct": 0.0, "avg_gap_pct": 0.0,
+        "max_gap_pct": 0.0, "top_pairs": [],
+    }
     monkeypatch.setattr("database.queries.get_today_trades", fake_q.get_today_trades)
     monkeypatch.setattr("database.queries.get_open_trades", fake_q.get_open_trades)
     monkeypatch.setattr("database.queries.get_recent_closed_trades", fake_q.get_recent_closed_trades)
     monkeypatch.setattr("database.queries.get_signal_win_rate", fake_q.get_signal_win_rate)
     monkeypatch.setattr("database.queries.get_today_skipped_signals", fake_q.get_today_skipped_signals)
+    monkeypatch.setattr("database.queries.get_arb_opportunity_stats",
+                        fake_q.get_arb_opportunity_stats)
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -449,6 +456,162 @@ def test_full_dashboard_renders_with_cmd_bar(monkeypatch):
     monkeypatch.setattr("database.queries.get_signal_win_rate",
                         lambda **kw: {"total": 0, "win_rate": 0.0})
     monkeypatch.setattr("database.queries.get_today_skipped_signals", lambda: 0)
+    monkeypatch.setattr("database.queries.get_arb_opportunity_stats",
+                        lambda: {"total_detected": 0, "total_executed": 0,
+                                 "execution_rate_pct": 0.0,
+                                 "avg_gap_pct": 0.0, "max_gap_pct": 0.0,
+                                 "top_pairs": []})
     dash = Dashboard(_mock_bot())
     layout = dash.render()
     _render_to_string(layout)   # would raise on bad markup or missing panel
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# ARB OPPORTUNITY panel — detection/execution funnel
+# ─────────────────────────────────────────────────────────────────────────
+
+def _populated_opportunity_stats(executed=21, above=38, detected=142,
+                                 avg=0.07, mx=0.31, top=("ETH/USDT", 9)):
+    return {
+        "total_detected":     detected,
+        "total_executed":     executed,
+        "execution_rate_pct": (executed / above * 100.0) if above else 0.0,
+        "avg_gap_pct":        avg,
+        "max_gap_pct":        mx,
+        "top_pairs":          [top] if top else [],
+    }
+
+
+def test_arb_opportunity_panel_renders_with_stats(monkeypatch):
+    """Populated stats → numbers + top pair appear in the rendered text."""
+    monkeypatch.setattr("database.queries.get_arb_opportunity_stats",
+                        lambda: _populated_opportunity_stats())
+    dash = Dashboard(_mock_bot())
+    text = _render_to_string(dash._panel_arb_opportunities())
+    assert "142" in text                         # detected
+    assert "38"  in text                         # above threshold (derived)
+    assert "21"  in text                         # executed
+    assert "0.07" in text                        # avg gap
+    assert "0.31" in text                        # max gap
+    assert "ETH/USDT" in text                    # top pair
+    assert "(9 detections)" in text
+
+
+def test_arb_opportunity_panel_placeholder_on_empty_stats(monkeypatch):
+    """Empty stats dict → placeholder text, no crash, dim border."""
+    monkeypatch.setattr(
+        "database.queries.get_arb_opportunity_stats",
+        lambda: {"total_detected": 0, "total_executed": 0,
+                 "execution_rate_pct": 0.0, "avg_gap_pct": 0.0,
+                 "max_gap_pct": 0.0, "top_pairs": []},
+    )
+    dash = Dashboard(_mock_bot())
+    text = _render_to_string(dash._panel_arb_opportunities())
+    assert "No opportunities detected yet" in text
+
+
+def test_arb_opportunity_panel_amber_when_exec_rate_below_50(monkeypatch):
+    """20% ≤ exec_rate < 50% → amber (yellow) styling on executed line."""
+    # 8 / 27 ≈ 30% execution rate
+    monkeypatch.setattr(
+        "database.queries.get_arb_opportunity_stats",
+        lambda: _populated_opportunity_stats(executed=8, above=27, detected=80),
+    )
+    dash = Dashboard(_mock_bot())
+    # Render with color_system so styles materialise as ANSI codes.
+    import io
+    from rich.console import Console
+    buf = io.StringIO()
+    Console(file=buf, width=120, force_terminal=True,
+            color_system="truecolor").print(dash._panel_arb_opportunities())
+    out = buf.getvalue()
+    # Yellow (ANSI 33) is what Rich uses for the "yellow" style.
+    assert "33" in out  # ANSI yellow attribute appears
+    assert "8" in out
+
+
+def test_arb_opportunity_panel_red_when_exec_rate_below_20(monkeypatch):
+    """exec_rate < 20% → red styling on executed line."""
+    # 1 / 25 = 4%
+    monkeypatch.setattr(
+        "database.queries.get_arb_opportunity_stats",
+        lambda: _populated_opportunity_stats(executed=1, above=25, detected=100),
+    )
+    dash = Dashboard(_mock_bot())
+    import io
+    from rich.console import Console
+    buf = io.StringIO()
+    Console(file=buf, width=120, force_terminal=True,
+            color_system="truecolor").print(dash._panel_arb_opportunities())
+    out = buf.getvalue()
+    # ANSI 31 is the foreground red.
+    assert "31" in out
+
+
+def test_dashboard_does_not_crash_on_stats_query_failure(monkeypatch):
+    """If the query raises, the panel must render the placeholder."""
+    def boom():
+        raise RuntimeError("db offline")
+    monkeypatch.setattr("database.queries.get_arb_opportunity_stats", boom)
+    dash = Dashboard(_mock_bot())
+    text = _render_to_string(dash._panel_arb_opportunities())
+    assert "No opportunities detected yet" in text
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# ARB FEED — inline "Missed (balance)" capital-gate counter
+# ─────────────────────────────────────────────────────────────────────────
+
+def test_arb_panel_shows_missed_balance_checks_count():
+    """The arb feed panel surfaces missed_balance_checks pulled from the
+    cached engine stats."""
+    dash = Dashboard(_mock_bot())
+    dash._arb_engine_stats_cache = {"missed_balance_checks": 4}
+    text = _render_to_string(dash._panel_arb_feed())
+    assert "Missed (balance):" in text
+    assert "4" in text
+
+
+def test_arb_panel_balance_miss_amber_at_threshold():
+    """At 1 ≤ N < 6 the counter renders in amber (yellow). Threshold value
+    comes from settings — we use DASHBOARD_BALANCE_MISS_AMBER = 1."""
+    from config import settings as s
+    dash = Dashboard(_mock_bot())
+    dash._arb_engine_stats_cache = {
+        "missed_balance_checks": s.DASHBOARD_BALANCE_MISS_AMBER,
+    }
+    import io
+    from rich.console import Console
+    buf = io.StringIO()
+    Console(file=buf, width=120, force_terminal=True,
+            color_system="truecolor").print(dash._panel_arb_feed())
+    out = buf.getvalue()
+    assert "33" in out  # ANSI yellow
+    assert "blocked today" in out
+
+
+def test_arb_panel_balance_miss_red_at_threshold():
+    """At N ≥ DASHBOARD_BALANCE_MISS_RED the counter renders red."""
+    from config import settings as s
+    dash = Dashboard(_mock_bot())
+    dash._arb_engine_stats_cache = {
+        "missed_balance_checks": s.DASHBOARD_BALANCE_MISS_RED,
+    }
+    import io
+    from rich.console import Console
+    buf = io.StringIO()
+    Console(file=buf, width=120, force_terminal=True,
+            color_system="truecolor").print(dash._panel_arb_feed())
+    out = buf.getvalue()
+    assert "31" in out  # ANSI red
+    assert "blocked today" in out
+
+
+def test_arb_panel_handles_missing_missed_balance_attr():
+    """No cached engine stats → defaults to 0 missed, dim styling, panel
+    still renders without raising."""
+    dash = Dashboard(_mock_bot())
+    # Don't populate _arb_engine_stats_cache — leaves it as {}
+    text = _render_to_string(dash._panel_arb_feed())
+    assert "Missed (balance):" in text
+    assert "0" in text

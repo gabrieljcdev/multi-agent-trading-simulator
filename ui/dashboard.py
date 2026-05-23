@@ -3,10 +3,11 @@ ui/dashboard.py
 
 Rich terminal dashboard — single pane of glass for CryptoBot.
 
-Eleven stacked rows: header, portfolio bar, status/regime/sentiment/macro,
+Twelve stacked rows: header, portfolio bar, status/regime/sentiment/macro,
 market overview, agents/circuit-breakers/top-performers/events, positions
-table, signal+arb feeds, exchange health + session performance, log feed +
-approval panel, insights strip, footer.
+table, signal feed + arb feed + arb opportunity stats, exchange health +
+session performance, log feed + approval panel, insights strip, footer,
+command bar.
 
 Every panel is wrapped in try/except — a broken data source must never
 crash the whole dashboard. Modules that haven't been built yet (macro,
@@ -130,6 +131,12 @@ class Dashboard:
         self._portfolio_cache:   Optional[dict] = None
         self._agent_stats_cache: list[dict]     = []
 
+        # Arb engine raw stats — AgentStats doesn't carry engine-specific
+        # counters (missed_balance_checks, last_opportunity), so the
+        # dashboard reaches through the coordinator's agent list to the
+        # ArbEngine directly. Empty dict when no arb agent is present.
+        self._arb_engine_stats_cache: dict = {}
+
         self._console = Console()
 
     # ── Push API ────────────────────────────────────────────────────────
@@ -236,8 +243,9 @@ class Dashboard:
             Layout(self._safe(self._panel_pending_events,    "events")),
         )
         layout["row7"].split_row(
-            Layout(self._safe(self._panel_signal_feed, "signals")),
-            Layout(self._safe(self._panel_arb_feed,    "arb")),
+            Layout(self._safe(self._panel_signal_feed,         "signals"), ratio=2),
+            Layout(self._safe(self._panel_arb_feed,            "arb"),     ratio=1),
+            Layout(self._safe(self._panel_arb_opportunities,   "arb_opps"), ratio=1),
         )
         layout["row8"].split_row(
             Layout(self._safe(self._panel_exchange_health, "exchanges")),
@@ -319,6 +327,23 @@ class Dashboard:
                 ]
             except Exception as e:
                 logger.debug(f"dashboard agent stats refresh: {e}")
+
+        # Pull the arb engine's raw stats dict so the capital-gate line
+        # and opportunity panel can read counters that AgentStats omits.
+        # Wrapped defensively — coordinator's internal layout is private,
+        # and the arb agent may not be registered in some configurations.
+        try:
+            agents = getattr(self._coordinator, "_agents", None) or []
+            for a in agents:
+                if getattr(a, "agent_id", None) != "arb":
+                    continue
+                engine = getattr(a, "_engine", None)
+                if engine is None or not hasattr(engine, "get_stats"):
+                    break
+                self._arb_engine_stats_cache = engine.get_stats() or {}
+                break
+        except Exception as e:
+            logger.debug(f"dashboard arb engine stats refresh: {e}")
 
     def stop(self) -> None:
         self._running = False
@@ -929,16 +954,103 @@ class Dashboard:
 
         if not self._arb_buffer:
             t.add_row("[dim]—[/dim]", "", "", "", "", "")
-            return Panel(t, title="[bold]ARB FEED[/bold]", border_style="cyan")
+        else:
+            for a in list(self._arb_buffer)[-10:][::-1]:
+                pnl_col = _pnl_colour(a["pnl"])
+                t.add_row(
+                    a["time"], a["pair"], a["buy"], a["sell"],
+                    f"{a['gap_pct']:.3f}",
+                    f"[{pnl_col}]{a['pnl']:+.4f}[/{pnl_col}]",
+                )
 
-        for a in list(self._arb_buffer)[-10:][::-1]:
-            pnl_col = _pnl_colour(a["pnl"])
-            t.add_row(
-                a["time"], a["pair"], a["buy"], a["sell"],
-                f"{a['gap_pct']:.3f}",
-                f"[{pnl_col}]{a['pnl']:+.4f}[/{pnl_col}]",
+        # Capital-gate counter sits inline under the feed so the
+        # operator sees blocked executions next to fired ones. Resilient
+        # to older ArbEngine instances that don't carry the attribute —
+        # TODO: hook into the engine's daily reset once a reset hook is
+        # exposed (today the counter survives until process restart).
+        missed = int(self._arb_engine_stats_cache.get("missed_balance_checks", 0) or 0)
+        if missed >= settings.DASHBOARD_BALANCE_MISS_RED:
+            miss_style  = "red bold"
+            miss_suffix = f"  ({missed} blocked today)"
+        elif missed >= settings.DASHBOARD_BALANCE_MISS_AMBER:
+            miss_style  = "yellow"
+            miss_suffix = f"  ({missed} blocked today)"
+        else:
+            miss_style  = "dim"
+            miss_suffix = ""
+        footer = Text()
+        footer.append("Missed (balance): ", style="bold")
+        footer.append(str(missed), style=miss_style)
+        footer.append(miss_suffix, style=miss_style)
+
+        return Panel(self._stack(t, footer), title="[bold]ARB FEED[/bold]",
+                     border_style="cyan")
+
+    def _panel_arb_opportunities(self) -> Panel:
+        """Detection-vs-execution funnel for the arb engine.
+
+        Reads from queries.get_arb_opportunity_stats — failure or empty
+        stats render a placeholder rather than crashing the panel.
+        """
+        title = "[bold]ARB OPPORTUNITIES[/bold]"
+        try:
+            from database import queries as q
+            stats = q.get_arb_opportunity_stats() or {}
+        except Exception as e:
+            logger.debug(f"arb opportunity stats query failed: {e}")
+            return Panel(
+                Text("No opportunities detected yet", style="dim italic"),
+                title=title, border_style="dim",
             )
-        return Panel(t, title="[bold]ARB FEED[/bold]", border_style="cyan")
+
+        total      = int(stats.get("total_detected", 0) or 0)
+        if total == 0:
+            return Panel(
+                Text("No opportunities detected yet", style="dim italic"),
+                title=title, border_style="dim",
+            )
+
+        executed   = int(stats.get("total_executed", 0) or 0)
+        exec_rate  = float(stats.get("execution_rate_pct", 0.0) or 0.0)
+        avg_gap    = float(stats.get("avg_gap_pct", 0.0) or 0.0)
+        max_gap    = float(stats.get("max_gap_pct", 0.0) or 0.0)
+        top_pairs  = list(stats.get("top_pairs") or [])
+
+        # above_threshold isn't carried directly in the stats dict —
+        # derive it from execution_rate when both sides are known.
+        # execution_rate_pct = executed / above_threshold × 100, so
+        # above_threshold = executed × 100 / exec_rate (when nonzero).
+        above_threshold: int
+        if exec_rate > 0 and executed > 0:
+            above_threshold = int(round(executed * 100.0 / exec_rate))
+        else:
+            above_threshold = executed
+
+        # Colour ladder for the executed line — green when we're
+        # catching the majority, amber mid-range, red when most viable
+        # gaps slip past.
+        if exec_rate >= settings.DASHBOARD_EXEC_RATE_GREEN_PCT:
+            exec_style = "bright_green"
+        elif exec_rate >= settings.DASHBOARD_EXEC_RATE_AMBER_PCT:
+            exec_style = "yellow"
+        else:
+            exec_style = "red"
+
+        body = Text()
+        body.append(f"Detected today:  {total:>6d}\n", style="dim")
+        body.append(f"Above threshold: {above_threshold:>6d}\n", style="white")
+        body.append("Executed:        ", style="bold")
+        body.append(f"{executed:>6d}", style=exec_style)
+        body.append(f"  ({exec_rate:.0f}% of above)\n", style=exec_style)
+        body.append(f"Avg gap:         {avg_gap:.3f}%\n", style="white")
+        body.append(f"Max gap:         {max_gap:.3f}%\n", style="white")
+        if top_pairs:
+            pair, count = top_pairs[0]
+            body.append("Top pair:        ", style="bold")
+            body.append(f"{pair}", style="cyan")
+            body.append(f" ({count} detections)", style="dim")
+
+        return Panel(body, title=title, border_style="cyan")
 
     def _panel_exchange_health(self) -> Panel:
         t = Table(expand=True, show_header=True, header_style="bold")

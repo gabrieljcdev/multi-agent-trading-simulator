@@ -844,3 +844,18 @@ UI_SHOW_REGIME_DETAILS   = True
 UI_SHOW_OFI_BARS         = True
 UI_SHOW_HURST_BARS       = True
 UI_DEFAULT_TAB           = "overview"
+
+# ── Dashboard arb-opportunity panel colour ladder ───────────────────────────
+# Execution rate = executed / above_threshold. Green when we're catching
+# the majority of viable gaps; amber when half are slipping through;
+# red when most viable gaps go unfilled (capital, latency, or routing
+# bug — investigate immediately).
+DASHBOARD_EXEC_RATE_GREEN_PCT = 50.0    # test: 30–70
+DASHBOARD_EXEC_RATE_AMBER_PCT = 20.0    # test: 10–40
+
+# ── Dashboard capital-gate miss colour ladder ───────────────────────────────
+# Inline counter on the arb panel — how many would-be arbs the
+# pre-execution balance check blocked today. 0 = green (healthy),
+# 1–N = amber (worth watching), N+ = red (capital not pre-positioned).
+DASHBOARD_BALANCE_MISS_AMBER = 1        # test: 1–3
+DASHBOARD_BALANCE_MISS_RED   = 6        # test: 3–10
