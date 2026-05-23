@@ -16,7 +16,8 @@ import pytest
 from config import settings
 from execution.arb_engine import (
     ArbEngine, ArbOpportunity, ArbResult,
-    gross_gap_pct, net_gap_pct, min_gap_threshold,
+    FundingRateArbEngine,
+    gross_gap_pct, net_gap_pct, min_gap_threshold, slippage_pct,
 )
 
 
@@ -24,11 +25,22 @@ from execution.arb_engine import (
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────
 
+# Rich-enough free balance to pass the pre-execution capital gate for
+# every test that doesn't deliberately stress the gate. Quote and base
+# currencies share the same dict — fetch_balance.get('free').get(ccy)
+# returns this number for any ccy the test passes through.
+_AMPLE_BALANCE = {
+    "free": {"USDT": 1_000_000.0, "BTC": 1_000.0, "ETH": 1_000.0,
+             "SOL": 1_000.0, "BNB": 1_000.0},
+}
+
+
 def _mock_exchange(
     asks: list,
     bids: list,
     buy_fill_price: float = None,
     sell_fill_price: float = None,
+    free_balance: dict | None = None,
 ) -> MagicMock:
     """Construct a mock CCXT-shaped client with the given book + fills."""
     ex = MagicMock()
@@ -39,30 +51,66 @@ def _mock_exchange(
     ex.create_market_sell_order = AsyncMock(
         return_value={"price": sell_fill_price if sell_fill_price is not None else bids[0][0]}
     )
+    ex.fetch_balance = AsyncMock(
+        return_value=free_balance if free_balance is not None else _AMPLE_BALANCE,
+    )
     ex.close = AsyncMock()
     return ex
 
 
 def _opp(symbol="BTC/USDT", buy_ex="bitget", sell_ex="kraken",
-         buy=100.0, sell=100.4, net=0.20, size=10.0) -> ArbOpportunity:
+         buy=100.0, sell=100.4, net=0.20, size=10.0,
+         spread_buy_pct=0.02, spread_sell_pct=0.02,
+         depth_buy_usd=10.0, depth_sell_usd=10.0) -> ArbOpportunity:
+    """Default spread + depth values produce slippage = 0.02% (the legacy
+    flat-model number) so legacy assertions still work where applicable.
+    Tests that exercise the depth-aware model override these explicitly."""
     return ArbOpportunity(
         symbol=symbol, buy_exchange=buy_ex, sell_exchange=sell_ex,
         buy_price=buy, sell_price=sell,
         gross_gap_pct=(sell - buy) / buy * 100,
         net_gap_pct=net, max_size_usd=size, detected_at=time.monotonic(),
+        spread_buy_pct=spread_buy_pct, spread_sell_pct=spread_sell_pct,
+        depth_buy_usd=depth_buy_usd, depth_sell_usd=depth_sell_usd,
     )
+
+
+def _with_balance(ex: MagicMock, free: dict | None = None) -> MagicMock:
+    """Attach a fetch_balance AsyncMock to an exchange built without the
+    _mock_exchange helper (manual MagicMock construction)."""
+    ex.fetch_balance = AsyncMock(
+        return_value=free if free is not None else _AMPLE_BALANCE,
+    )
+    return ex
 
 
 @pytest.fixture(autouse=True)
 def _patch_db(monkeypatch):
-    """Never touch SQLite during arb-engine tests."""
+    """Never touch SQLite during arb-engine tests.
+
+    log_arb_trade returns an int (the new row id) in production; the
+    stub returns 1 so callers chaining mark_arb_opportunity_executed
+    on the id still work.
+    """
     monkeypatch.setattr(
         "execution.arb_engine.db_queries.log_arb_trade",
-        lambda *a, **k: None,
+        lambda *a, **k: 1,
     )
     monkeypatch.setattr(
         "execution.arb_engine.db_queries.log_circuit_breaker",
         lambda *a, **k: None,
+    )
+    monkeypatch.setattr(
+        "execution.arb_engine.db_queries.log_arb_opportunity",
+        lambda *a, **k: 1,
+    )
+    monkeypatch.setattr(
+        "execution.arb_engine.db_queries.mark_arb_opportunity_executed",
+        lambda *a, **k: None,
+    )
+    monkeypatch.setattr(
+        "execution.arb_engine.db_queries.log_arb_balance_fail",
+        lambda *a, **k: 2,
     )
 
 
@@ -145,8 +193,10 @@ async def test_live_fills_runs_both_legs_concurrently(monkeypatch):
 
     a = MagicMock()
     a.create_market_buy_order = slow_buy
+    _with_balance(a)
     b = MagicMock()
     b.create_market_sell_order = slow_sell
+    _with_balance(b)
 
     engine = ArbEngine(exchange_clients={"bitget": a, "kraken": b}, sim_mode=False)
     opp = _opp(buy=100.0, sell=100.5)
@@ -186,8 +236,10 @@ async def test_per_symbol_lock_blocks_second_attempt(monkeypatch):
 
     a = MagicMock()
     a.create_market_buy_order = slow_buy
+    _with_balance(a)
     b = MagicMock()
     b.create_market_sell_order = slow_sell
+    _with_balance(b)
 
     engine = ArbEngine(
         exchange_clients={"bitget": a, "kraken": b},
@@ -237,13 +289,18 @@ def test_circuit_breaker_clear_when_under_thresholds():
 # ─────────────────────────────────────────────────────────────────────────
 
 def test_sim_fills_apply_slippage_model():
+    """With the default _opp spread=0.02% / depth=$10 / size=$10 the
+    depth-aware model collapses to 0.02% per leg — same number the
+    legacy flat model produced. Dedicated tests below stretch the
+    model with varying size and depth."""
     engine = ArbEngine(exchange_clients={"bitget": MagicMock(), "kraken": MagicMock()},
                        sim_mode=True)
     opp = _opp(buy=100.0, sell=100.5)
-    buy_fill, sell_fill = engine._sim_fills(opp)
-    # +/- 0.02%
+    buy_fill, sell_fill, slip_buy, slip_sell = engine._sim_fills(opp)
     assert buy_fill  == pytest.approx(100.0 * 1.0002, abs=0.0001)
     assert sell_fill == pytest.approx(100.5 * 0.9998, abs=0.0001)
+    assert slip_buy  == pytest.approx(0.02, abs=0.0001)
+    assert slip_sell == pytest.approx(0.02, abs=0.0001)
 
 
 @pytest.mark.asyncio
@@ -252,9 +309,11 @@ async def test_execute_arb_uses_sim_fills_in_sim_mode():
     a = MagicMock()
     a.create_market_buy_order  = AsyncMock(side_effect=AssertionError("should not be called"))
     a.fetch_order_book = AsyncMock()
+    _with_balance(a)
     b = MagicMock()
     b.create_market_sell_order = AsyncMock(side_effect=AssertionError("should not be called"))
     b.fetch_order_book = AsyncMock()
+    _with_balance(b)
     engine = ArbEngine(exchange_clients={"bitget": a, "kraken": b}, sim_mode=True)
     await engine._execute_arb(_opp(buy=100.0, sell=100.5))
     a.create_market_buy_order.assert_not_called()
@@ -292,8 +351,10 @@ async def test_new_exchange_in_fee_map_evaluated(monkeypatch):
 async def test_dashboard_add_arb_called_on_completed_trade():
     a = MagicMock()
     a.fetch_order_book = AsyncMock()
+    _with_balance(a)
     b = MagicMock()
     b.fetch_order_book = AsyncMock()
+    _with_balance(b)
     dash = MagicMock()
     engine = ArbEngine(
         exchange_clients={"bitget": a, "kraken": b},
@@ -313,8 +374,10 @@ async def test_dashboard_not_called_on_failed_trade(monkeypatch):
     """Failed arb (e.g. exchange error in live mode) must not push to dashboard."""
     a = MagicMock()
     a.create_market_buy_order = AsyncMock(side_effect=RuntimeError("api down"))
+    _with_balance(a)
     b = MagicMock()
     b.create_market_sell_order = AsyncMock(return_value={"price": 100.5})
+    _with_balance(b)
     dash = MagicMock()
     engine = ArbEngine(
         exchange_clients={"bitget": a, "kraken": b},
@@ -325,3 +388,236 @@ async def test_dashboard_not_called_on_failed_trade(monkeypatch):
     dash.add_arb.assert_not_called()
     # The failure didn't crash the engine
     assert engine._total_trades == 0
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Pre-execution capital gate (balance verification)
+# ─────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_balance_check_blocks_execution_when_insufficient_funds():
+    """The buy-side has $1 — far below the size × buffer requirement —
+    so _execute_arb returns before any order leg fires."""
+    a = MagicMock()
+    a.create_market_buy_order = AsyncMock(side_effect=AssertionError("must not fire"))
+    _with_balance(a, {"free": {"USDT": 1.0}})           # buy side: not enough quote
+    b = MagicMock()
+    b.create_market_sell_order = AsyncMock(side_effect=AssertionError("must not fire"))
+    _with_balance(b)                                    # sell side: ample
+
+    engine = ArbEngine(
+        exchange_clients={"bitget": a, "kraken": b},
+        sim_mode=False,
+    )
+    opp = _opp(buy=100.0, sell=100.5, size=100.0)
+    await engine._execute_arb(opp)
+
+    a.create_market_buy_order.assert_not_called()
+    b.create_market_sell_order.assert_not_called()
+    assert engine._total_trades == 0
+    assert engine.missed_balance_checks == 1
+
+
+@pytest.mark.asyncio
+async def test_balance_check_logs_miss_to_db(monkeypatch):
+    """The balance gate must persist the miss via log_arb_balance_fail
+    with status='balance_fail'."""
+    captured = {}
+
+    def fake_log(symbol, buy_exchange, sell_exchange, detail, sim_mode):
+        captured.update(symbol=symbol, buy_exchange=buy_exchange,
+                        sell_exchange=sell_exchange, detail=detail,
+                        sim_mode=sim_mode)
+        return 99
+
+    monkeypatch.setattr(
+        "execution.arb_engine.db_queries.log_arb_balance_fail",
+        fake_log,
+    )
+
+    a = _with_balance(MagicMock(), {"free": {"USDT": 0.5}})
+    b = _with_balance(MagicMock())
+    engine = ArbEngine(
+        exchange_clients={"bitget": a, "kraken": b},
+        sim_mode=False,
+    )
+    await engine._execute_arb(_opp(buy=100.0, sell=100.5, size=50.0))
+
+    assert captured["symbol"]        == "BTC/USDT"
+    assert captured["buy_exchange"]  == "bitget"
+    assert captured["sell_exchange"] == "kraken"
+    assert "USDT" in (captured["detail"] or "")
+    assert engine.missed_balance_checks == 1
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Depth-aware slippage model
+# ─────────────────────────────────────────────────────────────────────────
+
+def test_slippage_model_increases_with_position_size():
+    """slip = spread × sqrt(size/depth); 4× the size = 2× the slippage.
+    Inputs chosen so both slippages live INSIDE the [MIN, MAX] clamp."""
+    base_spread = 0.20    # 0.2% — comfortably above the 0.01% MIN
+    depth_usd   = 100.0
+    slip_small = slippage_pct(base_spread, size_usd=25.0,  depth_usd=depth_usd)
+    slip_big   = slippage_pct(base_spread, size_usd=100.0, depth_usd=depth_usd)
+    assert settings.ARB_SLIPPAGE_MIN_PCT < slip_small < settings.ARB_SLIPPAGE_MAX_PCT
+    assert settings.ARB_SLIPPAGE_MIN_PCT < slip_big   < settings.ARB_SLIPPAGE_MAX_PCT
+    assert slip_big > slip_small
+    # 4× size → 2× sqrt → 2× slippage (both stay inside the clamp).
+    assert slip_big == pytest.approx(slip_small * 2.0, rel=0.01)
+
+
+def test_slippage_model_clamps_to_min_max():
+    """Tiny inputs clamp UP to MIN; massive size/spread clamps DOWN to MAX."""
+    # Below-min: nearly-zero spread or near-zero size → MIN.
+    assert slippage_pct(0.0,  size_usd=10.0, depth_usd=1_000.0) == settings.ARB_SLIPPAGE_MIN_PCT
+    assert slippage_pct(0.05, size_usd=0.0,  depth_usd=1_000.0) == settings.ARB_SLIPPAGE_MIN_PCT
+    # Above-max: huge spread + size > depth → MAX.
+    assert slippage_pct(5.0,  size_usd=10_000.0, depth_usd=10.0) == settings.ARB_SLIPPAGE_MAX_PCT
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Dynamic position sizing
+# ─────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_dynamic_sizing_scales_with_gap_width(monkeypatch):
+    """A gap 2× the threshold yields a position 2× the base — provided
+    the depth cap leaves room. We engineer a deep book so depth doesn't
+    bind."""
+    monkeypatch.setattr(settings, "ARB_WATCH_PAIRS", ["BTC/USDT"])
+    monkeypatch.setattr(settings, "ARB_CAPITAL_PER_EXCHANGE", 1_000_000.0)
+
+    # Deep book on both sides so 10% of depth ≫ dynamic size.
+    a = _mock_exchange(asks=[[100.00, 1_000.0]] * 3, bids=[[ 99.99, 1_000.0]] * 3)
+    # Build the sell side so the net gap is roughly 2× the bitget
+    # threshold after fees. bitget fee 0.0001 + kraken fee 0.0026 = 0.27pct
+    # → net = gross − 0.27. For 2× threshold (≈0.06%), gross ≈ 0.33%.
+    sell_price = 100.0 * (1 + 0.0033)
+    b = _mock_exchange(
+        asks=[[sell_price * 1.0001, 1_000.0]] * 3,
+        bids=[[sell_price,           1_000.0]] * 3,
+    )
+    engine = ArbEngine(exchange_clients={"bitget": a, "kraken": b}, sim_mode=True)
+    opp = await engine._find_best_opportunity()
+    assert opp is not None
+
+    threshold = min_gap_threshold(opp.buy_exchange, opp.sell_exchange)
+    gap_ratio = opp.net_gap_pct / threshold
+    # Dynamic size should equal base × min(gap_ratio, cap), capped
+    # before any depth cap kicks in here (book is huge).
+    expected_multiplier = min(gap_ratio, settings.ARB_SIZE_MULTIPLIER_CAP)
+    expected_size = settings.ARB_BASE_POSITION_USD * expected_multiplier
+    assert opp.max_size_usd == pytest.approx(expected_size, rel=0.01)
+    assert opp.max_size_usd > settings.ARB_BASE_POSITION_USD
+
+
+@pytest.mark.asyncio
+async def test_dynamic_sizing_caps_at_multiplier_cap(monkeypatch):
+    """A 10× threshold gap caps at ARB_SIZE_MULTIPLIER_CAP × base
+    regardless of how wide the gap really was."""
+    monkeypatch.setattr(settings, "ARB_WATCH_PAIRS", ["BTC/USDT"])
+    monkeypatch.setattr(settings, "ARB_CAPITAL_PER_EXCHANGE", 1_000_000.0)
+
+    a = _mock_exchange(asks=[[100.00, 1_000.0]] * 3, bids=[[ 99.99, 1_000.0]] * 3)
+    # Massive gap — 5% gross, well above any multiplier-cap range.
+    b = _mock_exchange(asks=[[105.01, 1_000.0]] * 3, bids=[[105.00, 1_000.0]] * 3)
+
+    engine = ArbEngine(exchange_clients={"bitget": a, "kraken": b}, sim_mode=True)
+    opp = await engine._find_best_opportunity()
+    assert opp is not None
+    cap_size = settings.ARB_BASE_POSITION_USD * settings.ARB_SIZE_MULTIPLIER_CAP
+    assert opp.max_size_usd == pytest.approx(cap_size, rel=0.001)
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Opportunity logging
+# ─────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_opportunity_log_records_unexecuted_gaps(monkeypatch):
+    """A gap that clears liquidity but sits BELOW the execution threshold
+    must still produce an arb_opportunities row, with above_threshold=False
+    and executed=False."""
+    monkeypatch.setattr(settings, "ARB_WATCH_PAIRS", ["BTC/USDT"])
+
+    calls = []
+    monkeypatch.setattr(
+        "execution.arb_engine.db_queries.log_arb_opportunity",
+        lambda **kw: (calls.append(kw), 7)[1],
+    )
+    # Tiny gap below threshold; depth comfortably above liquidity floor.
+    a = _mock_exchange(asks=[[100.00, 50.0]] * 3, bids=[[99.99, 50.0]] * 3)
+    b = _mock_exchange(asks=[[100.05, 50.0]] * 3, bids=[[100.02, 50.0]] * 3)
+    engine = ArbEngine(exchange_clients={"bitget": a, "kraken": b}, sim_mode=True)
+    opp = await engine._find_best_opportunity()
+    assert opp is None
+    # At least one unexecuted gap was logged
+    sub_threshold = [c for c in calls if not c.get("above_threshold")]
+    assert sub_threshold, "expected an unexecuted opportunity row"
+    row = sub_threshold[0]
+    assert row["symbol"] == "BTC/USDT"
+    # executed / arb_trade_id default in the query signature; the engine
+    # never overrides them on the initial write — log_opportunity passes
+    # neither key, so the DB column stays at its default False / NULL.
+    assert "executed" not in row
+    assert "arb_trade_id" not in row
+
+
+@pytest.mark.asyncio
+async def test_opportunity_log_records_executed_gaps_with_trade_id(monkeypatch):
+    """Executable gaps get logged with the resolved arb_trades id once
+    the trade fires."""
+    monkeypatch.setattr(settings, "ARB_WATCH_PAIRS", ["BTC/USDT"])
+
+    monkeypatch.setattr(
+        "execution.arb_engine.db_queries.log_arb_opportunity",
+        lambda **kw: 42,
+    )
+    monkeypatch.setattr(
+        "execution.arb_engine.db_queries.log_arb_trade",
+        lambda *a, **k: 777,
+    )
+    executed_calls = []
+    monkeypatch.setattr(
+        "execution.arb_engine.db_queries.mark_arb_opportunity_executed",
+        lambda opp_id, trade_id: executed_calls.append((opp_id, trade_id)),
+    )
+
+    a = _mock_exchange(asks=[[100.00, 50.0]] * 3, bids=[[99.99, 50.0]] * 3)
+    b = _mock_exchange(asks=[[100.51, 50.0]] * 3, bids=[[100.50, 50.0]] * 3)
+    engine = ArbEngine(exchange_clients={"bitget": a, "kraken": b}, sim_mode=True)
+    opp = await engine._find_best_opportunity()
+    assert opp is not None
+    assert opp.opportunity_log_id == 42
+    await engine._execute_arb(opp)
+    assert executed_calls == [(42, 777)]
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# FundingRateArbEngine — Coinglass-not-wired stub + circuit breaker
+# ─────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_funding_arb_engine_stub_returns_empty_without_coinglass(caplog):
+    """fetch_funding_rates returns an empty dict and emits one warning
+    when no data source is wired."""
+    engine = FundingRateArbEngine(sim_mode=True)
+    with caplog.at_level("WARNING"):
+        out = await engine.fetch_funding_rates()
+    assert out == {}
+    assert any("Coinglass" in r.message for r in caplog.records)
+
+
+def test_funding_arb_circuit_breaker_halts_on_daily_loss():
+    """Independent thresholds — the funding engine's halt uses
+    ARB_FUNDING_DAILY_LOSS_HALT_USD, distinct from ArbEngine's."""
+    engine = FundingRateArbEngine(sim_mode=True)
+    engine._daily_pnl_usd = -settings.ARB_FUNDING_DAILY_LOSS_HALT_USD - 0.01
+    assert engine._cb_triggered() is True
+    engine._daily_pnl_usd = 0.0
+    engine._consecutive_losses = settings.ARB_FUNDING_CONSECUTIVE_LOSS_HALT
+    assert engine._cb_triggered() is True
+    engine._consecutive_losses = 0
+    assert engine._cb_triggered() is False

@@ -208,11 +208,30 @@ ARB_MIN_LIQUIDITY_MULT   = 2.0
 
 # Dedicated arb engine
 ARB_SCAN_INTERVAL_MS      = 500       # test: 250–2000
-ARB_MAX_POSITION_USD      = 25.0      # test: 10–100
+ARB_BASE_POSITION_USD     = 25.0      # test: 10.0–50.0  (base for gap-proportional sizing)
+ARB_SIZE_MULTIPLIER_CAP   = 4.0       # test: 2.0–6.0    (max gap/threshold scale-up)
 ARB_MIN_LIQUIDITY_USD     = 500.0     # test: 250–2000   (sum of top 3 book levels)
 ARB_MAX_CONCURRENT        = 3         # test: 1–5
 ARB_DAILY_LOSS_HALT_USD   = 10.0      # test: 5–50
 ARB_CONSECUTIVE_LOSS_HALT = 5         # test: 3–10
+
+# Pre-execution capital verification — query both exchange balances via
+# CCXT before firing. Buffer keeps a margin above the bare requirement.
+ARB_BALANCE_BUFFER_PCT    = 5.0       # test: 2.0–10.0
+
+# Depth-aware slippage model — sim mode applies this to both legs.
+#   slippage = base_spread * (size_usd / depth_usd) ** 0.5
+# clamped to [min, max]. Replaces the legacy flat ±0.02% sim slippage.
+ARB_SLIPPAGE_MIN_PCT      = 0.01      # test: 0.005–0.02
+ARB_SLIPPAGE_MAX_PCT      = 0.25      # test: 0.1–0.5
+
+# Funding-rate arb (FundingRateArbEngine). Open spot-long + perp-short
+# when funding rate exceeds MIN, close when it drops below EXIT. Same
+# circuit-breaker shape as ArbEngine with independent thresholds.
+ARB_FUNDING_RATE_MIN_PCT          = 0.05   # test: 0.03–0.10  (per 8h funding)
+ARB_FUNDING_RATE_EXIT_PCT         = 0.02   # test: 0.01–0.05
+ARB_FUNDING_DAILY_LOSS_HALT_USD   = 15.0
+ARB_FUNDING_CONSECUTIVE_LOSS_HALT = 4
 
 # Pairs the arb engine watches. Distinct from signal-track FALLBACK_PAIRS.
 ARB_WATCH_PAIRS = [

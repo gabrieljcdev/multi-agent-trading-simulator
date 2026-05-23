@@ -423,6 +423,10 @@ class ArbTrade(Base):
     Logged whether or not the trade succeeded; the `success` flag and
     `error` field tell them apart. P&L columns are USD because arb is
     flat-quoted in USD-equivalent across exchanges.
+
+    TODO: existing databases need an Alembic migration to add the
+    status / slippage_buy_pct / slippage_sell_pct columns. Fresh
+    init_db creates them automatically.
     """
     __tablename__ = "arb_trades"
 
@@ -441,12 +445,85 @@ class ArbTrade(Base):
     gross_pnl_usd  = Column(Float)
     net_pnl_usd    = Column(Float)
     execution_ms   = Column(Float)
+    # "executed" on the happy path; "balance_fail" when the pre-execution
+    # capital check blocked the trade. Indexed for cheap dashboard counts.
+    status            = Column(String(20), default="executed")
+    slippage_buy_pct  = Column(Float)
+    slippage_sell_pct = Column(Float)
     sim_mode       = Column(Boolean, default=True)
     success        = Column(Boolean, default=False)
     error          = Column(Text)
 
     __table_args__ = (
         Index("ix_arb_trades_lookup", "symbol", "timestamp"),
+    )
+
+
+class ArbOpportunity(Base):
+    """Every above-liquidity gap detected by the arb scan, regardless of
+    whether it was executed. Lets the dashboard answer "how many real
+    opportunities did we see today and what fraction did we capture?".
+
+    TODO: new table — fresh init_db creates it; existing databases need
+    an Alembic migration.
+    """
+    __tablename__ = "arb_opportunities"
+
+    id              = Column(Integer, primary_key=True)
+    detected_at     = Column(DateTime, default=datetime.utcnow)
+    symbol          = Column(String(20), nullable=False)
+    buy_exchange    = Column(String(20))
+    sell_exchange   = Column(String(20))
+    gap_pct         = Column(Float)
+    threshold_pct   = Column(Float)
+    above_threshold = Column(Boolean, default=False)
+    depth_buy_usd   = Column(Float)
+    depth_sell_usd  = Column(Float)
+    executed        = Column(Boolean, default=False)
+    arb_trade_id    = Column(Integer, ForeignKey("arb_trades.id"))
+
+    __table_args__ = (
+        Index("ix_arb_opportunities_lookup", "symbol", "detected_at"),
+    )
+
+
+class FundingArbTrade(Base):
+    """One row per funding-rate arb attempt by FundingRateArbEngine.
+
+    Mirrors ArbTrade's shape — the additional funding_rate_pct column
+    captures the rate that triggered (or that would have triggered, if
+    the row is a sim record) the position.
+
+    TODO: new table — fresh init_db creates it; existing databases need
+    an Alembic migration.
+    """
+    __tablename__ = "funding_arb_trades"
+
+    id                = Column(Integer, primary_key=True)
+    timestamp         = Column(DateTime, default=datetime.utcnow)
+    symbol            = Column(String(20), nullable=False)
+    buy_exchange      = Column(String(20))
+    sell_exchange     = Column(String(20))
+    buy_price         = Column(Float)
+    sell_price        = Column(Float)
+    buy_fill          = Column(Float)
+    sell_fill         = Column(Float)
+    gross_gap_pct     = Column(Float)
+    net_gap_pct       = Column(Float)
+    size_usd          = Column(Float)
+    gross_pnl_usd     = Column(Float)
+    net_pnl_usd       = Column(Float)
+    execution_ms      = Column(Float)
+    status            = Column(String(20), default="executed")
+    slippage_buy_pct  = Column(Float)
+    slippage_sell_pct = Column(Float)
+    funding_rate_pct  = Column(Float)
+    sim_mode          = Column(Boolean, default=True)
+    success           = Column(Boolean, default=False)
+    error             = Column(Text)
+
+    __table_args__ = (
+        Index("ix_funding_arb_trades_lookup", "symbol", "timestamp"),
     )
 
 

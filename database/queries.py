@@ -11,7 +11,8 @@ from .db import get_session
 from .models import (
     Candle, Signal, Trade, SentimentSnapshot, SentimentLog,
     DailyStats, CircuitBreakerLog,
-    PortfolioSnapshot, AgentEvent, ArbTrade,
+    PortfolioSnapshot, AgentEvent,
+    ArbTrade, ArbOpportunity, FundingArbTrade,
     DataLog,
     MacroLog, CalendarEvent,
     ScalpObservationModel,
@@ -332,15 +333,16 @@ def upsert_daily_stats(date_str: str, data: dict):
 
 # ── Arb engine ─────────────────────────────────────────────
 
-def log_arb_trade(result, sim_mode: bool = True) -> None:
-    """Persist one ArbResult.
+def log_arb_trade(result, sim_mode: bool = True) -> int:
+    """Persist one ArbResult and return its new row id.
 
     `result` is duck-typed (execution.arb_engine.ArbResult) to avoid a
-    queries→arb_engine import cycle.
+    queries→arb_engine import cycle. slippage_*_pct and status default
+    via getattr so older callers that don't fill them still work.
     """
     opp = result.opportunity
     with get_session() as s:
-        s.add(ArbTrade(
+        row = ArbTrade(
             symbol=opp.symbol,
             buy_exchange=opp.buy_exchange,
             sell_exchange=opp.sell_exchange,
@@ -354,10 +356,45 @@ def log_arb_trade(result, sim_mode: bool = True) -> None:
             gross_pnl_usd=result.gross_pnl_usd,
             net_pnl_usd=result.net_pnl_usd,
             execution_ms=result.execution_ms,
+            status=getattr(result, "status", "executed"),
+            slippage_buy_pct=getattr(result, "slippage_buy_pct", None),
+            slippage_sell_pct=getattr(result, "slippage_sell_pct", None),
             sim_mode=sim_mode,
             success=result.success,
             error=result.error,
-        ))
+        )
+        s.add(row)
+        s.flush()
+        return row.id
+
+
+def log_arb_balance_fail(
+    symbol:           str,
+    buy_exchange:     str,
+    sell_exchange:    str,
+    detail:           str,
+    sim_mode:         bool = True,
+) -> int:
+    """Persist a balance-check miss as an ArbTrade row with
+    status='balance_fail'. Returns the new row id.
+
+    Kept distinct from log_arb_trade because the gate fires before an
+    ArbResult exists — we want the miss recorded with zero P&L and the
+    failure detail in the error column.
+    """
+    with get_session() as s:
+        row = ArbTrade(
+            symbol=symbol,
+            buy_exchange=buy_exchange,
+            sell_exchange=sell_exchange,
+            status="balance_fail",
+            sim_mode=sim_mode,
+            success=False,
+            error=detail,
+        )
+        s.add(row)
+        s.flush()
+        return row.id
 
 
 def get_arb_trades(hours: int = 24) -> list:
@@ -417,6 +454,149 @@ def get_arb_stats() -> dict:
         "best_pair":   best_pair,
         "best_combo":  best_combo,
     }
+
+
+# ── Arb opportunities (detected gaps, executed + missed) ───
+
+def log_arb_opportunity(
+    symbol:          str,
+    buy_exchange:    str,
+    sell_exchange:   str,
+    gap_pct:         float,
+    threshold_pct:   float,
+    above_threshold: bool,
+    depth_buy_usd:   float,
+    depth_sell_usd:  float,
+    executed:        bool = False,
+    arb_trade_id:    Optional[int] = None,
+) -> int:
+    """Persist a detected gap. Always logged once the liquidity check
+    clears, regardless of whether the engine fired."""
+    with get_session() as s:
+        row = ArbOpportunity(
+            symbol=symbol,
+            buy_exchange=buy_exchange,
+            sell_exchange=sell_exchange,
+            gap_pct=gap_pct,
+            threshold_pct=threshold_pct,
+            above_threshold=above_threshold,
+            depth_buy_usd=depth_buy_usd,
+            depth_sell_usd=depth_sell_usd,
+            executed=executed,
+            arb_trade_id=arb_trade_id,
+        )
+        s.add(row)
+        s.flush()
+        return row.id
+
+
+def mark_arb_opportunity_executed(opp_id: int, arb_trade_id: Optional[int]) -> None:
+    """Flip executed=True on an ArbOpportunity row and link the firing
+    arb_trades row, if known. No-op when the row is missing."""
+    with get_session() as s:
+        row = s.get(ArbOpportunity, opp_id)
+        if row is None:
+            return
+        row.executed = True
+        if arb_trade_id is not None:
+            row.arb_trade_id = arb_trade_id
+
+
+def get_arb_opportunities_today() -> list:
+    """Every ArbOpportunity row detected today (UTC), newest first."""
+    today = datetime.utcnow().date()
+    with get_session() as s:
+        return (
+            s.query(ArbOpportunity)
+            .filter(func.date(ArbOpportunity.detected_at) == today)
+            .order_by(desc(ArbOpportunity.detected_at))
+            .all()
+        )
+
+
+def get_arb_opportunity_stats() -> dict:
+    """Aggregate dashboard stats over today's detected opportunities.
+
+    Keys: total_detected, total_executed, execution_rate_pct,
+    avg_gap_pct, max_gap_pct, top_pairs (list of (symbol, count)).
+    Returns zeros when the table is empty.
+    """
+    rows = get_arb_opportunities_today()
+    if not rows:
+        return {
+            "total_detected":      0,
+            "total_executed":      0,
+            "execution_rate_pct":  0.0,
+            "avg_gap_pct":         0.0,
+            "max_gap_pct":         0.0,
+            "top_pairs":           [],
+        }
+    total = len(rows)
+    executed = sum(1 for r in rows if r.executed)
+    gaps = [r.gap_pct for r in rows if r.gap_pct is not None]
+
+    from collections import Counter
+    counts = Counter(r.symbol for r in rows)
+    top_pairs = counts.most_common(5)
+
+    return {
+        "total_detected":     total,
+        "total_executed":     executed,
+        "execution_rate_pct": (executed / total * 100.0) if total else 0.0,
+        "avg_gap_pct":        sum(gaps) / len(gaps) if gaps else 0.0,
+        "max_gap_pct":        max(gaps) if gaps else 0.0,
+        "top_pairs":          top_pairs,
+    }
+
+
+# ── Funding rate arb ───────────────────────────────────────
+
+def log_funding_arb_trade(result, sim_mode: bool = True) -> int:
+    """Persist one FundingArbResult. Same duck-typing as log_arb_trade —
+    avoids a queries→execution import cycle.
+
+    Returns the new row id.
+    """
+    opp = result.opportunity
+    with get_session() as s:
+        row = FundingArbTrade(
+            symbol=opp.symbol,
+            buy_exchange=opp.buy_exchange,
+            sell_exchange=opp.sell_exchange,
+            buy_price=opp.buy_price,
+            sell_price=opp.sell_price,
+            buy_fill=result.buy_fill,
+            sell_fill=result.sell_fill,
+            gross_gap_pct=opp.gross_gap_pct,
+            net_gap_pct=opp.net_gap_pct,
+            size_usd=opp.max_size_usd,
+            gross_pnl_usd=result.gross_pnl_usd,
+            net_pnl_usd=result.net_pnl_usd,
+            execution_ms=result.execution_ms,
+            status=getattr(result, "status", "executed"),
+            slippage_buy_pct=getattr(result, "slippage_buy_pct", None),
+            slippage_sell_pct=getattr(result, "slippage_sell_pct", None),
+            funding_rate_pct=getattr(opp, "funding_rate_pct", None),
+            sim_mode=sim_mode,
+            success=result.success,
+            error=result.error,
+        )
+        s.add(row)
+        s.flush()
+        return row.id
+
+
+def get_funding_arb_pnl_today() -> float:
+    today = datetime.utcnow().date()
+    with get_session() as s:
+        rows = (
+            s.query(FundingArbTrade.net_pnl_usd)
+            .filter(func.date(FundingArbTrade.timestamp) == today,
+                    FundingArbTrade.success == True,  # noqa: E712
+                    FundingArbTrade.net_pnl_usd.isnot(None))
+            .all()
+        )
+    return float(sum(r[0] for r in rows))
 
 
 # ── Portfolio + agents ─────────────────────────────────────

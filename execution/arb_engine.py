@@ -60,6 +60,18 @@ class ArbOpportunity:
     net_gap_pct:   float                  # after both legs' fees
     max_size_usd:  float                  # liquidity-limited
     detected_at:   float                  # time.monotonic() at scan time
+    # Per-side bid-ask spread in % — fed to the depth-aware slippage model.
+    spread_buy_pct:  float = 0.0
+    spread_sell_pct: float = 0.0
+    # USD depth of the top N book levels on each side (mirrors what the
+    # liquidity check sums up). Slippage scales with size/depth.
+    depth_buy_usd:   float = 0.0
+    depth_sell_usd:  float = 0.0
+    # arb_opportunities row id — set when the scan logs this gap; lets
+    # _execute_arb update the row with executed=True post-fill.
+    opportunity_log_id: Optional[int] = None
+    # Funding-rate arb only — % per 8h that triggered the opportunity.
+    funding_rate_pct: Optional[float] = None
 
 
 @dataclass
@@ -72,6 +84,11 @@ class ArbResult:
     net_pnl_usd:    float
     execution_ms:   float
     error:          Optional[str] = None
+    # "executed" on the happy path; "balance_fail" when capital gate
+    # blocked. Mirrors arb_trades.status.
+    status:            str   = "executed"
+    slippage_buy_pct:  Optional[float] = None
+    slippage_sell_pct: Optional[float] = None
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -119,6 +136,24 @@ def _liquidity_usd(levels: list, depth: int = 3) -> float:
     return total
 
 
+def slippage_pct(base_spread_pct: float, size_usd: float, depth_usd: float) -> float:
+    """Depth-aware slippage model:
+
+        slip = base_spread * sqrt(size_usd / depth_usd)
+
+    Clamped to [ARB_SLIPPAGE_MIN_PCT, ARB_SLIPPAGE_MAX_PCT].  Used both
+    by sim fills and by the spot/perp legs of FundingRateArbEngine.
+    """
+    if depth_usd <= 0 or base_spread_pct <= 0 or size_usd <= 0:
+        slip = settings.ARB_SLIPPAGE_MIN_PCT
+    else:
+        slip = base_spread_pct * (size_usd / depth_usd) ** 0.5
+    return max(
+        settings.ARB_SLIPPAGE_MIN_PCT,
+        min(settings.ARB_SLIPPAGE_MAX_PCT, slip),
+    )
+
+
 # ─────────────────────────────────────────────────────────────────────────
 # ArbEngine
 # ─────────────────────────────────────────────────────────────────────────
@@ -161,6 +196,12 @@ class ArbEngine:
         self._consecutive_losses: int              = 0
         self._last_opportunity:   Optional[str]    = None
         self._last_trade_time:    Optional[datetime] = None
+
+        # Pre-execution capital gate counter — incremented every time a
+        # would-be arb is blocked because one side doesn't have enough
+        # free balance. Surfaced via get_stats() so the dashboard can
+        # show how many real misses pre-positioning cost us.
+        self.missed_balance_checks: int = 0
 
         # Concurrency primitives
         self._symbol_locks: dict[str, asyncio.Lock] = {
@@ -231,14 +272,15 @@ class ArbEngine:
     def get_stats(self) -> dict:
         """Return a stats dict — ArbAgentWrapper translates this to AgentStats."""
         return {
-            "status":             self._status,
-            "daily_pnl":          self._daily_pnl_usd,
-            "total_pnl":          self._total_pnl_usd,
-            "total_trades":       self._total_trades,
-            "consecutive_losses": self._consecutive_losses,
-            "active_arbs":        self._active_arbs,
-            "last_opportunity":   self._last_opportunity,
-            "last_trade_time":    self._last_trade_time.isoformat() if self._last_trade_time else None,
+            "status":                self._status,
+            "daily_pnl":             self._daily_pnl_usd,
+            "total_pnl":             self._total_pnl_usd,
+            "total_trades":          self._total_trades,
+            "consecutive_losses":    self._consecutive_losses,
+            "active_arbs":           self._active_arbs,
+            "last_opportunity":      self._last_opportunity,
+            "last_trade_time":       self._last_trade_time.isoformat() if self._last_trade_time else None,
+            "missed_balance_checks": self.missed_balance_checks,
         }
 
     # ── Scan loop ───────────────────────────────────────────────────────
@@ -275,7 +317,14 @@ class ArbEngine:
     async def _find_best_opportunity(self) -> Optional[ArbOpportunity]:
         """Fetch every (exchange, pair) book once, then evaluate every
         cross-exchange combination both directions. Returns the best
-        above-threshold opportunity, or None."""
+        above-threshold opportunity, or None.
+
+        Side effect: every detected gap that passes the liquidity check
+        is logged to arb_opportunities, regardless of whether it clears
+        the execution threshold. The best above-threshold candidate
+        carries its opportunity-row id so _execute_arb can mark it as
+        executed after the trade fires.
+        """
         ex_names = list(self._exchanges.keys())
         if len(ex_names) < 2:
             return None
@@ -301,6 +350,8 @@ class ArbEngine:
                     if not book_a or not book_b:
                         continue
                     asks_a = book_a.get("asks") or []
+                    bids_a = book_a.get("bids") or []
+                    asks_b = book_b.get("asks") or []
                     bids_b = book_b.get("bids") or []
                     if not asks_a or not bids_b:
                         continue
@@ -313,20 +364,58 @@ class ArbEngine:
                         continue
 
                     gross, net = net_gap_pct(buy_price, sell_price, a, b, settings.ARB_FEE_MAP)
-                    if net < min_gap_threshold(a, b):
-                        continue
 
                     ask_liq = _liquidity_usd(asks_a)
                     bid_liq = _liquidity_usd(bids_b)
                     if ask_liq < settings.ARB_MIN_LIQUIDITY_USD or bid_liq < settings.ARB_MIN_LIQUIDITY_USD:
                         continue
 
-                    # Three independent caps: the legacy per-trade max,
-                    # 10% of order-book depth, and the per-exchange
-                    # capital budget (FIX 6 — keeps any single venue's
-                    # exposure bounded by the agent allocation).
+                    # Per-side bid-ask spread feeds the depth-aware
+                    # slippage model. Fall back to 0 when one side is
+                    # missing (treated as "no info"; slippage clamps to
+                    # the configured minimum).
+                    spread_buy_pct  = 0.0
+                    spread_sell_pct = 0.0
+                    if bids_a:
+                        try:
+                            best_bid_a = float(bids_a[0][0])
+                            if buy_price > 0:
+                                spread_buy_pct = (buy_price - best_bid_a) / buy_price * 100.0
+                        except (TypeError, IndexError, ValueError):
+                            pass
+                    if asks_b:
+                        try:
+                            best_ask_b = float(asks_b[0][0])
+                            if sell_price > 0:
+                                spread_sell_pct = (best_ask_b - sell_price) / sell_price * 100.0
+                        except (TypeError, IndexError, ValueError):
+                            pass
+
+                    threshold = min_gap_threshold(a, b)
+                    above_threshold = net >= threshold
+
+                    # Log every above-liquidity gap, even sub-threshold
+                    # ones — execution-rate stats only mean something
+                    # when we know the denominator.
+                    opp_log_id = self._log_opportunity(
+                        symbol=sym, buy_ex=a, sell_ex=b,
+                        gap_pct=net, threshold_pct=threshold,
+                        above_threshold=above_threshold,
+                        depth_buy_usd=ask_liq, depth_sell_usd=bid_liq,
+                    )
+
+                    if not above_threshold:
+                        continue
+
+                    # Dynamic position sizing — wider gaps get bigger
+                    # positions, capped at ARB_SIZE_MULTIPLIER_CAP × base.
+                    # Still respect the 10%-of-depth liquidity cap and
+                    # the per-exchange capital budget.
+                    gap_ratio = net / threshold if threshold > 0 else 1.0
+                    size_multiplier = min(gap_ratio, settings.ARB_SIZE_MULTIPLIER_CAP)
+                    dynamic_size = settings.ARB_BASE_POSITION_USD * size_multiplier
                     max_size = min(
-                        settings.ARB_MAX_POSITION_USD,
+                        dynamic_size,
                         min(ask_liq, bid_liq) * 0.10,
                         settings.ARB_CAPITAL_PER_EXCHANGE,
                     )
@@ -336,10 +425,24 @@ class ArbEngine:
                         buy_price=buy_price, sell_price=sell_price,
                         gross_gap_pct=gross, net_gap_pct=net,
                         max_size_usd=max_size, detected_at=time.monotonic(),
+                        spread_buy_pct=spread_buy_pct,
+                        spread_sell_pct=spread_sell_pct,
+                        depth_buy_usd=ask_liq, depth_sell_usd=bid_liq,
+                        opportunity_log_id=opp_log_id,
                     )
                     if best is None or candidate.net_gap_pct > best.net_gap_pct:
                         best = candidate
         return best
+
+    @staticmethod
+    def _log_opportunity(**kwargs) -> Optional[int]:
+        """Safe wrapper around db_queries.log_arb_opportunity — never
+        let a DB hiccup take down the scan loop."""
+        try:
+            return db_queries.log_arb_opportunity(**kwargs)
+        except Exception as e:
+            logger.debug(f"log_arb_opportunity: {e}")
+            return None
 
     async def _safe_fetch_book(self, ex, sym: str):
         try:
@@ -364,8 +467,28 @@ class ArbEngine:
             start_t = time.perf_counter()
             try:
                 size_base = opp.max_size_usd / opp.buy_price if opp.buy_price > 0 else 0.0
+
+                # Hard capital gate — must pass before any leg fires.
+                ok, detail = await self._check_balances(opp, size_base)
+                if not ok:
+                    self.missed_balance_checks += 1
+                    logger.warning(f"arb balance_fail {opp.symbol}: {detail}")
+                    try:
+                        db_queries.log_arb_balance_fail(
+                            symbol=opp.symbol,
+                            buy_exchange=opp.buy_exchange,
+                            sell_exchange=opp.sell_exchange,
+                            detail=detail or "",
+                            sim_mode=self.sim_mode,
+                        )
+                    except Exception as e:
+                        logger.debug(f"log_arb_balance_fail: {e}")
+                    return
+
+                slip_buy_pct: Optional[float] = None
+                slip_sell_pct: Optional[float] = None
                 if self.sim_mode:
-                    buy_fill, sell_fill = self._sim_fills(opp)
+                    buy_fill, sell_fill, slip_buy_pct, slip_sell_pct = self._sim_fills(opp)
                 else:
                     buy_fill, sell_fill = await self._live_fills(opp, size_base)
 
@@ -381,10 +504,14 @@ class ArbEngine:
                     buy_fill=buy_fill, sell_fill=sell_fill,
                     gross_pnl_usd=gross_pnl, net_pnl_usd=net_pnl,
                     execution_ms=(time.perf_counter() - start_t) * 1000.0,
+                    status="executed",
+                    slippage_buy_pct=slip_buy_pct,
+                    slippage_sell_pct=slip_sell_pct,
                 )
                 self._update_stats(result)
                 self._notify_dashboard(result)
-                self._log_to_db(result)
+                trade_id = self._log_to_db(result)
+                self._mark_opportunity_executed(opp.opportunity_log_id, trade_id)
             except Exception as e:
                 logger.error(f"arb execute {opp.symbol}: {e}")
                 result = ArbResult(
@@ -399,10 +526,106 @@ class ArbEngine:
             finally:
                 self._active_arbs = max(0, self._active_arbs - 1)
 
-    def _sim_fills(self, opp: ArbOpportunity) -> tuple[float, float]:
-        """+/- 0.02% slippage model — represents realistic market impact
-        without making an exchange call."""
-        return opp.buy_price * 1.0002, opp.sell_price * 0.9998
+    async def _check_balances(
+        self,
+        opp: ArbOpportunity,
+        size_base: float,
+    ) -> tuple[bool, Optional[str]]:
+        """Hard pre-execution capital gate.
+
+        Buy side must hold ``size_usd × (1 + buffer)`` in the quote
+        currency; sell side must hold ``size_base × (1 + buffer)`` of
+        the base currency. In live mode, an unavailable balance API is
+        a fail. In sim mode, we treat an unavailable balance API as
+        "ok" — the configured EXCHANGE_BALANCES are the source of truth
+        when no exchange keys are wired up.
+        """
+        if "/" in opp.symbol:
+            base_ccy, quote_ccy = opp.symbol.split("/", 1)
+        else:
+            base_ccy, quote_ccy = opp.symbol, "USDT"
+
+        buffer = 1.0 + settings.ARB_BALANCE_BUFFER_PCT / 100.0
+        required_quote = opp.max_size_usd * buffer
+        required_base  = size_base        * buffer
+
+        buy_free  = await self._fetch_free_balance(
+            self._exchanges.get(opp.buy_exchange),  quote_ccy,
+        )
+        sell_free = await self._fetch_free_balance(
+            self._exchanges.get(opp.sell_exchange), base_ccy,
+        )
+
+        if buy_free is None or sell_free is None:
+            if not self.sim_mode:
+                return False, "fetch_balance unavailable on one or both exchanges"
+            return True, None
+
+        if buy_free < required_quote:
+            return False, (
+                f"{opp.buy_exchange} {quote_ccy} free={buy_free:.4f} "
+                f"< required={required_quote:.4f}"
+            )
+        if sell_free < required_base:
+            return False, (
+                f"{opp.sell_exchange} {base_ccy} free={sell_free:.8f} "
+                f"< required={required_base:.8f}"
+            )
+        return True, None
+
+    @staticmethod
+    async def _fetch_free_balance(ex, ccy: str) -> Optional[float]:
+        """Return the free balance of `ccy` on `ex`, or None if the
+        balance API is unavailable or returned unparseable shape."""
+        if ex is None:
+            return None
+        fetch = getattr(ex, "fetch_balance", None)
+        if fetch is None:
+            return None
+        try:
+            res = fetch()
+            bal = await res if asyncio.iscoroutine(res) else res
+        except Exception as e:
+            logger.debug(f"fetch_balance failed: {e}")
+            return None
+        if not isinstance(bal, dict):
+            return None
+        free = bal.get("free")
+        if not isinstance(free, dict):
+            return None
+        try:
+            return float(free.get(ccy, 0) or 0)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _mark_opportunity_executed(opp_id: Optional[int], trade_id: Optional[int]) -> None:
+        if opp_id is None:
+            return
+        try:
+            db_queries.mark_arb_opportunity_executed(opp_id, trade_id)
+        except Exception as e:
+            logger.debug(f"mark_arb_opportunity_executed: {e}")
+
+    def _sim_fills(
+        self,
+        opp: ArbOpportunity,
+    ) -> tuple[float, float, float, float]:
+        """Depth-aware slippage applied independently to each leg.
+
+        Returns (buy_fill, sell_fill, slip_buy_pct, slip_sell_pct). The
+        per-leg slippage is also surfaced on the ArbResult so the DB
+        row captures what the model thought the impact was.
+        """
+        slip_buy_pct = slippage_pct(
+            opp.spread_buy_pct, opp.max_size_usd, opp.depth_buy_usd,
+        )
+        slip_sell_pct = slippage_pct(
+            opp.spread_sell_pct, opp.max_size_usd, opp.depth_sell_usd,
+        )
+        buy_fill  = opp.buy_price  * (1.0 + slip_buy_pct  / 100.0)
+        sell_fill = opp.sell_price * (1.0 - slip_sell_pct / 100.0)
+        return buy_fill, sell_fill, slip_buy_pct, slip_sell_pct
 
     async def _live_fills(
         self,
@@ -446,11 +669,12 @@ class ArbEngine:
         except Exception as e:
             logger.debug(f"dashboard.add_arb: {e}")
 
-    def _log_to_db(self, result: ArbResult) -> None:
+    def _log_to_db(self, result: ArbResult) -> Optional[int]:
         try:
-            db_queries.log_arb_trade(result, sim_mode=self.sim_mode)
+            return db_queries.log_arb_trade(result, sim_mode=self.sim_mode)
         except Exception as e:
             logger.debug(f"log_arb_trade: {e}")
+            return None
 
     # ── Circuit breakers ────────────────────────────────────────────────
 
@@ -504,3 +728,165 @@ class ArbEngine:
             except Exception as e:
                 logger.warning(f"  {name}: failed to build client — {e}")
         return clients
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# FundingRateArbEngine — sibling engine for funding-rate carry
+# ─────────────────────────────────────────────────────────────────────────
+#
+# Strategy: when a perpetual's funding rate exceeds
+# ARB_FUNDING_RATE_MIN_PCT (per 8h), open spot-long + perp-short. The
+# position is directionally neutral and earns the funding rate until it
+# decays below ARB_FUNDING_RATE_EXIT_PCT.
+#
+# Data source: Coinglass (wired in phase 2, see data_sources/). Until
+# the connector ships, fetch_funding_rates() returns an empty dict and
+# logs a warning — the rest of the engine machinery (lifecycle,
+# circuit breakers, stats) exists so it can be slotted in without code
+# changes once the data arrives.
+#
+# Circuit breakers mirror ArbEngine but use independent thresholds —
+# funding-rate carry has a different loss profile than cross-exchange
+# arb and shouldn't share the same halt limits.
+
+class FundingRateArbEngine:
+    """Funding-rate carry engine. Stub until Coinglass is connected.
+
+    Construct with no args in normal operation. Tests can pass
+    `sim_mode=True` to force the offline behaviour.
+    """
+
+    def __init__(
+        self,
+        sim_mode: Optional[bool] = None,
+        dashboard=None,
+    ):
+        self.sim_mode  = settings.SIM_MODE if sim_mode is None else sim_mode
+        self.dashboard = dashboard
+
+        self._running:     bool          = False
+        self._status:      str           = STATUS_OFFLINE
+        self._scan_task                  = None
+        self._reset_task                 = None
+
+        # Independent circuit-breaker state
+        self._daily_pnl_usd:      float            = 0.0
+        self._total_pnl_usd:      float            = 0.0
+        self._total_trades:       int              = 0
+        self._consecutive_losses: int              = 0
+        self._last_trade_time:    Optional[datetime] = None
+
+        # Tracks whether the Coinglass warning has been emitted, so
+        # we don't spam the log on every scan tick.
+        self._coinglass_warned: bool = False
+
+    # ── Public API ──────────────────────────────────────────────────────
+
+    async def start(self) -> None:
+        """Boot the funding-rate watch loop. Returns when stop() flips
+        _running. The current implementation is a stub that yields
+        forever — no rates available until Coinglass is wired."""
+        self._running = True
+        self._status  = STATUS_RUNNING
+        self._scan_task  = asyncio.create_task(self._scan_loop())
+        self._reset_task = asyncio.create_task(self._daily_reset_loop())
+        await asyncio.gather(self._scan_task, self._reset_task,
+                             return_exceptions=True)
+
+    async def stop(self) -> None:
+        self._running = False
+        for task in (self._scan_task, self._reset_task):
+            if task is not None and not task.done():
+                task.cancel()
+        self._status = STATUS_STOPPED
+
+    async def close_all_positions(self) -> None:
+        try:
+            db_queries.log_circuit_breaker(
+                reason="funding_arb_kill",
+                detail=f"daily_pnl=${self._daily_pnl_usd:.2f}",
+            )
+        except Exception:
+            pass
+        self._status = STATUS_STOPPED
+
+    def get_stats(self) -> dict:
+        return {
+            "status":             self._status,
+            "daily_pnl":          self._daily_pnl_usd,
+            "total_pnl":          self._total_pnl_usd,
+            "total_trades":       self._total_trades,
+            "consecutive_losses": self._consecutive_losses,
+            "last_trade_time":    self._last_trade_time.isoformat() if self._last_trade_time else None,
+        }
+
+    # ── Data layer (stubbed) ────────────────────────────────────────────
+
+    async def fetch_funding_rates(self) -> dict:
+        """Return current funding rates per symbol.
+
+        Stub: Coinglass connector lives in data_sources/ (phase 2).
+        Returns an empty dict and logs a one-time warning. Replace the
+        body once data_sources.coinglass exposes a funding-rate getter.
+        """
+        if not self._coinglass_warned:
+            logger.warning(
+                "FundingRateArbEngine: Coinglass not yet connected — "
+                "fetch_funding_rates returning empty"
+            )
+            self._coinglass_warned = True
+        return {}
+
+    # ── Scan loop ───────────────────────────────────────────────────────
+
+    async def _scan_loop(self) -> None:
+        """Periodically pull funding rates; surface eligible carries.
+
+        With no data source wired, this is a no-op heartbeat that keeps
+        the engine alive (so circuit-breaker checks still tick) until
+        Coinglass arrives.
+        """
+        interval = settings.ARB_SCAN_INTERVAL_MS / 1000.0
+        while self._running:
+            try:
+                if self._cb_triggered():
+                    if self._status != STATUS_HALTED:
+                        logger.warning(
+                            "FundingRateArbEngine: circuit breaker triggered — HALTED"
+                        )
+                    self._status = STATUS_HALTED
+                    await asyncio.sleep(interval)
+                    continue
+                rates = await self.fetch_funding_rates()
+                if rates:
+                    # When Coinglass is wired up, this branch evaluates
+                    # rates and fires spot-long + perp-short trades.
+                    # Today it never executes.
+                    pass
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(f"funding arb scan loop: {e}", exc_info=True)
+            await asyncio.sleep(interval)
+
+    # ── Circuit breakers ────────────────────────────────────────────────
+
+    def _cb_triggered(self) -> bool:
+        if self._daily_pnl_usd <= -settings.ARB_FUNDING_DAILY_LOSS_HALT_USD:
+            return True
+        if self._consecutive_losses >= settings.ARB_FUNDING_CONSECUTIVE_LOSS_HALT:
+            return True
+        return False
+
+    async def _daily_reset_loop(self) -> None:
+        while self._running:
+            now = datetime.utcnow()
+            tomorrow_midnight = (now + timedelta(days=1)).replace(
+                hour=0, minute=0, second=0, microsecond=0,
+            )
+            try:
+                await asyncio.sleep((tomorrow_midnight - now).total_seconds())
+            except asyncio.CancelledError:
+                raise
+            self._daily_pnl_usd = 0.0
+            logger.info("FundingRateArbEngine: daily P&L reset at UTC midnight")
