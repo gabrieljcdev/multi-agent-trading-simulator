@@ -556,6 +556,20 @@ STRATEGY_EXCHANGE_MAP = {
 SCALP_CAPITAL             = 0.0     # test: 0-100   ($0 = observation only)
 SCALP_PAIRS               = ["BTC/USDT", "ETH/USDT"]
 
+# MEXC supports per-key pair allowlists — one account can hold many API
+# keys, each restricted to a different subset of pairs. The scalper
+# routes each pair through the right key via this map. Key index is
+# 1-based and matches the MEXC_KEY_{N}_API_KEY / _SECRET env vars in
+# config/keys.env. Pairs not listed here can't be traded on MEXC;
+# extend the map (and add the matching env vars) when you provision
+# a new key. Empty by default so observation mode runs without keys.
+MEXC_PAIR_KEY_MAP: dict[str, int] = {
+    # "BTC/USDT": 1,
+    # "ETH/USDT": 1,
+    # "SOL/USDT": 2,
+    # ... — fill in as keys are provisioned.
+}
+
 # Fee-aware profit targeting — TP/SL are computed dynamically, not fixed.
 SCALP_NET_PROFIT_TARGET_BPS  = 3.0   # test: 2.0-8.0   (net profit after fees)
 SCALP_RR_RATIO               = 1.6   # test: 1.3-2.5   (tp_bps / sl_bps)

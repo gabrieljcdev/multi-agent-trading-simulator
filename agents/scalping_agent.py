@@ -45,7 +45,9 @@ TODO comment in this file:
   _get_mid_price(symbol, exchange)   → wire to market_data.get_mid_price
   _get_spread_bps(symbol, exchange)  → wire to market_data.get_spread_bps
   _get_regime(symbol)                → wire to regime_detector.get
-  _get_ccxt_exchange(exchange_id)    → wire to execution router pool
+  _get_ccxt_exchange(exchange_id, symbol=...) → MEXC routes through
+      execution.mexc_key_router (one account, many pair-restricted
+      keys); other exchanges fall through to market_data._exchanges.
 
 Until wired, FeeManager falls back to SCALP_FEE_OVERRIDES (correct
 MEXC + Bitget values hardcoded) and observation mode hums along.
@@ -752,15 +754,33 @@ class ScalpingAgent(BaseAgent):
         # compares against uppercase strings.
         return str(snap.regime).upper()
 
-    async def _get_ccxt_exchange(self, exchange_id: str):
-        """Return a live ccxt client for `exchange_id` from MarketData's
-        connection pool, or None.
+    async def _get_ccxt_exchange(self, exchange_id: str, symbol: Optional[str] = None):
+        """Return a live ccxt client for `exchange_id`, or None.
 
-        Useful for FeeManager.load_exchange when the venue is already
-        in settings.ENABLED_EXCHANGES (e.g. bitget). MEXC isn't in the
-        pool — FeeManager falls through to SCALP_FEE_OVERRIDES, which
-        is exactly the documented contract.
+        MEXC supports per-key pair allowlists — one account, many keys,
+        each restricted to a subset of pairs. When exchange_id == "mexc"
+        the symbol parameter chooses the right key via
+        execution.mexc_key_router. With no symbol (e.g. fee pre-warm)
+        the router returns any constructable MEXC client.
+
+        Every other exchange falls through to MarketData's connection
+        pool — that's where bitget / binance / kraken clients live.
         """
+        if exchange_id == "mexc":
+            try:
+                from execution.mexc_key_router import mexc_key_router
+            except Exception as e:
+                log.debug("[ScalpingAgent] mexc_key_router import failed: %s", e)
+                return None
+            client = (
+                mexc_key_router.get_client_for(symbol) if symbol
+                else mexc_key_router.any_client()
+            )
+            if client is not None:
+                return client
+            # No symbol match (or symbol omitted with no usable key) —
+            # fall through to MarketData in case an installer wired a
+            # single shared MEXC client there.
         md = self._resolve_market_data()
         if md is None:
             return None
