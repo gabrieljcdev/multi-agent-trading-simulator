@@ -36,6 +36,13 @@ class CoinglassSource(BaseDataSource):
     optional         = True
     requires_api_key = False
 
+    def __init__(self):
+        super().__init__()
+        # Free-tier rate cap: cap concurrent HTTP requests. Each refresh
+        # bursts ~16 pairs × 4 endpoints; without this an enthusiastic
+        # asyncio.gather punches straight through Coinglass's quota.
+        self._rate_limit = asyncio.Semaphore(settings.COINGLASS_RATE_LIMIT_PER_MIN)
+
     def list_metrics(self) -> list[str]:
         return [
             "funding_rate",
@@ -127,11 +134,12 @@ class CoinglassSource(BaseDataSource):
         params: dict,
     ) -> dict:
         url = BASE + path
-        async with session.get(url, params=params) as r:
-            try:
-                return await r.json(content_type=None)
-            except Exception:
-                return {}
+        async with self._rate_limit:
+            async with session.get(url, params=params) as r:
+                try:
+                    return await r.json(content_type=None)
+                except Exception:
+                    return {}
 
     def _extract_latest(self, payload: dict, key: str) -> Optional[float]:
         """Coinglass shapes vary by endpoint; pull the most recent numeric

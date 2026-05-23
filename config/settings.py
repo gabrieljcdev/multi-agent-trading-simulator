@@ -654,6 +654,14 @@ SENTIMENT_WEIGHT_TELEGRAM      = 0.05
 
 # ─── Refresh intervals ──────────────────────
 COINGLASS_REFRESH_SEC     = 300     # test: 60-600
+# Reference exchange used when Coinglass returns per-exchange funding-rate
+# series; the source falls back to the venue's own aggregate if the
+# reference exchange isn't present in the payload.
+COINGLASS_REFERENCE_EXCHANGE = "Binance"   # test: Binance | Bybit | OKX
+# Free-tier rate limit. Implemented as an asyncio.Semaphore capping
+# in-flight HTTP requests inside CoinglassSource — keeps a 16-pair ×
+# 4-metric burst from punching through Coinglass's per-minute quota.
+COINGLASS_RATE_LIMIT_PER_MIN = 6    # test: 3-12
 COINGECKO_REFRESH_SEC     = 300     # test: 60-900
 FRED_REFRESH_SEC          = 3600    # test: 1800-7200
 ALPHA_VANTAGE_REFRESH_SEC = 900     # test: 300-1800

@@ -138,6 +138,51 @@ class DataSources:
                 snap[point.key] = point
         return snap
 
+    def get_latest(
+        self,
+        source_id: str,
+        metric:    str,
+        symbol:    Optional[str] = None,
+    ) -> Optional[DataPoint]:
+        """Sync cached read by (source_id, metric, symbol).
+
+        Equivalent to `data_sources.<source_id>.cached(metric, symbol)`
+        but with a stable signature consumers (funding-rate carry,
+        dashboard, macro modifier) can call without knowing the source
+        attribute name in advance. None on unknown source or missing
+        cache entry — no fetch is triggered.
+        """
+        source = getattr(self, source_id, None)
+        if source is None:
+            return None
+        return source.cached(metric, symbol)
+
+    def get_funding_rates(self) -> dict[str, float]:
+        """Latest funding rate per symbol across every available source.
+
+        Returns ``{symbol: rate}`` where rate is the source-native
+        decimal (0.0001 = 0.01% per 8h). When multiple registered
+        sources publish the same symbol the most recently observed
+        point wins (higher .timestamp). Empty when no source has
+        observed a funding rate yet — callers treat that as
+        "nothing to do" rather than an error.
+        """
+        out: dict[str, float] = {}
+        best_ts: dict[str, float] = {}
+        for source in self._sources:
+            if not source.is_available():
+                continue
+            for point in source.latest_points():
+                if point.metric != "funding_rate" or point.symbol is None:
+                    continue
+                if point.error is not None:
+                    continue
+                prev_ts = best_ts.get(point.symbol, -1.0)
+                if point.timestamp > prev_ts:
+                    out[point.symbol] = float(point.value)
+                    best_ts[point.symbol] = point.timestamp
+        return out
+
     # ─── Push API ────────────────────────────────────────────────────────
 
     def subscribe(

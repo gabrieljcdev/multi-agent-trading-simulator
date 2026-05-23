@@ -854,3 +854,102 @@ def test_get_data_at_time(temp_db):
     row = q.get_data_at_time("fred", "cpi", one_hour_ago)
     assert row is not None
     assert row.value == 100.0
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# DataSources.get_funding_rates — funding-rate-carry convenience API
+# ─────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_get_funding_rates_empty_when_nothing_cached():
+    """No source has cached a funding rate → empty dict, never None."""
+    s = StubSource([_pt("vix", 18.0)]); s.source_id = "stub"; s._cache.clear()
+    agg = DataSources(sources=[s])
+    assert agg.get_funding_rates() == {}
+
+
+@pytest.mark.asyncio
+async def test_get_funding_rates_returns_symbol_to_rate_map():
+    """Each source publishing funding_rate contributes one entry per
+    symbol; the dict maps symbol → most recently observed rate."""
+    s = StubSource([
+        _pt("funding_rate", 0.0001, symbol="BTC/USDT"),
+        _pt("funding_rate", 0.0002, symbol="ETH/USDT"),
+    ])
+    s.source_id = "coinglass"; s._cache.clear()
+    agg = DataSources(sources=[s])
+    with patch("database.queries.log_data_point"):
+        await agg.refresh_all()
+    rates = agg.get_funding_rates()
+    assert rates == {"BTC/USDT": 0.0001, "ETH/USDT": 0.0002}
+
+
+@pytest.mark.asyncio
+async def test_get_funding_rates_skips_errored_points():
+    """A DataPoint with error set must not appear in the dict — callers
+    consume rates as decisions, error placeholders would mislead them."""
+    s = StubSource([
+        _pt("funding_rate", 0.0001, symbol="BTC/USDT"),
+        _pt("funding_rate", 0.0,     symbol="SOL/USDT", error="no_data"),
+    ])
+    s.source_id = "coinglass"; s._cache.clear()
+    agg = DataSources(sources=[s])
+    with patch("database.queries.log_data_point"):
+        await agg.refresh_all()
+    rates = agg.get_funding_rates()
+    assert "BTC/USDT" in rates
+    assert "SOL/USDT" not in rates
+
+
+@pytest.mark.asyncio
+async def test_get_funding_rates_prefers_newest_when_multiple_sources():
+    """Two sources publish the same symbol — the newer timestamp wins."""
+    older = StubSource([_pt("funding_rate", 0.0001, symbol="BTC/USDT")])
+    older.source_id = "src_a"; older._cache.clear()
+    newer = StubSource([_pt("funding_rate", 0.0009, symbol="BTC/USDT")])
+    newer.source_id = "src_b"; newer._cache.clear()
+    agg = DataSources(sources=[older, newer])
+    with patch("database.queries.log_data_point"):
+        await agg.refresh_all()
+    # Force newer's cached point timestamp ahead of older's.
+    older._cache[next(iter(older._cache))].timestamp = 100.0
+    newer._cache[next(iter(newer._cache))].timestamp = 200.0
+    rates = agg.get_funding_rates()
+    assert rates["BTC/USDT"] == 0.0009
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# DataSources.get_latest — sync cached read
+# ─────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_get_latest_returns_cached_datapoint():
+    """get_latest must read straight from the source's cache — no fetch,
+    no await."""
+    s = StubSource([_pt("vix", 22.5)]); s.source_id = "av"; s._cache.clear()
+    agg = DataSources(sources=[s])
+    with patch("database.queries.log_data_point"):
+        await agg.refresh_all()
+    point = agg.get_latest("av", "vix")
+    assert point is not None
+    assert point.value == 22.5
+
+
+def test_get_latest_returns_none_for_unknown_source():
+    agg = DataSources(sources=[])
+    assert agg.get_latest("never_registered", "vix") is None
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# CoinglassSource — rate-limit semaphore
+# ─────────────────────────────────────────────────────────────────────────
+
+def test_coinglass_source_has_rate_limit_semaphore():
+    """CoinglassSource caps concurrent HTTP requests via an internal
+    asyncio.Semaphore sized to COINGLASS_RATE_LIMIT_PER_MIN — the cap
+    keeps a 16-pair × 4-endpoint burst from blowing through the free
+    tier quota."""
+    from config import settings
+    src = CoinglassSource()
+    assert isinstance(src._rate_limit, asyncio.Semaphore)
+    assert src._rate_limit._value == settings.COINGLASS_RATE_LIMIT_PER_MIN

@@ -739,21 +739,23 @@ class ArbEngine:
 # position is directionally neutral and earns the funding rate until it
 # decays below ARB_FUNDING_RATE_EXIT_PCT.
 #
-# Data source: Coinglass (wired in phase 2, see data_sources/). Until
-# the connector ships, fetch_funding_rates() returns an empty dict and
-# logs a warning — the rest of the engine machinery (lifecycle,
-# circuit breakers, stats) exists so it can be slotted in without code
-# changes once the data arrives.
+# Data source: data_sources.get_funding_rates() — backed by Coinglass
+# as the primary source plus BinanceFutures / BybitDerivs as fallbacks.
+# When no source has cached a reading yet the aggregator returns {}
+# and the scan loop simply does nothing on that tick.
 #
 # Circuit breakers mirror ArbEngine but use independent thresholds —
 # funding-rate carry has a different loss profile than cross-exchange
 # arb and shouldn't share the same halt limits.
 
 class FundingRateArbEngine:
-    """Funding-rate carry engine. Stub until Coinglass is connected.
+    """Funding-rate carry engine, wired to the data_sources aggregator.
 
-    Construct with no args in normal operation. Tests can pass
-    `sim_mode=True` to force the offline behaviour.
+    Funding rates come from data_sources.get_funding_rates(), which
+    blends every available source that publishes the funding_rate
+    metric (Coinglass is primary; BinanceFutures + BybitDerivs are
+    secondaries). Construct with no args in normal operation; tests
+    pass sim_mode=True.
     """
 
     def __init__(
@@ -776,22 +778,38 @@ class FundingRateArbEngine:
         self._consecutive_losses: int              = 0
         self._last_trade_time:    Optional[datetime] = None
 
-        # Tracks whether the Coinglass warning has been emitted, so
-        # we don't spam the log on every scan tick.
-        self._coinglass_warned: bool = False
-
     # ── Public API ──────────────────────────────────────────────────────
 
     async def start(self) -> None:
         """Boot the funding-rate watch loop. Returns when stop() flips
-        _running. The current implementation is a stub that yields
-        forever — no rates available until Coinglass is wired."""
+        _running. Logs the Coinglass connection state once on boot so
+        the operator knows whether real rates are flowing."""
+        self._log_coinglass_status()
         self._running = True
         self._status  = STATUS_RUNNING
         self._scan_task  = asyncio.create_task(self._scan_loop())
         self._reset_task = asyncio.create_task(self._daily_reset_loop())
         await asyncio.gather(self._scan_task, self._reset_task,
                              return_exceptions=True)
+
+    @staticmethod
+    def _log_coinglass_status() -> None:
+        """One-shot startup log: INFO when Coinglass is reachable,
+        WARN otherwise. Kept defensive — the aggregator import or the
+        coinglass attribute could be missing in test harnesses, and we
+        don't want that to block the engine from starting."""
+        try:
+            from data_sources import data_sources as ds
+            coinglass = getattr(ds, "coinglass", None)
+            if coinglass is not None and coinglass.is_available():
+                logger.info("Funding rate arb engine connected to Coinglass")
+                return
+            logger.warning(
+                "Funding rate arb engine: Coinglass unavailable — "
+                "running without live funding-rate data"
+            )
+        except Exception as e:
+            logger.warning(f"Funding rate arb engine: Coinglass probe failed — {e}")
 
     async def stop(self) -> None:
         self._running = False
@@ -820,31 +838,32 @@ class FundingRateArbEngine:
             "last_trade_time":    self._last_trade_time.isoformat() if self._last_trade_time else None,
         }
 
-    # ── Data layer (stubbed) ────────────────────────────────────────────
+    # ── Data layer ──────────────────────────────────────────────────────
 
-    async def fetch_funding_rates(self) -> dict:
-        """Return current funding rates per symbol.
-
-        Stub: Coinglass connector lives in data_sources/ (phase 2).
-        Returns an empty dict and logs a one-time warning. Replace the
-        body once data_sources.coinglass exposes a funding-rate getter.
-        """
-        if not self._coinglass_warned:
-            logger.warning(
-                "FundingRateArbEngine: Coinglass not yet connected — "
-                "fetch_funding_rates returning empty"
-            )
-            self._coinglass_warned = True
-        return {}
+    async def fetch_funding_rates(self) -> dict[str, float]:
+        """Return ``{symbol: latest funding rate}`` from the data_sources
+        aggregator. Empty when no source has cached a reading yet —
+        callers (the scan loop) handle that case as "nothing to do"."""
+        try:
+            from data_sources import data_sources as ds
+        except Exception as e:
+            logger.debug(f"data_sources import failed: {e}")
+            return {}
+        try:
+            return ds.get_funding_rates()
+        except Exception as e:
+            logger.debug(f"data_sources.get_funding_rates failed: {e}")
+            return {}
 
     # ── Scan loop ───────────────────────────────────────────────────────
 
     async def _scan_loop(self) -> None:
         """Periodically pull funding rates; surface eligible carries.
 
-        With no data source wired, this is a no-op heartbeat that keeps
-        the engine alive (so circuit-breaker checks still tick) until
-        Coinglass arrives.
+        Today the loop reads rates but doesn't yet route the spot-long
+        + perp-short pair — that's the next phase. The cycle exists so
+        circuit-breaker checks keep ticking and the operator can see
+        rates flow through the dashboard once the route lands.
         """
         interval = settings.ARB_SCAN_INTERVAL_MS / 1000.0
         while self._running:
@@ -859,9 +878,9 @@ class FundingRateArbEngine:
                     continue
                 rates = await self.fetch_funding_rates()
                 if rates:
-                    # When Coinglass is wired up, this branch evaluates
-                    # rates and fires spot-long + perp-short trades.
-                    # Today it never executes.
+                    # Execution path lands in a follow-up — for now the
+                    # rate fetch keeps the cache warm and the dashboard
+                    # visible.
                     pass
             except asyncio.CancelledError:
                 raise

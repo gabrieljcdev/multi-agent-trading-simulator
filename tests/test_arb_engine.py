@@ -600,14 +600,31 @@ async def test_opportunity_log_records_executed_gaps_with_trade_id(monkeypatch):
 # ─────────────────────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_funding_arb_engine_stub_returns_empty_without_coinglass(caplog):
-    """fetch_funding_rates returns an empty dict and emits one warning
-    when no data source is wired."""
+async def test_funding_arb_engine_pulls_from_data_sources(monkeypatch):
+    """fetch_funding_rates must read from the data_sources aggregator —
+    no in-engine stub. Patching the aggregator's get_funding_rates
+    flows straight through to the engine's return value."""
+    import data_sources as ds_mod
+
+    expected = {"BTC/USDT": 0.0001, "ETH/USDT": 0.00025}
+    monkeypatch.setattr(ds_mod.data_sources, "get_funding_rates",
+                        lambda: dict(expected))
+
     engine = FundingRateArbEngine(sim_mode=True)
-    with caplog.at_level("WARNING"):
-        out = await engine.fetch_funding_rates()
+    out = await engine.fetch_funding_rates()
+    assert out == expected
+
+
+@pytest.mark.asyncio
+async def test_funding_arb_engine_returns_empty_when_no_coinglass_data(monkeypatch):
+    """When no source has cached a funding rate yet, the engine returns
+    an empty dict instead of raising — the scan loop treats that as
+    'nothing to do' on that tick."""
+    import data_sources as ds_mod
+    monkeypatch.setattr(ds_mod.data_sources, "get_funding_rates", lambda: {})
+    engine = FundingRateArbEngine(sim_mode=True)
+    out = await engine.fetch_funding_rates()
     assert out == {}
-    assert any("Coinglass" in r.message for r in caplog.records)
 
 
 def test_funding_arb_circuit_breaker_halts_on_daily_loss():
