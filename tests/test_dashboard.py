@@ -615,3 +615,207 @@ def test_arb_panel_handles_missing_missed_balance_attr():
     text = _render_to_string(dash._panel_arb_feed())
     assert "Missed (balance):" in text
     assert "0" in text
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# SCALP FEED panel — header, OFI strip, positions, recent closed, stats
+# ─────────────────────────────────────────────────────────────────────────
+
+def test_scalp_panel_placeholder_when_no_agent():
+    """No scalp agent registered (default _scalp_data_cache shape) → dim
+    placeholder panel, never raises."""
+    dash = Dashboard(_mock_bot())
+    text = _render_to_string(dash._panel_scalp_feed())
+    assert "Scalp agent not registered" in text
+
+
+def test_scalp_panel_renders_header_and_sections_when_available():
+    """When _scalp_data_cache is populated, the panel renders every
+    section: header (with venue ticks), OFI strip, positions table,
+    closed observations, stats bar."""
+    dash = Dashboard(_mock_bot())
+    dash._scalp_data_cache = {
+        "available": True,
+        "live":      False,                  # obs-mode
+        "fee_viability": {
+            "mexc":   {"viable": True},
+            "bitget": {"viable": False},
+        },
+        "ofi_top": [
+            {"symbol": "BTC/USDT", "exchange": "mexc",
+             "z": 2.3, "direction": "LONG", "strength": "strong", "stale": False},
+            {"symbol": "ETH/USDT", "exchange": "bitget",
+             "z": -1.6, "direction": "SHORT", "strength": "moderate", "stale": False},
+        ],
+        "open_positions": [
+            {"symbol": "BTC/USDT", "exchange": "mexc", "direction": "LONG",
+             "entry": 100000.0, "tp": 100500.0, "sl": 99700.0,
+             "unrealised_bps": 4.2, "hold_sec": 42.0},
+        ],
+        "recent_closed": [
+            {"symbol": "BTC/USDT", "direction": "LONG", "exit_reason": "TP_HIT",
+             "gross_bps": 8.0, "net_bps": 6.0, "hold_sec": 35.0},
+            {"symbol": "ETH/USDT", "direction": "SHORT", "exit_reason": "OFI_EXHAUSTED",
+             "gross_bps": -3.0, "net_bps": -5.0, "hold_sec": 50.0},
+        ],
+        "stats": {
+            "total_evaluated":   142,
+            "would_enter":       18,
+            "closed":            12,
+            "win_rate":          0.58,
+            "avg_pnl_net_bps":   3.4,
+            "daily_loss_usd":    0.0,
+            "fee_viability":     {},
+        },
+    }
+    text = _render_to_string(dash._panel_scalp_feed())
+
+    # Header bits
+    assert "SCALP"       in text
+    assert "OFI-Primary" in text
+    assert "MEXC"        in text
+    assert "BITGET"      in text
+    assert "obs-mode"    in text
+
+    # OFI strip — top 5 by |z|
+    assert "BTC/USDT" in text
+    assert "ETH/USDT" in text
+    assert "+2.30"    in text          # signed format for the LONG row
+    assert "-1.60"    in text          # SHORT row
+
+    # Open positions
+    assert "100000"   in text or "100,000" in text
+    assert "LONG"     in text
+
+    # Recent closed
+    assert "TP_HIT"        in text
+    assert "OFI_EXHAUSTED" in text
+
+    # Stats bar
+    assert "evaluated"   in text
+    assert "would-enter" in text
+    assert "wr"          in text
+    assert "58%"         in text
+    assert "avg-net"     in text
+
+
+def test_scalp_panel_shows_live_label_when_capital_positive():
+    """SCALP_CAPITAL > 0 → header shows LIVE (red), not obs-mode."""
+    dash = Dashboard(_mock_bot())
+    dash._scalp_data_cache = {
+        "available": True, "live": True,
+        "fee_viability": {}, "ofi_top": [],
+        "open_positions": [], "recent_closed": [], "stats": {},
+    }
+    text = _render_to_string(dash._panel_scalp_feed())
+    assert "LIVE"     in text
+    assert "obs-mode" not in text
+
+
+def test_scalp_panel_handles_missing_agent_state(monkeypatch):
+    """Coordinator present but no scalp agent registered — _snapshot_scalp_agent
+    must return the empty shape, panel renders the placeholder."""
+    coord = SimpleNamespace(_agents=[])
+    dash = Dashboard(_mock_bot(), coordinator=coord)
+    snap = dash._snapshot_scalp_agent()
+    assert snap["available"] is False
+    text = _render_to_string(dash._panel_scalp_feed())
+    assert "Scalp agent not registered" in text
+
+
+def test_scalp_snapshot_handles_observation_summary_failure():
+    """If get_observation_summary raises, the snapshot still returns
+    'available' True with zeroed stats — the panel must still render."""
+    class _BoomAgent:
+        agent_id = "scalp"
+        _capital = 0.0
+        _positions = {}
+        _observations = []
+        _ofi_engine = None
+        def get_observation_summary(self):
+            raise RuntimeError("synthetic failure")
+
+    coord = SimpleNamespace(_agents=[_BoomAgent()])
+    dash = Dashboard(_mock_bot(), coordinator=coord)
+    snap = dash._snapshot_scalp_agent()
+    assert snap["available"] is True
+    assert snap["stats"] == {}
+    # Panel must still render without raising
+    dash._scalp_data_cache = snap
+    text = _render_to_string(dash._panel_scalp_feed())
+    assert "SCALP" in text
+
+
+def test_scalp_snapshot_sorts_ofi_by_abs_z():
+    """The snapshot helper ranks OFI entries by absolute z, descending —
+    biggest conviction first regardless of sign. (The panel renders
+    whatever order the snapshot provides; sorting is the snapshot's
+    job.)"""
+    class _StubEngine:
+        def __init__(self, by_key):
+            self._by_key = by_key
+        def get(self, sym, ex):
+            return self._by_key.get((sym, ex), {"z": 0.0})
+
+    class _StubAgent:
+        agent_id = "scalp"
+        _capital = 0.0
+        _positions = {}
+        _observations = []
+        def __init__(self):
+            self._ofi_engine = _StubEngine({
+                ("AAA/USDT", "mexc"): {"z":  2.5, "direction": "LONG",
+                                       "strength": "strong",   "stale": False},
+                ("BBB/USDT", "mexc"): {"z": -3.1, "direction": "SHORT",
+                                       "strength": "strong",   "stale": False},
+                ("CCC/USDT", "mexc"): {"z":  0.5, "direction": "NEUTRAL",
+                                       "strength": "weak",     "stale": False},
+            })
+        def get_observation_summary(self):
+            return {}
+
+    # Restrict the (symbol × exchange) sweep to the three test symbols and
+    # one exchange so the snapshot sees exactly our crafted rows.
+    from config import settings as s
+    import unittest.mock as _mock
+    with _mock.patch.object(s, "SCALP_PAIRS",
+                            ["AAA/USDT", "BBB/USDT", "CCC/USDT"]), \
+         _mock.patch.dict(s.STRATEGY_EXCHANGE_MAP, {"scalp": ["mexc"]}):
+        coord = SimpleNamespace(_agents=[_StubAgent()])
+        dash = Dashboard(_mock_bot(), coordinator=coord)
+        snap = dash._snapshot_scalp_agent()
+    symbols = [r["symbol"] for r in snap["ofi_top"]]
+    # BBB (|z|=3.1) > AAA (|z|=2.5) > CCC (|z|=0.5)
+    assert symbols[:3] == ["BBB/USDT", "AAA/USDT", "CCC/USDT"]
+
+
+def test_full_dashboard_includes_scalp_row(monkeypatch):
+    """Smoke: the full render() now includes the scalp row without raising,
+    and the row exposes the panel under its named layout slot."""
+    monkeypatch.setattr("database.queries.get_today_trades", lambda: [])
+    monkeypatch.setattr("database.queries.get_open_trades", lambda: [])
+    monkeypatch.setattr("database.queries.get_recent_closed_trades",
+                        lambda limit=10: [])
+    monkeypatch.setattr("database.queries.get_signal_win_rate",
+                        lambda **kw: {"total": 0, "win_rate": 0.0})
+    monkeypatch.setattr("database.queries.get_today_skipped_signals", lambda: 0)
+    monkeypatch.setattr("database.queries.get_arb_opportunity_stats",
+                        lambda: {"total_detected": 0, "total_executed": 0,
+                                 "execution_rate_pct": 0.0,
+                                 "avg_gap_pct": 0.0, "max_gap_pct": 0.0,
+                                 "top_pairs": []})
+    dash = Dashboard(_mock_bot())
+    layout = dash.render()
+    # Render to a generously-sized buffer so every row materialises —
+    # the default StringIO console crops at ~25 rows, which would hide
+    # the new scalp slot below the fold.
+    import io
+    from rich.console import Console
+    buf = io.StringIO()
+    Console(file=buf, width=180, height=200,
+            force_terminal=False, color_system=None).print(layout)
+    text = buf.getvalue()
+    # Placeholder text since no scalp agent is wired in this smoke test
+    assert "Scalp agent not registered" in text
+    # Layout exposes the row by its slot name
+    assert layout["row_scalp"] is not None

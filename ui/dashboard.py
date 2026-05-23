@@ -3,11 +3,11 @@ ui/dashboard.py
 
 Rich terminal dashboard — single pane of glass for CryptoBot.
 
-Twelve stacked rows: header, portfolio bar, status/regime/sentiment/macro,
+Thirteen stacked rows: header, portfolio bar, status/regime/sentiment/macro,
 market overview, agents/circuit-breakers/top-performers/events, positions
-table, signal feed + arb feed + arb opportunity stats, exchange health +
-session performance, log feed + approval panel, insights strip, footer,
-command bar.
+table, signal feed + arb feed + arb opportunity stats, scalp feed,
+exchange health + session performance, log feed + approval panel,
+insights strip, footer, command bar.
 
 Every panel is wrapped in try/except — a broken data source must never
 crash the whole dashboard. Modules that haven't been built yet (macro,
@@ -137,6 +137,20 @@ class Dashboard:
         # ArbEngine directly. Empty dict when no arb agent is present.
         self._arb_engine_stats_cache: dict = {}
 
+        # Scalp agent snapshot — OFI ranking, open positions, recent
+        # closed observations, stats. Refreshed from the live agent
+        # in _refresh_coordinator_data so _panel_scalp_feed stays sync.
+        # Empty defaults when no scalp agent is registered.
+        self._scalp_data_cache: dict = {
+            "available":      False,
+            "live":            False,
+            "fee_viability":   {},
+            "ofi_top":         [],
+            "open_positions":  [],
+            "recent_closed":   [],
+            "stats":           {},
+        }
+
         self._console = Console()
 
     # ── Push API ────────────────────────────────────────────────────────
@@ -223,6 +237,8 @@ class Dashboard:
             Layout(name="row5", size=11),
             Layout(self._safe(self._panel_positions, "positions"), name="row6",  size=9),
             Layout(name="row7", size=11),
+            Layout(self._safe(self._panel_scalp_feed, "scalp"),
+                   name="row_scalp", size=20),
             Layout(name="row8", size=8),
             Layout(name="row9", size=12),
             Layout(self._safe(self._panel_insights,  "insights"),  name="row10", size=4),
@@ -344,6 +360,14 @@ class Dashboard:
                 break
         except Exception as e:
             logger.debug(f"dashboard arb engine stats refresh: {e}")
+
+        # Scalp agent snapshot — feeds _panel_scalp_feed. Defensive on
+        # every access because the agent's state is mutated by its own
+        # async loop concurrently with this refresh.
+        try:
+            self._scalp_data_cache = self._snapshot_scalp_agent()
+        except Exception as e:
+            logger.debug(f"dashboard scalp snapshot refresh: {e}")
 
     def stop(self) -> None:
         self._running = False
@@ -1051,6 +1075,300 @@ class Dashboard:
             body.append(f" ({count} detections)", style="dim")
 
         return Panel(body, title=title, border_style="cyan")
+
+    # ── Scalp feed ──────────────────────────────────────────────────────
+
+    def _snapshot_scalp_agent(self) -> dict:
+        """Pull a render-friendly snapshot of the scalp agent state.
+
+        Sync — called from _refresh_coordinator_data (which is async)
+        once per tick, so the panel itself stays fast. Returns the
+        canonical empty shape when no scalp agent is registered or
+        any single access raises (defensive across every attribute
+        because the agent mutates state on its own loop).
+        """
+        empty = {
+            "available": False, "live": False,
+            "fee_viability": {}, "ofi_top": [],
+            "open_positions": [], "recent_closed": [], "stats": {},
+        }
+        if self._coordinator is None:
+            return empty
+        try:
+            agents = getattr(self._coordinator, "_agents", None) or []
+        except Exception:
+            return empty
+
+        agent = None
+        for a in agents:
+            if getattr(a, "agent_id", None) == "scalp":
+                agent = a
+                break
+        if agent is None:
+            return empty
+
+        snap = dict(empty)
+        snap["available"] = True
+        try:
+            snap["live"] = float(getattr(agent, "_capital", 0.0)) > 0.0
+        except Exception:
+            snap["live"] = False
+
+        # get_observation_summary is documented to never raise — it
+        # returns zeroed defaults on failure — so we can trust it.
+        try:
+            stats = agent.get_observation_summary() or {}
+        except Exception as e:
+            logger.debug(f"scalp summary: {e}")
+            stats = {}
+        snap["stats"]          = stats
+        snap["fee_viability"]  = stats.get("fee_viability", {}) or {}
+
+        # OFI strip — top 5 (symbol, exchange) by |z|. Wrap every call
+        # because the engine's get() reads dict state that another
+        # coroutine might be mutating.
+        ofi = []
+        try:
+            engine = getattr(agent, "_ofi_engine", None)
+            scalp_pairs = list(getattr(settings, "SCALP_PAIRS", []))
+            scalp_exchanges = list(settings.STRATEGY_EXCHANGE_MAP.get("scalp", []))
+            if engine is not None:
+                rows = []
+                for sym in scalp_pairs:
+                    for ex in scalp_exchanges:
+                        try:
+                            r = engine.get(sym, ex) or {}
+                        except Exception:
+                            continue
+                        rows.append({
+                            "symbol":    sym,
+                            "exchange":  ex,
+                            "z":         float(r.get("z", 0.0) or 0.0),
+                            "direction": r.get("direction", "NEUTRAL"),
+                            "strength":  r.get("strength", "weak"),
+                            "stale":     bool(r.get("stale", True)),
+                        })
+                rows.sort(key=lambda r: abs(r["z"]), reverse=True)
+                ofi = rows[:5]
+        except Exception as e:
+            logger.debug(f"scalp ofi snapshot: {e}")
+        snap["ofi_top"] = ofi
+
+        # Open positions — current_price is opportunistic via market_data.
+        market = getattr(self._bot, "_market_data", None)
+        positions = []
+        try:
+            for pos in (getattr(agent, "_positions", {}) or {}).values():
+                cur_price = None
+                if market is not None and hasattr(market, "get_price"):
+                    try:
+                        cur_price = market.get_price(pos.exchange, pos.symbol)
+                    except Exception:
+                        cur_price = None
+                if cur_price and pos.entry_price:
+                    diff = cur_price - pos.entry_price
+                    if pos.direction == "SHORT":
+                        diff = -diff
+                    unrealised_bps = diff / pos.entry_price * 10000.0
+                else:
+                    unrealised_bps = None
+                hold_sec = max(0.0, datetime.utcnow().timestamp() - pos.entry_time)
+                positions.append({
+                    "symbol":         pos.symbol,
+                    "exchange":       pos.exchange,
+                    "direction":      pos.direction,
+                    "entry":          float(pos.entry_price),
+                    "tp":             float(pos.tp_price),
+                    "sl":             float(pos.sl_price),
+                    "unrealised_bps": unrealised_bps,
+                    "hold_sec":       hold_sec,
+                })
+        except Exception as e:
+            logger.debug(f"scalp positions snapshot: {e}")
+        snap["open_positions"] = positions
+
+        # Recent closed observations (last 10, newest first).
+        recent = []
+        try:
+            obs = list(getattr(agent, "_observations", []) or [])
+            closed = [o for o in obs if (o.exit_price or 0) > 0]
+            for o in closed[-10:][::-1]:
+                gross = float(o.pnl_bps or 0.0)
+                rt    = float(o.round_trip_cost_bps or 0.0)
+                recent.append({
+                    "symbol":      o.symbol,
+                    "direction":   o.direction,
+                    "exit_reason": o.exit_reason or "—",
+                    "gross_bps":   gross,
+                    "net_bps":     gross - rt,
+                    "hold_sec":    float(o.hold_sec or 0.0),
+                })
+        except Exception as e:
+            logger.debug(f"scalp recent-closed snapshot: {e}")
+        snap["recent_closed"] = recent
+
+        return snap
+
+    def _panel_scalp_feed(self) -> Panel:
+        """Five-section scalp panel: header, OFI strip, open positions,
+        recent closed observations, stats bar."""
+        title = "[bold]SCALP FEED[/bold]"
+        snap = self._scalp_data_cache or {}
+
+        if not snap.get("available"):
+            return Panel(
+                Text("Scalp agent not registered", style="dim italic"),
+                title=title, border_style="dim",
+            )
+
+        # ── 1. Header strip ────────────────────────────────────────────
+        live   = bool(snap.get("live"))
+        fee_v  = snap.get("fee_viability") or {}
+        header = Text()
+        header.append("SCALP", style="bold cyan")
+        header.append(" │ ", style="dim")
+        header.append("OFI-Primary", style="white")
+        header.append(" │ ", style="dim")
+        for ex in settings.STRATEGY_EXCHANGE_MAP.get("scalp", []):
+            v = (fee_v.get(ex) or {}).get("viable", False)
+            mark, mark_style = ("✓", "bright_green") if v else ("✗", "red")
+            header.append(f"[{ex.upper()} ", style="white")
+            header.append(mark, style=mark_style)
+            header.append("] ", style="white")
+        header.append("│ ", style="dim")
+        if live:
+            header.append("LIVE", style="red bold")
+        else:
+            header.append("obs-mode", style="yellow")
+
+        # ── 2. OFI strip — top 5 by |z| ────────────────────────────────
+        ofi_table = Table.grid(expand=True)
+        ofi_table.add_column(ratio=1)
+        ofi_table.add_column(justify="right", ratio=1)
+        ofi_table.add_column(justify="center", ratio=1)
+        ofi_table.add_column(ratio=1)
+        ofi_table.add_column(ratio=1)
+        ofi_top = snap.get("ofi_top") or []
+        if not ofi_top:
+            ofi_table.add_row("[dim italic]No OFI snapshots yet[/dim italic]", "", "", "", "")
+        else:
+            ofi_table.add_row(
+                "[bold]Pair[/bold]", "[bold]z[/bold]", "[bold]dir[/bold]",
+                "[bold]strength[/bold]", "[bold]venue[/bold]",
+            )
+            for r in ofi_top:
+                z       = r["z"]
+                dirn    = r["direction"]
+                strng   = r["strength"]
+                stale   = r["stale"]
+                arrow   = {"LONG": "↑", "SHORT": "↓"}.get(dirn, "•")
+                arr_col = {"LONG": "bright_green", "SHORT": "red"}.get(dirn, "dim")
+                str_col = {"strong":   "bright_green",
+                           "moderate": "yellow",
+                           "weak":     "dim"}.get(strng, "white")
+                sym_str = f"{r['symbol']}"
+                if stale:
+                    sym_str = f"[dim]{sym_str}[/dim]"
+                ofi_table.add_row(
+                    sym_str,
+                    f"{z:+.2f}",
+                    f"[{arr_col}]{arrow}[/{arr_col}]",
+                    f"[{str_col}]{strng}[/{str_col}]",
+                    f"[dim]{r['exchange']}[/dim]",
+                )
+
+        # ── 3. Open positions ──────────────────────────────────────────
+        pos_table = Table(expand=True, show_header=True, header_style="bold",
+                          title="OPEN", title_style="bold")
+        pos_table.add_column("Symbol")
+        pos_table.add_column("Ex")
+        pos_table.add_column("Dir")
+        pos_table.add_column("Entry",       justify="right")
+        pos_table.add_column("TP",          justify="right")
+        pos_table.add_column("SL",          justify="right")
+        pos_table.add_column("Unr. bps",    justify="right")
+        pos_table.add_column("Hold")
+        positions = snap.get("open_positions") or []
+        if not positions:
+            pos_table.add_row("[dim]No open positions[/dim]",
+                              "", "", "", "", "", "", "")
+        else:
+            for p in positions:
+                dir_col = "bright_green" if p["direction"] == "LONG" else "red"
+                if p["unrealised_bps"] is None:
+                    unr_cell = "[dim]—[/dim]"
+                else:
+                    unr_col = _pnl_colour(p["unrealised_bps"])
+                    unr_cell = f"[{unr_col}]{p['unrealised_bps']:+.1f}[/{unr_col}]"
+                pos_table.add_row(
+                    p["symbol"],
+                    p["exchange"],
+                    f"[{dir_col}]{p['direction']}[/{dir_col}]",
+                    f"{p['entry']:.4f}",
+                    f"{p['tp']:.4f}",
+                    f"{p['sl']:.4f}",
+                    unr_cell,
+                    self._fmt_duration(timedelta(seconds=p["hold_sec"])),
+                )
+
+        # ── 4. Recent closed observations (last 10) ────────────────────
+        closed_table = Table(expand=True, show_header=True, header_style="bold",
+                             title="RECENT CLOSED", title_style="bold")
+        closed_table.add_column("Symbol")
+        closed_table.add_column("Dir")
+        closed_table.add_column("Exit")
+        closed_table.add_column("Gross",  justify="right")
+        closed_table.add_column("Net",    justify="right")
+        closed_table.add_column("Hold s", justify="right")
+        recent = snap.get("recent_closed") or []
+        if not recent:
+            closed_table.add_row("[dim]—[/dim]", "", "", "", "", "")
+        else:
+            for r in recent:
+                dir_col = "bright_green" if r["direction"] == "LONG" else "red"
+                g_col   = _pnl_colour(r["gross_bps"])
+                n_col   = _pnl_colour(r["net_bps"])
+                closed_table.add_row(
+                    r["symbol"],
+                    f"[{dir_col}]{r['direction']}[/{dir_col}]",
+                    f"[dim]{r['exit_reason']}[/dim]",
+                    f"[{g_col}]{r['gross_bps']:+.1f}[/{g_col}]",
+                    f"[{n_col}]{r['net_bps']:+.1f}[/{n_col}]",
+                    f"{r['hold_sec']:.0f}",
+                )
+
+        # ── 5. Stats bar ───────────────────────────────────────────────
+        stats = snap.get("stats") or {}
+        evaluated     = int(stats.get("total_evaluated", 0) or 0)
+        would_enter   = int(stats.get("would_enter",     0) or 0)
+        closed_count  = int(stats.get("closed",          0) or 0)
+        win_rate      = float(stats.get("win_rate",      0.0) or 0.0)
+        avg_net_bps   = float(stats.get("avg_pnl_net_bps", 0.0) or 0.0)
+        daily_loss    = float(stats.get("daily_loss_usd", 0.0) or 0.0)
+
+        wr_col = ("bright_green" if win_rate >= 0.55 else
+                  "yellow"       if win_rate >= 0.45 else
+                  "red"          if closed_count > 0 else "dim")
+        net_col = _pnl_colour(avg_net_bps)
+        loss_col = "red" if daily_loss > 0 else "dim"
+
+        stats_bar = Text()
+        stats_bar.append("evaluated ",   style="dim"); stats_bar.append(f"{evaluated}", style="white")
+        stats_bar.append("  │  ", style="dim")
+        stats_bar.append("would-enter ", style="dim"); stats_bar.append(f"{would_enter}", style="white")
+        stats_bar.append("  │  ", style="dim")
+        stats_bar.append("closed ",      style="dim"); stats_bar.append(f"{closed_count}", style="white")
+        stats_bar.append("  │  ", style="dim")
+        stats_bar.append("wr ",          style="dim"); stats_bar.append(f"{win_rate*100:.0f}%", style=wr_col)
+        stats_bar.append("  │  ", style="dim")
+        stats_bar.append("avg-net ",     style="dim"); stats_bar.append(f"{avg_net_bps:+.1f}bps", style=net_col)
+        stats_bar.append("  │  ", style="dim")
+        stats_bar.append("daily-loss ",  style="dim"); stats_bar.append(f"${daily_loss:.2f}", style=loss_col)
+
+        return Panel(
+            self._stack(header, ofi_table, pos_table, closed_table, stats_bar),
+            title=title, border_style="cyan",
+        )
 
     def _panel_exchange_health(self) -> Panel:
         t = Table(expand=True, show_header=True, header_style="bold")
