@@ -337,8 +337,10 @@ class OFIEngine:
         self._last_book: dict[str, BookSnap] = {}
         # In-progress bucket: list of e_n events accumulated within this window.
         self._cur_bucket: dict[str, list[float]]   = defaultdict(list)
-        # In-progress TFI sum (signed trade flow this window).
-        self._cur_tfi:    dict[str, float]         = defaultdict(float)
+        # In-progress traded volume this window, split by side, so the bucket
+        # TFI is a volume-weighted imbalance ratio (buy-sell)/(buy+sell).
+        self._cur_buy_vol:  dict[str, float]       = defaultdict(float)
+        self._cur_sell_vol: dict[str, float]       = defaultdict(float)
         # Bucket close times.
         self._bucket_start: dict[str, float]       = {}
         # Closed buckets — deque of bucket-level OFI sums.
@@ -366,12 +368,19 @@ class OFIEngine:
         if (now - start) < self._window_sec:
             return
         bucket_ofi = float(sum(self._cur_bucket[key]))
-        bucket_tfi = float(self._cur_tfi[key])
+        # Volume-weighted trade-flow imbalance in [-1, 1]: net signed volume
+        # normalised by total traded volume this window. Sign is unchanged
+        # from the raw signed-volume version, so tfi_confirms is unaffected.
+        buy_vol   = float(self._cur_buy_vol[key])
+        sell_vol  = float(self._cur_sell_vol[key])
+        total_vol = buy_vol + sell_vol
+        bucket_tfi = (buy_vol - sell_vol) / total_vol if total_vol > 0 else 0.0
         self._ofi_buckets[key].append(bucket_ofi)
         self._last_tfi[key] = bucket_tfi
         # Reset accumulators for the next window.
         self._cur_bucket[key].clear()
-        self._cur_tfi[key] = 0.0
+        self._cur_buy_vol[key]  = 0.0
+        self._cur_sell_vol[key] = 0.0
         self._bucket_start[key] = now
         self._last_bucket_close[key] = now
         # Recompute z-score from the rolling window.
@@ -447,8 +456,11 @@ class OFIEngine:
         qty: float,
     ) -> None:
         key = self._key(symbol, exchange)
-        sign = 1.0 if side.lower() in ("buy", "b") else -1.0
-        self._cur_tfi[key] += sign * float(qty)
+        q = float(qty)
+        if side.lower() in ("buy", "b"):
+            self._cur_buy_vol[key] += q
+        else:
+            self._cur_sell_vol[key] += q
 
     def get(self, symbol: str, exchange: str) -> dict:
         key = self._key(symbol, exchange)

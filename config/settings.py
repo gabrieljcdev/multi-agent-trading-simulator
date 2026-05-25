@@ -679,7 +679,7 @@ SCALP_OFI_Z_ENTRY         = 1.5    # test: 1.0-2.5   (z-score entry threshold)
 SCALP_OFI_Z_EXIT          = 0.3    # test: 0.1-0.7   (OFI exhaustion exit)
 SCALP_OFI_Z_CONTRADICT    = -0.8   # test: -0.4 to -1.5 (OFI flip exit)
 SCALP_OFI_PERSIST_TICKS   = 3      # test: 2-6       (consecutive ticks above threshold)
-SCALP_OFI_LEVELS          = 5      # test: 1-10      (book depth levels)
+SCALP_OFI_LEVELS          = 10     # test: 1-10      (book depth levels)
 SCALP_OFI_WINDOW_SEC      = 20     # test: 10-40     (bucket accumulation window seconds)
 SCALP_ZSCORE_WINDOW       = 80     # test: 40-150    (rolling z-score normalisation periods)
 
@@ -716,8 +716,15 @@ SCALP_BTC_GUARD_PCT       = 0.3    # test: 0.2-0.6   (block if |BTC 1m change| >
 # spirit as the main bot's future_price_tracker but on a tighter window.
 SCALP_TRACKER_INTERVAL_SEC = 15    # test: 10-30
 
-# Depth weights for multi-level OFI (exponential decay ~λ=0.3).
-SCALP_DEPTH_WEIGHTS       = {0: 1.0, 1: 0.70, 2: 0.50, 3: 0.35, 4: 0.25}
+# Depth weights for multi-level OFI — exponential decay (≈λ=0.36) from 1.0
+# at the top of book down to 0.04 at level 9 (Xu/Gould/Howison 2018,
+# multi-level OFI). The engine uses min(SCALP_OFI_LEVELS, levels the book
+# actually provides), so venues that stream fewer than 10 levels simply
+# use what they send — no error.
+SCALP_DEPTH_WEIGHTS       = {
+    0: 1.0,  1: 0.70, 2: 0.50, 3: 0.35, 4: 0.25,
+    5: 0.18, 6: 0.12, 7: 0.08, 8: 0.06, 9: 0.04,
+}
 
 # Portfolio-level circuit breakers — sit on TOP of per-agent breakers.
 # Per-agent CBs (in settings.CIRCUIT_BREAKERS) fire first; these catch

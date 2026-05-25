@@ -124,6 +124,31 @@ def test_ofi_zscore_after_min_buckets():
     assert eng._last_z[key] != 0.0
 
 
+def test_ofi_depth_weights_ten_levels():
+    """10-level depth ladder: 10 weights, 1.0 at the top of book down to
+    0.04 at L9, monotonically decreasing (Xu/Gould/Howison 2018)."""
+    assert settings.SCALP_OFI_LEVELS == 10
+    w = settings.SCALP_DEPTH_WEIGHTS
+    assert len(w) == 10
+    assert w[0] == 1.0
+    assert w[9] == 0.04
+    vals = [w[i] for i in range(10)]
+    assert vals == sorted(vals, reverse=True)
+
+
+def test_ofi_uses_available_levels_when_book_shorter():
+    """Backward-compatible: a 10-level engine fed a 5-level book uses the 5
+    levels it has and computes e_n cleanly (no IndexError)."""
+    eng = OFIEngine(levels=10, window_sec=20, zscore_window=80)
+    bids_p, asks_p = _book(100.0, 5.0, 101.0, 5.0)   # 5 levels each side
+    bids_c, asks_c = _book(100.5, 5.0, 101.0, 5.0)   # bid improved at L1
+    e = eng._compute_e_n(
+        BookSnap(0.0, bids_p, asks_p),
+        BookSnap(1.0, bids_c, asks_c),
+    )
+    assert e > 0
+
+
 # ─────────────────────────────────────────────────────────────────────────
 # FEE MANAGER (5 tests)
 # ─────────────────────────────────────────────────────────────────────────
@@ -199,6 +224,20 @@ def test_tfi_confirms_matching_direction():
     # Either confirms (matching signs) or the z happens to be zero — in
     # which case the "no contradiction" branch returns True anyway.
     assert out["tfi_confirms"] is True
+
+
+def test_tfi_normalized_imbalance_ratio():
+    """Bucket TFI is a volume-weighted imbalance (buy-sell)/(buy+sell),
+    bounded to [-1, 1] — not raw signed volume."""
+    eng = OFIEngine(levels=10, window_sec=0.01, zscore_window=80)
+    key = "BTC/USDT:mexc"
+    eng._bucket_start[key] = time.time() - 1.0      # force the next close
+    eng.on_trade("BTC/USDT", "mexc", "buy", 3.0)
+    eng.on_trade("BTC/USDT", "mexc", "sell", 1.0)
+    eng._maybe_close_bucket(key, time.time())
+    # (3 - 1) / (3 + 1) = 0.5, regardless of absolute volume.
+    assert eng._last_tfi[key] == pytest.approx(0.5)
+    assert -1.0 <= eng._last_tfi[key] <= 1.0
 
 
 def test_direction_persistence_resets():
