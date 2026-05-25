@@ -58,3 +58,21 @@ def test_mexc_arb_fund_set_includes_mexc_main_arb_excludes_it():
     main_arb_venues = [e for e in settings.ARB_FEE_MAP if e != "mexc"]
     assert "mexc" not in main_arb_venues
     assert len(main_arb_venues) >= 2
+
+
+def test_sim_balance_ledger_sums_to_starting_capital_and_includes_mexc():
+    """In sim, the per-venue ledger fully backs the funds: it spans every
+    venue the funds touch and sums to STARTING_CAPITAL."""
+    assert sum(settings.EXCHANGE_BALANCES.values()) == settings.STARTING_CAPITAL
+    assert settings.EXCHANGE_BALANCES["mexc"] == (
+        settings.FUND_MEXC_SCALP_CAPITAL + settings.FUND_MEXC_ARB_CAPITAL
+    )
+
+
+def test_order_router_sizes_off_signal_fund_not_total():
+    """Ring-fence: the signal agent's OrderRouter sizes off its own fund,
+    not the whole-portfolio sim ledger."""
+    from execution.router import OrderRouter
+    r = OrderRouter()
+    assert r._portfolio_value == settings.FUND_SIGNAL_CAPITAL
+    assert r._portfolio_value != sum(settings.EXCHANGE_BALANCES.values())

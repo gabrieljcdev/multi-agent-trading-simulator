@@ -83,11 +83,23 @@ SESSION_MIN_ACTIVE_PAIRS     = 2      # Need at least N viable pairs
 # CAPITAL
 # ══════════════════════════════════════════════════════════════════════════════
 
+# Simulated per-venue cash ledger (sim mode). Spans every venue the funds
+# touch and sums to STARTING_CAPITAL ($1,100) so the fund allocations are
+# fully backed in sim. MEXC carries the $200 ring-fenced pot (scalp +
+# arb). NOTE: this is a per-venue ledger, NOT a per-fund one — funds share
+# venues. Per-fund sizing lives with each agent (e.g. OrderRouter sizes the
+# signal agent off FUND_SIGNAL_CAPITAL, not this sum), so a bigger ledger
+# never lets one fund risk beyond its own allocation.
 EXCHANGE_BALANCES = {
-    "binance": 100.0,
-    "kraken":  100.0,
-    "bybit":   100.0,
-    "kucoin":  100.0,
+    "binance":  150.0,
+    "kraken":   200.0,   # signal + arb
+    "bybit":    200.0,   # signal + arb
+    "kucoin":    50.0,
+    "bitget":   100.0,   # arb
+    "bitstamp":  70.0,   # arb
+    "gateio":    70.0,   # arb
+    "bitfinex":  60.0,   # arb
+    "mexc":     200.0,   # MEXC pot: scalp $100 + arb $100
 }
 
 # ══════════════════════════════════════════════════════════════════════════════

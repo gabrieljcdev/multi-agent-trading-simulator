@@ -15,7 +15,11 @@ class OrderRouter:
     def __init__(self, exchange_manager=None):
         self._exchange_manager = exchange_manager
         self._sim_mode = settings.SIM_MODE
-        self._portfolio_value = sum(settings.EXCHANGE_BALANCES.values())
+        # The signal agent IS the SIGNAL fund — size off its ring-fenced
+        # allocation, not the whole portfolio. EXCHANGE_BALANCES is the
+        # per-venue sim ledger across ALL funds (sums to STARTING_CAPITAL);
+        # sizing off that sum would let signal risk beyond its fund.
+        self._portfolio_value = settings.FUND_SIGNAL_CAPITAL
 
     async def execute(self, signal: Signal, profile) -> Optional[dict]:
         """Execute a trade from an approved signal."""
