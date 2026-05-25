@@ -155,6 +155,21 @@ class ScalpObservation:
     price_1m:              float = 0.0
     price_3m:              float = 0.0
     price_5m:              float = 0.0
+    # v2 selectivity diagnostics — None on v1 / pre-v2 rows so old data stays
+    # valid. Populated by the confluence + ATR layer in _evaluate_entry.
+    confluence_score:      Optional[int]   = None
+    strength_label:        Optional[str]   = None
+    cross_exchange_agrees: Optional[bool]  = None
+    btc_compatible:        Optional[bool]  = None
+    adverse_selection_ok:  Optional[bool]  = None
+    depth_ok:              Optional[bool]  = None
+    vwap_aligned:          Optional[bool]  = None
+    htf_aligned:           Optional[bool]  = None
+    volume_adequate:       Optional[bool]  = None
+    atr_bps:               Optional[float] = None
+    atr_adjusted:          Optional[bool]  = None
+    sl_clamped:            Optional[str]   = None
+    rr_actual:             Optional[float] = None
 
 
 # ─────────────────────────────────────────────────────────────────────────

@@ -327,6 +327,20 @@ class ScalpObservationModel(Base):
     price_1m              = Column(Float, default=0.0)
     price_3m              = Column(Float, default=0.0)
     price_5m              = Column(Float, default=0.0)
+    # v2 selectivity diagnostics — all nullable so pre-v2 rows stay valid.
+    confluence_score      = Column(Integer, nullable=True)
+    strength_label        = Column(String(16), nullable=True)
+    cross_exchange_agrees = Column(Boolean, nullable=True)
+    btc_compatible        = Column(Boolean, nullable=True)
+    adverse_selection_ok  = Column(Boolean, nullable=True)
+    depth_ok              = Column(Boolean, nullable=True)
+    vwap_aligned          = Column(Boolean, nullable=True)
+    htf_aligned           = Column(Boolean, nullable=True)
+    volume_adequate       = Column(Boolean, nullable=True)
+    atr_bps               = Column(Float, nullable=True)
+    atr_adjusted          = Column(Boolean, nullable=True)
+    sl_clamped            = Column(String(8), nullable=True)
+    rr_actual             = Column(Float, nullable=True)
     created_at            = Column(DateTime, default=datetime.utcnow)
 
     __table_args__ = (

@@ -918,6 +918,19 @@ def save_scalp_observations(obs_list: list) -> None:
                 price_1m=getattr(o,  "price_1m",  0.0),
                 price_3m=getattr(o,  "price_3m",  0.0),
                 price_5m=getattr(o,  "price_5m",  0.0),
+                confluence_score=getattr(o,      "confluence_score", None),
+                strength_label=getattr(o,        "strength_label", None),
+                cross_exchange_agrees=getattr(o, "cross_exchange_agrees", None),
+                btc_compatible=getattr(o,        "btc_compatible", None),
+                adverse_selection_ok=getattr(o,  "adverse_selection_ok", None),
+                depth_ok=getattr(o,              "depth_ok", None),
+                vwap_aligned=getattr(o,          "vwap_aligned", None),
+                htf_aligned=getattr(o,           "htf_aligned", None),
+                volume_adequate=getattr(o,       "volume_adequate", None),
+                atr_bps=getattr(o,               "atr_bps", None),
+                atr_adjusted=getattr(o,          "atr_adjusted", None),
+                sl_clamped=getattr(o,            "sl_clamped", None),
+                rr_actual=getattr(o,             "rr_actual", None),
             )
             if existing is None:
                 s.add(ScalpObservationModel(**payload))
