@@ -1,0 +1,437 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CryptoBot — Control Panel</title>
+<style>
+  :root{
+    --bg0:#ffffff; --bg1:#f5f4f0; --bg2:#eceae4;
+    --tx0:#1a1a18; --tx1:#5f5e5a; --tx2:#9b9890;
+    --pos:#3B6D11; --neg:#A32D2D; --warn:#854F0B;
+    --line:#dcdad3;
+  }
+  .dark{
+    --bg0:#1c1c1a; --bg1:#242422; --bg2:#2e2e2b;
+    --tx0:#eeece6; --tx1:#a8a69e; --tx2:#6a6860;
+    --pos:#8ecc54; --neg:#f08080; --warn:#e8a830;
+    --line:#3a3a36;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg1);color:var(--tx0);
+    font-family:'Consolas','Menlo','DejaVu Sans Mono',monospace;font-size:13px;line-height:1.4}
+  .wrap{max-width:1280px;margin:0 auto;padding:10px}
+  .row{display:flex;gap:10px;flex-wrap:wrap}
+  .card{background:var(--bg0);border:1px solid var(--line);border-radius:4px;padding:10px}
+  .pos{color:var(--pos)} .neg{color:var(--neg)} .warn{color:var(--warn)} .dim{color:var(--tx2)}
+  h2{font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--tx1);margin:0 0 6px}
+  /* top bar */
+  .topbar{display:flex;align-items:center;gap:12px;flex-wrap:wrap;
+    background:var(--bg0);border:1px solid var(--line);border-radius:4px;padding:8px 10px;margin-bottom:10px}
+  .badge{padding:2px 8px;border-radius:3px;font-weight:bold}
+  .badge.sim{background:var(--pos);color:#fff} .badge.live{background:var(--neg);color:#fff}
+  .spacer{flex:1}
+  button{font-family:inherit;font-size:12px;cursor:pointer;border:1px solid var(--line);
+    background:var(--bg2);color:var(--tx0);border-radius:3px;padding:4px 10px}
+  button:hover{border-color:var(--tx2)}
+  button.kill{background:var(--neg);color:#fff;border-color:var(--neg)}
+  button.armed{background:var(--warn);color:#fff;border-color:var(--warn)}
+  button.on{background:var(--tx0);color:var(--bg0)}
+  .livebanner{display:none;background:var(--neg);color:#fff;padding:8px 10px;border-radius:4px;
+    margin-bottom:10px;align-items:center;gap:12px}
+  .livebanner.show{display:flex}
+  /* tabs */
+  .tabs{display:flex;gap:6px;margin-bottom:10px}
+  .tab{padding:6px 14px} .tab.active{background:var(--tx0);color:var(--bg0);border-color:var(--tx0)}
+  .panel{display:none} .panel.active{display:block}
+  /* metric cards */
+  .metrics{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin-bottom:10px}
+  .metric .v{font-size:20px;font-weight:bold}
+  /* agent grid */
+  .agents{display:grid;grid-template-columns:repeat(6,1fr);gap:10px;margin-bottom:10px}
+  .agent.offline{opacity:.4}
+  .agent .id{font-weight:bold;text-transform:capitalize}
+  .st{font-size:11px;padding:1px 6px;border-radius:3px;background:var(--bg2)}
+  .st.RUNNING{color:var(--pos)} .st.HALTED,.st.ERROR{color:var(--neg)} .st.PAUSED{color:var(--warn)}
+  table{width:100%;border-collapse:collapse;font-size:12px}
+  th,td{text-align:left;padding:4px 6px;border-bottom:1px solid var(--line)}
+  th{color:var(--tx1);font-weight:normal}
+  .scroll{max-height:260px;overflow:auto}
+  /* bars */
+  .bar{height:8px;background:var(--bg2);border-radius:4px;overflow:hidden;margin:3px 0 8px}
+  .bar > i{display:block;height:100%}
+  /* dots */
+  .dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:6px}
+  .dot.live{background:var(--pos);animation:pulse 1.6s infinite}
+  .dot.dead{background:var(--neg);animation:pulse 1.6s infinite}
+  .dot.nokey{background:var(--tx2)}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+  /* chips */
+  .chip{display:inline-block;padding:1px 7px;border-radius:3px;font-size:11px;margin:2px 4px 2px 0;
+    background:var(--bg2);color:var(--tx1)}
+  .chip.exec{color:var(--pos)} .chip.skip{color:var(--warn)} .chip.arb{color:#2b6cb0}
+  .chip.err,.chip.kill{color:var(--neg)} .chip.warn{color:var(--warn)}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+  .grid3{display:grid;grid-template-columns:2fr 1fr;gap:10px}
+  .sessions{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
+  .session.active{outline:2px solid var(--tx1)}
+  .logline{padding:4px 0;border-bottom:1px solid var(--line)}
+  .filters{display:flex;gap:4px;flex-wrap:wrap;margin-bottom:8px}
+  .filters button.on{background:var(--tx0);color:var(--bg0)}
+  .muted{color:var(--tx2);font-style:italic}
+</style>
+</head>
+<body>
+<div class="wrap" id="root">
+
+  <!-- TOP BAR -->
+  <div class="topbar">
+    <span id="modeBadge" class="badge sim">SIM</span>
+    <span id="clock">--:--:--</span>
+    <span id="session" class="dim">—</span>
+    <span id="uptime" class="dim">up —</span>
+    <span class="dim">mode</span><span id="apprMode">—</span>
+    <span class="spacer"></span>
+    <span id="conn" class="dim">connecting…</span>
+    <button id="darkBtn" title="dark mode">☾</button>
+    <button id="pauseBtn">Pause</button>
+    <button id="killBtn" class="kill">Kill</button>
+  </div>
+
+  <!-- LIVE BANNER -->
+  <div id="liveBanner" class="livebanner">
+    <b>⚠ LIVE MODE — real money at risk</b>
+    <span class="spacer"></span>
+    <button id="killBtn2" class="kill">Kill All</button>
+  </div>
+
+  <!-- TABS -->
+  <div class="tabs">
+    <button class="tab active" data-tab="dashboard">Dashboard</button>
+    <button class="tab" data-tab="arb">Arb History</button>
+    <button class="tab" data-tab="insights">Insights</button>
+    <button class="tab" data-tab="log">Log</button>
+  </div>
+
+  <!-- DASHBOARD -->
+  <div id="panel-dashboard" class="panel active">
+    <div class="metrics">
+      <div class="card metric"><h2>Total Equity</h2><div class="v" id="m-eq">—</div></div>
+      <div class="card metric"><h2>Daily P&amp;L</h2><div class="v" id="m-dpnl">—</div></div>
+      <div class="card metric"><h2>Total P&amp;L</h2><div class="v" id="m-tpnl">—</div></div>
+      <div class="card metric"><h2>Exposure</h2><div class="v" id="m-exp">—</div></div>
+      <div class="card metric"><h2>Win Rate</h2><div class="v" id="m-wr">—</div></div>
+    </div>
+
+    <div class="agents" id="agents"></div>
+
+    <div class="grid2" style="margin-bottom:10px">
+      <div class="card"><h2>Regime</h2><div id="regime"></div></div>
+      <div class="card"><h2>Sentiment</h2><div id="sentiment"></div></div>
+    </div>
+
+    <div class="grid3" style="margin-bottom:10px">
+      <div class="card"><h2>Signal Feed</h2><div class="scroll" id="signals"></div></div>
+      <div class="card">
+        <h2>Approval</h2>
+        <div id="pending"></div>
+        <div style="margin-top:8px">
+          <span class="dim">mode:</span>
+          <button class="modeBtn" data-mode="per_trade">per_trade</button>
+          <button class="modeBtn" data-mode="window">window</button>
+          <button class="modeBtn" data-mode="autonomous">autonomous</button>
+        </div>
+        <div style="margin-top:6px"><button id="windowBtn">Approve 60m window</button></div>
+      </div>
+    </div>
+
+    <div class="grid2" style="margin-bottom:10px">
+      <div class="card"><h2>Circuit Breakers</h2><div id="breakers"></div></div>
+      <div class="card"><h2>Exchanges</h2><div id="exchanges"></div></div>
+    </div>
+
+    <div class="card" style="margin-bottom:10px">
+      <h2>Open Positions</h2><div class="scroll" id="positions"></div>
+    </div>
+
+    <div class="card">
+      <h2>Session P&amp;L</h2><div class="sessions" id="sessions"></div>
+    </div>
+  </div>
+
+  <!-- ARB HISTORY -->
+  <div id="panel-arb" class="panel">
+    <div class="metrics" style="grid-template-columns:repeat(4,1fr)">
+      <div class="card metric"><h2>Arb Trades</h2><div class="v" id="a-n">—</div></div>
+      <div class="card metric"><h2>Net P&amp;L</h2><div class="v" id="a-pnl">—</div></div>
+      <div class="card metric"><h2>Fees</h2><div class="v" id="a-fees">—</div></div>
+      <div class="card metric"><h2>Avg Fill</h2><div class="v" id="a-fill">—</div></div>
+    </div>
+    <div class="card"><h2>All Arb Trades</h2><div class="scroll" id="arbTable"></div></div>
+  </div>
+
+  <!-- INSIGHTS -->
+  <div id="panel-insights" class="panel">
+    <div class="grid2" style="margin-bottom:10px">
+      <div class="card"><h2>Top Pairs</h2><div id="topPairs"></div></div>
+      <div class="card"><h2>Strategy Performance</h2><div id="topStrats"></div></div>
+    </div>
+    <div class="card"><h2>Claude Self-Review</h2><div id="insights"></div></div>
+  </div>
+
+  <!-- LOG -->
+  <div id="panel-log" class="panel">
+    <div class="filters" id="logFilters">
+      <button class="on" data-f="ALL">ALL</button>
+      <button data-f="exec">EXEC</button><button data-f="skip">SKIP</button>
+      <button data-f="arb">ARB</button><button data-f="info">INFO</button>
+      <button data-f="warn">WARN</button><button data-f="err">ERR</button>
+      <button data-f="kill">KILL</button>
+    </div>
+    <div class="card scroll" id="logFeed" style="max-height:600px"></div>
+  </div>
+
+</div>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+let STATE = {};
+let logFilter = "ALL";
+
+/* ---------- dark mode ---------- */
+function applyDark(on){
+  $("root").parentElement; // noop
+  document.body.classList.toggle("dark", on);
+  $("darkBtn").textContent = on ? "☀" : "☾";
+}
+applyDark(localStorage.getItem("cb_dark") === "1");
+$("darkBtn").onclick = () => {
+  const on = !document.body.classList.contains("dark");
+  localStorage.setItem("cb_dark", on ? "1" : "0");
+  applyDark(on);
+};
+
+/* ---------- tabs ---------- */
+document.querySelectorAll(".tab").forEach(b => b.onclick = () => {
+  document.querySelectorAll(".tab").forEach(t => t.classList.remove("active"));
+  document.querySelectorAll(".panel").forEach(p => p.classList.remove("active"));
+  b.classList.add("active");
+  $("panel-" + b.dataset.tab).classList.add("active");
+});
+
+/* ---------- actions ---------- */
+async function postAction(path, body = {}){
+  try{
+    const r = await fetch(path, {method:"POST",
+      headers:{"Content-Type":"application/json"}, body: JSON.stringify(body)});
+    return await r.json();
+  }catch(e){ return {ok:false, error:String(e)}; }
+}
+document.querySelectorAll(".modeBtn").forEach(b =>
+  b.onclick = () => postAction("/action/set_mode", {mode:b.dataset.mode}));
+$("windowBtn").onclick = () => postAction("/action/approve_window", {minutes:60});
+$("pauseBtn").onclick = () =>
+  postAction("/action/pause", {paused: !(STATE.paused)});
+
+/* kill — two-click arm/fire within 3s */
+let killTimer = null;
+function wireKill(btn){
+  btn.onclick = () => {
+    if(btn.classList.contains("armed")){
+      clearTimeout(killTimer); btn.classList.remove("armed");
+      btn.textContent = btn.dataset.label || "Kill";
+      postAction("/action/kill");
+    }else{
+      btn.dataset.label = btn.textContent;
+      btn.classList.add("armed"); btn.textContent = "Confirm?";
+      killTimer = setTimeout(() => {
+        btn.classList.remove("armed"); btn.textContent = btn.dataset.label;
+      }, 3000);
+    }
+  };
+}
+wireKill($("killBtn")); wireKill($("killBtn2"));
+
+/* approval queue buttons are wired per-render (approve/skip) */
+
+/* ---------- helpers ---------- */
+const fmtUsd = (v) => (v==null? "—" : (v<0?"-$":"$") + Math.abs(v).toFixed(2));
+const fmtPct = (v) => (v==null? "—" : (v>=0?"+":"") + Number(v).toFixed(2) + "%");
+const cls = (v) => (v==null||v==0? "" : (v>0? "pos":"neg"));
+const esc = (s) => String(s==null?"":s).replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+function fmtAge(s){ s=Math.max(0,s|0); const h=s/3600|0,m=(s%3600)/60|0; return h?`${h}h${m}m`:(m?`${m}m`:`${s}s`); }
+function fmtUp(s){ s=s|0; const h=s/3600|0,m=(s%3600)/60|0; return `up ${h}h${String(m).padStart(2,"0")}m`; }
+
+/* ---------- render ---------- */
+function updateUI(s){
+  STATE = s;
+  // top bar
+  $("clock").textContent = s.ts || "--:--:--";
+  $("session").textContent = s.session || "—";
+  $("uptime").textContent = fmtUp(s.uptime_s || 0);
+  $("apprMode").textContent = s.approval_mode || "—";
+  const live = s.mode === "LIVE";
+  const mb = $("modeBadge");
+  mb.textContent = s.mode || "SIM";
+  mb.className = "badge " + (live ? "live" : "sim");
+  $("liveBanner").classList.toggle("show", live);
+  $("pauseBtn").textContent = s.paused ? "Resume" : "Pause";
+  $("pauseBtn").classList.toggle("on", !!s.paused);
+  document.querySelectorAll(".modeBtn").forEach(b =>
+    b.classList.toggle("on", b.dataset.mode === s.approval_mode));
+
+  // metrics
+  const p = s.portfolio || {};
+  $("m-eq").textContent = fmtUsd(p.equity);
+  $("m-dpnl").innerHTML = `<span class="${cls(p.daily_pnl)}">${fmtUsd(p.daily_pnl)} ${fmtPct(p.daily_pnl_pct)}</span>`;
+  $("m-tpnl").innerHTML = `<span class="${cls(p.total_pnl)}">${fmtUsd(p.total_pnl)}</span>`;
+  $("m-exp").textContent = (p.exposure_pct==null?"—":p.exposure_pct.toFixed(1)+"%");
+  $("m-wr").textContent = (p.win_rate_today==null?"—":p.win_rate_today.toFixed(0)+"%");
+
+  // agents (fixed 6 slots)
+  const order = ["signal","arb","scalp","macro","sentiment_agent","onchain"];
+  const byId = {}; (s.agents||[]).forEach(a => byId[a.id]=a);
+  $("agents").innerHTML = order.map(id => {
+    const a = byId[id] || {id, status:"OFFLINE", capital:0, daily_pnl:0, trades_today:0, win_rate:0};
+    const off = (a.status==="OFFLINE");
+    return `<div class="card agent ${off?"offline":""}">
+      <div class="id">${esc(id.replace("_agent",""))}</div>
+      <div><span class="st ${esc(a.status)}">${esc(a.status)}</span></div>
+      <div class="dim">cap ${fmtUsd(a.capital)}</div>
+      <div class="${cls(a.daily_pnl)}">${fmtUsd(a.daily_pnl)}</div>
+      <div class="dim">${a.trades_today||0} tr · ${(a.win_rate||0).toFixed(0)}% wr</div>
+    </div>`;
+  }).join("");
+
+  // regime
+  const r = s.regime || {};
+  $("regime").innerHTML =
+    `<div><b>${esc(r.dominant||"—")}</b> <span class="dim">ADX ${r.adx??"—"} · H ${r.hurst??"—"}</span></div>` +
+    `<table><tbody>` + (r.pairs||[]).slice(0,8).map(x =>
+      `<tr><td>${esc(x.pair)}</td><td class="dim">${esc(x.regime)}</td></tr>`).join("") + `</tbody></table>`;
+
+  // sentiment
+  const se = s.sentiment || {};
+  $("sentiment").innerHTML =
+    `<div>Fear &amp; Greed: <b>${se.fear_greed??"—"}</b> <span class="dim">${esc(se.fear_greed_label||"")}</span></div>` +
+    `<div>Composite: ${se.composite==null?"—":((se.composite>=0?"+":"")+se.composite)}</div>` +
+    `<div>Reddit: ${se.reddit_score==null?"—":se.reddit_score}</div>` +
+    `<div>News guard: <span class="${se.news_guard==="ACTIVE"?"neg":"pos"}">${esc(se.news_guard||"CLEAR")}</span></div>` +
+    `<div>BTC 30m: <span class="${cls(se.btc_30m_delta)}">${se.btc_30m_delta==null?"—":fmtPct(se.btc_30m_delta)}</span></div>`;
+
+  // signal feed
+  $("signals").innerHTML = `<table><thead><tr><th>t</th><th>pair</th><th>trk</th><th>score</th><th>action</th></tr></thead><tbody>` +
+    ((s.signals||[]).map(x =>
+      `<tr><td class="dim">${esc(x.ts)}</td><td>${esc(x.pair)}</td><td class="dim">${esc(x.track)}</td>
+       <td>${x.score}</td><td class="${x.action==="exec"?"pos":(x.action==="skip"?"warn":"dim")}">${esc(x.action)}</td></tr>`).join("")
+     || `<tr><td colspan="5" class="muted">no signals</td></tr>`) + `</tbody></table>`;
+
+  // pending / approval
+  const pend = s.pending_signal;
+  if(pend){
+    $("pending").innerHTML =
+      `<div><b>${esc(pend.pair)}</b> ${esc(pend.direction)} <span class="dim">${esc(pend.track)} · score ${pend.score}</span></div>` +
+      `<div class="dim">entry ${pend.entry??"—"} · sl ${pend.sl??"—"} · tp ${pend.tp??"—"} · rr ${pend.rr??"—"}</div>` +
+      `<div class="dim" style="margin:4px 0">${esc((pend.claude_summary||"").slice(0,160))}</div>` +
+      `<button id="approveBtn" class="on">Approve</button> <button id="skipBtn">Skip</button>`;
+    $("approveBtn").onclick = () => postAction("/action/approve");
+    $("skipBtn").onclick = () => postAction("/action/skip", {reason:"web_skip"});
+  }else{
+    $("pending").innerHTML = `<span class="muted">no signal pending</span>`;
+  }
+
+  // circuit breakers
+  const cb = s.circuit_breakers || {};
+  function barRow(label, val, limit){
+    const pct = limit>0 ? Math.min(100, val/limit*100) : 0;
+    const col = pct>=80? "var(--neg)" : pct>=50? "var(--warn)" : "var(--pos)";
+    return `<div>${label} <span class="dim">${(+val).toFixed(2)} / ${(+limit).toFixed(2)}</span></div>
+      <div class="bar"><i style="width:${pct}%;background:${col}"></i></div>`;
+  }
+  $("breakers").innerHTML =
+    barRow("Daily loss %", cb.daily_loss_pct||0, cb.daily_loss_limit||0) +
+    barRow("Consecutive losses", cb.consecutive_losses||0, cb.consecutive_limit||0) +
+    barRow("Drawdown %", cb.drawdown_pct||0, cb.drawdown_limit||0);
+
+  // exchanges
+  $("exchanges").innerHTML = (s.exchanges||[]).map(x =>
+    `<div><span class="dot ${esc(x.status)}"></span>${esc(x.name)} <span class="dim">${esc(x.status)}</span></div>`
+  ).join("") || `<span class="muted">none</span>`;
+
+  // positions
+  $("positions").innerHTML = `<table><thead><tr><th>agent</th><th>pair</th><th>dir</th><th>entry</th><th>cur</th><th>size</th><th>P&amp;L</th><th>age</th></tr></thead><tbody>` +
+    ((s.positions||[]).map(x =>
+      `<tr><td class="dim">${esc(x.agent)}</td><td>${esc(x.pair)}</td><td>${esc(x.direction)}</td>
+       <td>${x.entry}</td><td>${x.current}</td><td>${fmtUsd(x.size_usd)}</td>
+       <td class="${cls(x.pnl_usd)}">${fmtUsd(x.pnl_usd)} ${fmtPct(x.pnl_pct)}</td><td class="dim">${fmtAge(x.age_s)}</td></tr>`).join("")
+     || `<tr><td colspan="8" class="muted">no open positions</td></tr>`) + `</tbody></table>`;
+
+  // session P&L
+  const sp = s.session_pnl || {};
+  $("sessions").innerHTML = ["LONDON","NEW_YORK","ASIA","OFF_HOURS"].map(k => {
+    const d = sp[k] || {pnl:0,trades:0};
+    return `<div class="card session ${s.session===k?"active":""}">
+      <h2>${k.replace("_"," ")}</h2>
+      <div class="${cls(d.pnl)}">${fmtUsd(d.pnl)}</div>
+      <div class="dim">${d.trades} trades</div></div>`;
+  }).join("");
+
+  // arb history
+  const ah = s.arb_history || [];
+  $("a-n").textContent = ah.length;
+  $("a-pnl").innerHTML = `<span class="${cls(ah.reduce((a,x)=>a+(x.net_pnl||0),0))}">${fmtUsd(ah.reduce((a,x)=>a+(x.net_pnl||0),0))}</span>`;
+  $("a-fees").textContent = fmtUsd(ah.reduce((a,x)=>a+(x.fees||0),0));
+  $("a-fill").textContent = ah.length? (ah.reduce((a,x)=>a+(x.fill_ms||0),0)/ah.length).toFixed(0)+"ms" : "—";
+  $("arbTable").innerHTML = `<table><thead><tr><th>t</th><th>pair</th><th>buy</th><th>sell</th><th>gap%</th><th>size</th><th>net</th><th>fill</th><th>status</th></tr></thead><tbody>` +
+    (ah.map(x =>
+      `<tr><td class="dim">${esc(x.ts)}</td><td>${esc(x.pair)}</td><td class="dim">${esc(x.buy_exchange)}</td>
+       <td class="dim">${esc(x.sell_exchange)}</td><td>${x.gap_pct}</td><td>${fmtUsd(x.size_usd)}</td>
+       <td class="${cls(x.net_pnl)}">${fmtUsd(x.net_pnl)}</td><td class="dim">${x.fill_ms}ms</td><td class="dim">${esc(x.status)}</td></tr>`).join("")
+     || `<tr><td colspan="9" class="muted">no arb trades</td></tr>`) + `</tbody></table>`;
+
+  // insights
+  $("topPairs").innerHTML = `<table><thead><tr><th>pair</th><th>P&amp;L</th><th>trades</th><th>wr</th></tr></thead><tbody>` +
+    ((s.top_pairs||[]).map(x =>
+      `<tr><td>${esc(x.pair)}</td><td class="${cls(x.pnl)}">${fmtUsd(x.pnl)}</td><td>${x.trades}</td><td>${x.win_rate}%</td></tr>`).join("")
+     || `<tr><td colspan="4" class="muted">no data</td></tr>`) + `</tbody></table>`;
+  $("topStrats").innerHTML = `<table><thead><tr><th>track</th><th>wr</th><th>trades</th><th>P&amp;L</th></tr></thead><tbody>` +
+    ((s.top_strategies||[]).map(x =>
+      `<tr><td>${esc(x.name)}</td><td>${x.win_rate}%</td><td>${x.trades}</td><td class="${cls(x.pnl)}">${fmtUsd(x.pnl)}</td></tr>`).join("")
+     || `<tr><td colspan="4" class="muted">no data</td></tr>`) + `</tbody></table>`;
+  $("insights").innerHTML = (s.insights||[]).map(x =>
+    `<div class="card" style="margin-bottom:6px"><div class="dim">${esc(x.ts)} · ${esc(x.trade_range)}</div>
+     <div>${esc(x.body)}</div></div>`).join("") || `<span class="muted">no postmortems yet</span>`;
+
+  renderLog();
+}
+
+/* log tab */
+document.querySelectorAll("#logFilters button").forEach(b => b.onclick = () => {
+  document.querySelectorAll("#logFilters button").forEach(x => x.classList.remove("on"));
+  b.classList.add("on"); logFilter = b.dataset.f; renderLog();
+});
+function renderLog(){
+  const items = (STATE.log||[]).filter(e => logFilter==="ALL" || e.type===logFilter);
+  $("logFeed").innerHTML = items.map(e =>
+    `<div class="logline"><span class="chip ${esc(e.type)}">${esc(e.type)}</span>
+     <span class="dim">${esc(e.ts)}</span> ${esc(e.title)}
+     <span class="dim">${esc(e.detail)}</span></div>`).join("")
+    || `<span class="muted">no log entries</span>`;
+}
+
+/* ---------- websocket ---------- */
+function connect(){
+  const ws = new WebSocket("ws://" + location.host + "/ws");
+  ws.onopen = () => { $("conn").textContent = "● live"; $("conn").className = "pos"; };
+  ws.onmessage = (ev) => { try{ updateUI(JSON.parse(ev.data)); }catch(e){} };
+  ws.onclose = () => {
+    $("conn").textContent = "○ reconnecting…"; $("conn").className = "dim";
+    setTimeout(connect, 2000);
+  };
+  ws.onerror = () => { try{ ws.close(); }catch(e){} };
+}
+connect();
+</script>
+</body>
+</html>

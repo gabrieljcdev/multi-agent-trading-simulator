@@ -1148,3 +1148,145 @@ def get_signal_win_rate(signal_type: str = None, days: int = 30,
         "win_rate": len(wins) / len(trades),
         "avg_pnl":  sum(t.pnl_pct for t in trades) / len(trades),
     }
+
+
+# ── Web control panel (ui/web_server.py) ───────────────────────────────────
+
+_SESSIONS = ("LONDON", "NEW_YORK", "ASIA", "OFF_HOURS")
+
+
+def _session_for_hour(hour: int) -> str:
+    """UTC trading session for an hour — mirrors Dashboard._current_session.
+    There is no `session` column on trades, so callers derive it here."""
+    if 7 <= hour < 13:
+        return "LONDON"
+    if 13 <= hour < 20:
+        return "NEW_YORK"
+    if 0 <= hour < 7:
+        return "ASIA"
+    return "OFF_HOURS"
+
+
+def get_session_pnl_today() -> dict:
+    """Today's closed trades grouped by session (derived from close time).
+    {"LONDON": {"pnl": 5.20, "trades": 4}, ...} — always all four keys."""
+    out = {s: {"pnl": 0.0, "trades": 0} for s in _SESSIONS}
+    today = datetime.utcnow().date()
+    with get_session() as s:
+        rows = (
+            s.query(Trade)
+            .filter(func.date(Trade.timestamp_close) == today,
+                    Trade.pnl_usd.isnot(None))
+            .all()
+        )
+        for t in rows:
+            ts = t.timestamp_close or t.timestamp_open
+            sess = _session_for_hour(ts.hour) if ts else "OFF_HOURS"
+            out[sess]["pnl"] += float(t.pnl_usd or 0.0)
+            out[sess]["trades"] += 1
+    for v in out.values():
+        v["pnl"] = round(v["pnl"], 2)
+    return out
+
+
+def get_top_pairs(n: int = 5) -> list[dict]:
+    """Top n pairs by total realised P&L (all-time, closed trades)."""
+    from collections import defaultdict
+    agg: dict = defaultdict(lambda: {"pnl": 0.0, "trades": 0, "wins": 0})
+    with get_session() as s:
+        rows = s.query(Trade).filter(Trade.pnl_usd.isnot(None)).all()
+        for t in rows:
+            a = agg[t.pair]
+            a["pnl"] += float(t.pnl_usd or 0.0)
+            a["trades"] += 1
+            if (t.pnl_pct if t.pnl_pct is not None else t.pnl_usd or 0) > 0:
+                a["wins"] += 1
+    out = [
+        {"pair": p, "pnl": round(a["pnl"], 2), "trades": a["trades"],
+         "win_rate": round(a["wins"] / a["trades"] * 100, 1) if a["trades"] else 0.0}
+        for p, a in agg.items()
+    ]
+    out.sort(key=lambda d: d["pnl"], reverse=True)
+    return out[:n]
+
+
+def get_strategy_performance() -> list[dict]:
+    """Performance by signal track (closed trades). Always returns the four
+    tracks; scalp is excluded (it's a separate fund)."""
+    from collections import defaultdict
+    names = {
+        "arb":       "Track A — Arbitrage",
+        "momentum":  "Track B — Momentum",
+        "reversion": "Track C — Mean Reversion",
+        "sweep":     "Track D — Liquidity Sweep",
+    }
+    agg: dict = defaultdict(lambda: {"pnl": 0.0, "trades": 0, "wins": 0})
+    with get_session() as s:
+        rows = s.query(Trade).filter(Trade.pnl_usd.isnot(None)).all()
+        for t in rows:
+            st = (t.signal_type or "").lower()
+            if st not in names:
+                continue
+            a = agg[st]
+            a["pnl"] += float(t.pnl_usd or 0.0)
+            a["trades"] += 1
+            if (t.pnl_pct or 0) > 0:
+                a["wins"] += 1
+    out = []
+    for st, name in names.items():
+        a = agg.get(st, {"pnl": 0.0, "trades": 0, "wins": 0})
+        out.append({
+            "name": name,
+            "trades": a["trades"],
+            "win_rate": round(a["wins"] / a["trades"] * 100, 1) if a["trades"] else 0.0,
+            "pnl": round(a["pnl"], 2),
+        })
+    return out
+
+
+def get_recent_postmortems(n: int = 3) -> list[dict]:
+    """Last n Claude self-reviews. Stored on Trade.claude_postmortem (there
+    is no separate postmortems table)."""
+    out: list[dict] = []
+    with get_session() as s:
+        rows = (
+            s.query(Trade)
+            .filter(Trade.claude_postmortem.isnot(None))
+            .order_by(desc(Trade.timestamp_close))
+            .limit(n)
+            .all()
+        )
+        for t in rows:
+            ts = t.timestamp_close or t.timestamp_open
+            out.append({
+                "ts": ts.strftime("%H:%M") if ts else "—",
+                "trade_range": f"trade {t.id}",
+                "body": t.claude_postmortem or "",
+                "tags": [],
+            })
+    return out
+
+
+def _arb_trade_to_dict(r) -> dict:
+    gross = float(r.gross_pnl_usd or 0.0)
+    net = float(r.net_pnl_usd or 0.0)
+    return {
+        "id": r.id,
+        "ts": r.timestamp.strftime("%H:%M") if r.timestamp else "—",
+        "pair": r.symbol,
+        "buy_exchange": r.buy_exchange,
+        "sell_exchange": r.sell_exchange,
+        "gap_pct": round(float(r.net_gap_pct or 0.0), 4),
+        "size_usd": round(float(r.size_usd or 0.0), 2),
+        "net_pnl": round(net, 2),
+        "fees": round(gross - net, 2),
+        "fill_ms": round(float(r.execution_ms or 0.0)),
+        "status": r.status or ("filled" if r.success else "—"),
+    }
+
+
+def get_arb_trades_all() -> list[dict]:
+    """All arb trades, newest first — for the web UI Arb History tab."""
+    with get_session() as s:
+        rows = s.query(ArbTrade).order_by(desc(ArbTrade.timestamp)).all()
+        return [_arb_trade_to_dict(r) for r in rows]

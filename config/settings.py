@@ -958,6 +958,14 @@ UI_SHOW_OFI_BARS         = True
 UI_SHOW_HURST_BARS       = True
 UI_DEFAULT_TAB           = "overview"
 
+# ── Web control panel (ui/web_server.py) ───────────────────────────────────
+# Local operator tool only — no auth, no SSL, localhost/LAN. Started by the
+# --web-ui flag; never exposed to the internet.
+WEB_UI_HOST            = "localhost"   # test: "0.0.0.0" for LAN access
+WEB_UI_PORT            = 8765          # test: any open port
+WEB_UI_ENABLED         = False         # default off; enabled by --web-ui flag
+WEB_UI_PUSH_INTERVAL_S = 0.5           # test: 0.25-2.0  (WebSocket push rate, seconds)
+
 # ── Dashboard arb-opportunity panel colour ladder ───────────────────────────
 # Execution rate = executed / above_threshold. Green when we're catching
 # the majority of viable gaps; amber when half are slipping through;

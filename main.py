@@ -35,7 +35,8 @@ from utils.logger import setup_logging
 @click.option("--live",      is_flag=True, help="Force live trading mode")
 @click.option("--debug",     is_flag=True, help="Enable debug logging")
 @click.option("--dashboard", is_flag=True, help="Run the Rich terminal dashboard alongside the bot")
-def main(profile, strategy, sim, live, debug, dashboard):
+@click.option("--web-ui", "web_ui", is_flag=True, help="Start web control panel on localhost:8765")
+def main(profile, strategy, sim, live, debug, dashboard, web_ui):
     """CryptoBot — Claude-powered situational trading assistant."""
 
     # Logging
@@ -65,10 +66,11 @@ def main(profile, strategy, sim, live, debug, dashboard):
     logger.info(f"  Profile:  {active_profile_name}")
     logger.info(f"  Strategy: {active_strategy_name}")
     logger.info(f"  Dashboard: {'on' if dashboard else 'off'}")
+    logger.info(f"  Web UI:    {'on' if web_ui else 'off'}")
 
     # Boot the async event loop
     try:
-        asyncio.run(_run(active_profile, active_strategy, dashboard))
+        asyncio.run(_run(active_profile, active_strategy, dashboard, web_ui))
     except KeyboardInterrupt:
         logger.info("Shutting down (Ctrl+C)")
     except Exception as e:
@@ -76,18 +78,19 @@ def main(profile, strategy, sim, live, debug, dashboard):
         sys.exit(1)
 
 
-async def _run(profile, strategy, dashboard: bool):
+async def _run(profile, strategy, dashboard: bool, web_ui: bool = False):
     """Async main — imports are deferred here to keep startup fast.
 
     The Coordinator owns every agent (incl. SignalAgent which wraps
-    CryptoBot). Dashboard, if enabled, late-binds to the signal agent's
-    bot via set_dashboard once the agent constructs it.
+    CryptoBot). Dashboard / web UI, if enabled, late-bind to the signal
+    agent's bot once the agent constructs it.
 
     `profile` and `strategy` apply to the signal agent only; we set them
     on settings so SignalAgentWrapper picks them up when it constructs
     its CryptoBot. (Bypassing the wrapper to inject profile/strategy
     directly would break agent encapsulation.)
     """
+    logger = logging.getLogger(__name__)
     from agents.coordinator import Coordinator
 
     if profile is not None:
@@ -97,14 +100,34 @@ async def _run(profile, strategy, dashboard: bool):
 
     coordinator = Coordinator()
 
-    if not dashboard:
-        await coordinator.start()
-        return
+    tasks = [coordinator.start()]
 
-    from ui.dashboard import Dashboard
-    dash = Dashboard(coordinator=coordinator)
-    coordinator.set_dashboard(dash)
-    await asyncio.gather(coordinator.start(), dash.run(), return_exceptions=True)
+    if dashboard:
+        from ui.dashboard import Dashboard
+        dash = Dashboard(coordinator=coordinator)
+        coordinator.set_dashboard(dash)
+        tasks.append(dash.run())
+
+    # Web control panel — never let its startup crash the bot.
+    web_server = None
+    if web_ui:
+        try:
+            settings.WEB_UI_ENABLED = True
+            from ui.web_server import WebServer
+            web_server = WebServer(coordinator=coordinator, bot=None)
+            tasks.append(web_server.start())
+        except Exception as e:
+            logger.error(f"Web UI failed to start: {e}", exc_info=True)
+            web_server = None
+
+    try:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    finally:
+        if web_server is not None:
+            try:
+                await web_server.stop()
+            except Exception as e:
+                logger.debug(f"web server stop: {e}")
 
 
 if __name__ == "__main__":
