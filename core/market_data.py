@@ -6,7 +6,7 @@ import asyncio
 import logging
 import os
 import time
-from collections import deque
+from collections import deque, namedtuple
 import pandas as pd
 import ta
 import ccxt.async_support as ccxt
@@ -18,6 +18,12 @@ from database.queries import save_candle
 
 load_dotenv(dotenv_path="config/keys.env")
 logger = logging.getLogger(__name__)
+
+# Lightweight order-book shapes for the scalp v2 confluence depth gate —
+# get_order_book() returns these so callers can use .price / .size and slice
+# .bids / .asks (the ConfluenceChecker's expected interface).
+OBLevel   = namedtuple("OBLevel", ["price", "size"])
+OrderBook = namedtuple("OrderBook", ["bids", "asks"])
 
 def _make_exchange(name):
     configs = {
@@ -200,6 +206,141 @@ class MarketData:
         cutoff = now - self.PRICE_HISTORY_WINDOW_SEC
         while buf and buf[0][0] < cutoff:
             buf.popleft()
+
+    # ── Scalp v2 selectivity accessors ──────────────────────────────────
+    # The ConfluenceChecker / ATRStopCalculator (scalping_v2) read these.
+    # All are None-safe — the gates fail open on None. Indicator values come
+    # from the cached candle DataFrames (which already carry atr/ema/vwap/
+    # volume); timeframes the bot doesn't stream (e.g. 1m) return None and the
+    # consuming gate degrades gracefully.
+
+    def get_mid_price(self, symbol, exchange):
+        """Top-of-book mid for (symbol, exchange); falls back to last price."""
+        ob = self._last_book.get((exchange, symbol))
+        if ob:
+            bids = ob.get("bids") or []
+            asks = ob.get("asks") or []
+            if bids and asks:
+                try:
+                    return (float(bids[0][0]) + float(asks[0][0])) / 2.0
+                except (IndexError, TypeError, ValueError):
+                    pass
+        p = self._last_price.get((exchange, symbol))
+        return float(p) if p is not None else None
+
+    def get_mid_price_at_offset(self, symbol, exchange, offset_ms):
+        """Mid price ~offset_ms ago from the short-window sample buffer, or
+        None if there's no sample that old. Powers the adverse-selection gate."""
+        hist = self._price_history.get((exchange, symbol))
+        if not hist:
+            return None
+        target = time.time() - float(offset_ms) / 1000.0
+        for ts, price in reversed(hist):
+            if ts <= target and price > 0:
+                return float(price)
+        return None
+
+    def _candle_tf(self, exchange, symbol, preferred):
+        """Return `preferred` tf if we have candles for it, else the fastest
+        streamed timeframe we do have. None if no candles at all."""
+        if self.get_candles(exchange, symbol, preferred) is not None:
+            return preferred
+        for tf in settings.TIMEFRAMES:
+            if self.get_candles(exchange, symbol, tf) is not None:
+                return tf
+        return None
+
+    @staticmethod
+    def _last_finite(series):
+        try:
+            val = series.iloc[-1]
+            return float(val) if pd.notna(val) else None
+        except Exception:
+            return None
+
+    def get_session_vwap(self, symbol, exchange):
+        """Latest VWAP from the fastest available candle frame."""
+        tf = self._candle_tf(exchange, symbol, settings.FAST_TIMEFRAME)
+        if tf is None:
+            return None
+        df = self.get_candles(exchange, symbol, tf)
+        if df is None or df.empty or "vwap" not in df.columns:
+            return None
+        return self._last_finite(df["vwap"])
+
+    def get_ema(self, symbol, exchange, timeframe, period):
+        """EMA(period) of close on `timeframe`. None if that frame is absent
+        or too short (HTF gate uses 5m, which the bot streams)."""
+        df = self.get_candles(exchange, symbol, timeframe)
+        if df is None or df.empty or len(df) < int(period):
+            return None
+        try:
+            ema = ta.trend.EMAIndicator(df["close"], window=int(period)).ema_indicator()
+            return self._last_finite(ema)
+        except Exception as e:
+            logger.debug(f"get_ema {symbol} {exchange} {timeframe}/{period}: {e}")
+            return None
+
+    def get_atr(self, symbol, exchange, period, timeframe):
+        """ATR(period) on `timeframe` in price units. None if that frame is
+        absent — the ATR stop calculator then falls back to its base SL."""
+        df = self.get_candles(exchange, symbol, timeframe)
+        if df is None or df.empty or len(df) < int(period):
+            return None
+        try:
+            atr = ta.volatility.AverageTrueRange(
+                df["high"], df["low"], df["close"], window=int(period),
+            ).average_true_range()
+            return self._last_finite(atr)
+        except Exception as e:
+            logger.debug(f"get_atr {symbol} {exchange} {timeframe}/{period}: {e}")
+            return None
+
+    def get_current_minute_volume(self, symbol, exchange):
+        """Latest candle volume from the fastest available frame (the volume
+        gate's ratio is scale-invariant, so a 5m frame works when 1m isn't
+        streamed)."""
+        tf = self._candle_tf(exchange, symbol, "1m")
+        if tf is None:
+            return None
+        df = self.get_candles(exchange, symbol, tf)
+        if df is None or df.empty or "volume" not in df.columns:
+            return None
+        return self._last_finite(df["volume"])
+
+    def get_rolling_median_volume(self, symbol, exchange, timeframe, lookback):
+        """Median volume over the last `lookback` candles on the requested
+        frame (falling back to the fastest available)."""
+        tf = self._candle_tf(exchange, symbol, timeframe)
+        if tf is None:
+            return None
+        df = self.get_candles(exchange, symbol, tf)
+        if df is None or df.empty or "volume" not in df.columns:
+            return None
+        try:
+            tail = df["volume"].tail(int(lookback)).dropna()
+            if tail.empty:
+                return None
+            return float(tail.median())
+        except Exception:
+            return None
+
+    def get_order_book(self, symbol, exchange, levels=5):
+        """Cached order book as OrderBook(bids=[OBLevel(price,size)], asks=[…]),
+        top `levels` per side. None when no book is cached."""
+        ob = self._last_book.get((exchange, symbol))
+        if not ob:
+            return None
+        bids = ob.get("bids") or []
+        asks = ob.get("asks") or []
+        if not bids or not asks:
+            return None
+        try:
+            b = [OBLevel(float(p), float(s)) for p, s in bids[:levels]]
+            a = [OBLevel(float(p), float(s)) for p, s in asks[:levels]]
+        except (TypeError, ValueError):
+            return None
+        return OrderBook(b, a)
 
     def active_pairs(self):
         return self._active_pairs

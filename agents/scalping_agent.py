@@ -519,6 +519,22 @@ class OFIEngine:
         self._persist[key] += 1
         return self._persist[key]
 
+    # ── Scalp v2 read-only accessors (no effect on OFI accumulation) ────
+
+    def get_z_score(self, symbol: str, exchange: str):
+        """Latest bucket z-score for (symbol, exchange), or None if no bucket
+        has closed yet. Consumed by the v2 cross-exchange / BTC gates."""
+        key = self._key(symbol, exchange)
+        if self._last_bucket_close.get(key) is None:
+            return None
+        return float(self._last_z.get(key, 0.0))
+
+    def get_exchanges_for_symbol(self, symbol: str) -> list:
+        """Exchanges this engine has received books for on `symbol` — lets the
+        cross-exchange OFI gate discover other venues."""
+        prefix = f"{symbol}:"
+        return [k.split(":", 1)[1] for k in self._last_book if k.startswith(prefix)]
+
 
 # ─────────────────────────────────────────────────────────────────────────
 # ScalpingAgent
