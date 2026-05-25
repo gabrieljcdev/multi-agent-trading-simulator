@@ -171,39 +171,17 @@ class ArbEngine:
         dashboard=None,
         sim_mode:         Optional[bool] = None,
         *,
-        fund_id:                  str             = "arb",
-        exchanges:                Optional[list]  = None,
-        required_exchange:        Optional[str]   = None,
-        watch_pairs:              Optional[list]  = None,
-        capital_per_exchange_usd: Optional[float] = None,
-        daily_loss_halt_usd:      Optional[float] = None,
-        consecutive_loss_halt:    Optional[int]   = None,
+        fund_id:    str            = "arb",
+        exchanges:  Optional[list] = None,
     ):
         self.dashboard = dashboard
         self.sim_mode  = settings.SIM_MODE if sim_mode is None else sim_mode
 
-        # Fund identity + optional scoping knobs. Every default reproduces the
-        # original single-pool engine. The arb fund passes `exchanges` to scope
-        # itself to its approved venues; the remaining knobs let any future
-        # fund scope an engine instance:
-        #   exchanges          — build clients for this subset only
-        #   required_exchange  — only consider gaps with this venue as a leg
-        #   capital_per_exchange_usd / daily_loss_halt_usd / consec_loss —
-        #                        per-fund sizing cap + circuit-breaker thresholds
-        self.fund_id              = fund_id
-        self._required_exchange   = required_exchange
-        self._exchange_filter     = set(exchanges) if exchanges is not None else None
-        self._watch_pairs         = (list(watch_pairs) if watch_pairs is not None
-                                     else list(settings.ARB_WATCH_PAIRS))
-        self._capital_per_exchange = (float(capital_per_exchange_usd)
-                                      if capital_per_exchange_usd is not None
-                                      else float(settings.ARB_CAPITAL_PER_EXCHANGE))
-        self._daily_loss_halt_usd = (float(daily_loss_halt_usd)
-                                     if daily_loss_halt_usd is not None
-                                     else float(settings.ARB_DAILY_LOSS_HALT_USD))
-        self._consecutive_loss_halt = (int(consecutive_loss_halt)
-                                       if consecutive_loss_halt is not None
-                                       else int(settings.ARB_CONSECUTIVE_LOSS_HALT))
+        # fund_id labels logs/stats. `exchanges` scopes _build_clients to a
+        # subset of ARB_FEE_MAP (the arb fund passes STRATEGY_EXCHANGE_MAP
+        # ["arb"]); None builds every venue in ARB_FEE_MAP.
+        self.fund_id          = fund_id
+        self._exchange_filter = set(exchanges) if exchanges is not None else None
 
         # Exchange clients
         if exchange_clients is None:
@@ -212,8 +190,6 @@ class ArbEngine:
         logger.info(
             f"ArbEngine[{self.fund_id}]: {len(self._exchanges)} exchanges ready "
             f"({', '.join(self._exchanges) or '—'})"
-            + (f", required leg={self._required_exchange}"
-               if self._required_exchange else "")
         )
 
         # Lifecycle
@@ -238,7 +214,7 @@ class ArbEngine:
 
         # Concurrency primitives
         self._symbol_locks: dict[str, asyncio.Lock] = {
-            sym: asyncio.Lock() for sym in self._watch_pairs
+            sym: asyncio.Lock() for sym in settings.ARB_WATCH_PAIRS
         }
         self._semaphore = asyncio.Semaphore(settings.ARB_MAX_CONCURRENT)
         # Track in-flight count manually — asyncio.Semaphore has no public counter
@@ -366,7 +342,7 @@ class ArbEngine:
         # Concurrent fetch of all books
         fetch_keys = []
         fetch_coros = []
-        for sym in self._watch_pairs:
+        for sym in settings.ARB_WATCH_PAIRS:
             for name in ex_names:
                 fetch_keys.append((name, sym))
                 fetch_coros.append(self._safe_fetch_book(self._exchanges[name], sym))
@@ -374,17 +350,10 @@ class ArbEngine:
         idx = {k: b for k, b in zip(fetch_keys, books) if b is not None}
 
         best: Optional[ArbOpportunity] = None
-        for sym in self._watch_pairs:
+        for sym in settings.ARB_WATCH_PAIRS:
             for a in ex_names:
                 for b in ex_names:
                     if a == b:
-                        continue
-                    # Ring-fence: a fund restricted to a venue (e.g. the
-                    # MEXC-arb fund) only takes gaps where that venue is one
-                    # of the two legs. Keeps its trades — and P&L — disjoint
-                    # from the main arb fund's.
-                    if (self._required_exchange is not None
-                            and self._required_exchange not in (a, b)):
                         continue
                     book_a = idx.get((a, sym))
                     book_b = idx.get((b, sym))
@@ -458,7 +427,7 @@ class ArbEngine:
                     max_size = min(
                         dynamic_size,
                         min(ask_liq, bid_liq) * 0.10,
-                        self._capital_per_exchange,
+                        settings.ARB_CAPITAL_PER_EXCHANGE,
                     )
 
                     candidate = ArbOpportunity(
@@ -720,9 +689,9 @@ class ArbEngine:
     # ── Circuit breakers ────────────────────────────────────────────────
 
     def _cb_triggered(self) -> bool:
-        if self._daily_pnl_usd <= -self._daily_loss_halt_usd:
+        if self._daily_pnl_usd <= -settings.ARB_DAILY_LOSS_HALT_USD:
             return True
-        if self._consecutive_losses >= self._consecutive_loss_halt:
+        if self._consecutive_losses >= settings.ARB_CONSECUTIVE_LOSS_HALT:
             return True
         return False
 
