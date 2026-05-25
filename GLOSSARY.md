@@ -49,3 +49,57 @@ those intervals elapse. The scalp equivalent of the main bot's
 `future_price_tracker_loop`. Enables retrospective analysis of OFI
 directional accuracy independently of whether the position was held or
 exited early.
+
+---
+
+## Scalping v2 (selectivity layer)
+
+### ConfluenceChecker
+`agents/scalping_confluence.py`. Runs the v2 selectivity gates after the
+existing 13-gate flow and returns a `CombinedConfluenceResult` (pass/block,
+blocking reason, strength label, per-gate diagnostics). Dependency-injected
+over `MarketData` + `OFIEngine`; fails open on missing data. Reference copy in
+`scalping_v2/`.
+
+### Confluence Gates
+The three soft gates — VWAP alignment, 5m HTF trend, volume — of which
+`SCALP_CONFLUENCE_REQUIRED` (default 2 of 3) must pass to enter. Distinct from
+the v2 hard gates (adverse selection, depth, BTC-directional, cross-exchange),
+which block outright.
+
+### Strength Label
+Per-observation conviction tag — WEAK / MODERATE / STRONG / VERY_STRONG —
+from how many soft gates passed plus cross-exchange agreement. Stored in
+`scalp_observations.strength_label`; intended to drive position sizing in v3.
+
+### Cross-Exchange OFI Confirmation
+v2 gate: blocks a signal when another venue's OFI strongly opposes it, and
+labels it stronger when another venue confirms. Reads `OFIEngine.get_z_score`
+across venues.
+
+### BTC Directional Gate
+v2 gate for alts: blocks an alt scalp that fights BTC's order-flow direction
+(BTC OFI z beyond `SCALP_BTC_OFI_NEUTRAL_BAND`). BTC itself is exempt.
+
+### Adverse Selection Guard
+v2 gate: skips when the mid moved against the signal within
+`SCALP_ADVERSE_MOVE_WINDOW_MS` (default 100 ms) by more than
+`SCALP_ADVERSE_MID_MOVE_BPS` — avoids supplying liquidity into an adverse move.
+
+### Depth Adequacy Gate
+v2 gate: skips when top-5 book depth is below
+`SCALP_MIN_TOP5_DEPTH_MULTIPLIER` × position size, or the position would consume
+more than `SCALP_MAX_TOP1_CONSUME_PCT` of the top level.
+
+### ATRStopCalculator
+`agents/scalping_atr_sl.py`. v2 replacement for FeeManager's fixed-bps SL:
+SL = ATR(period) × `SCALP_ATR_SL_MULTIPLIER`, clamped to
+[`SCALP_ATR_SL_FLOOR_BPS`, `SCALP_ATR_SL_CEILING_BPS`], never tighter than the
+fee-derived base. Returns `atr_bps` / `atr_adjusted` / `sl_clamped` / `rr_actual`
+for logging. When ATR data is unavailable it returns the base SL (so it equals
+FeeManager).
+
+### Activation Readiness v2
+The tighter observation→live gate (`queries.get_scalp_activation_readiness_v2`):
+≥300 closed obs, ≥55% win rate, ≥0.5 avg net bps, ≤25% MAX_HOLD exits, ≥57% 1m
+directional accuracy (`SCALP_*_FOR_LIVE_V2`).
