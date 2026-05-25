@@ -175,8 +175,10 @@ class Coordinator:
         else:
             portfolio_status = "HEALTHY"
 
-        # total_equity = allocated + realized daily P&L
-        total_equity = total_allocated + total_daily_pnl
+        # Total equity = sum of every fund's equity (its allocation + today's
+        # realised P&L). Computed per-agent so it tracks each fund dynamically
+        # rather than pinning to a starting constant.
+        total_equity = sum(s.capital_allocated + s.daily_pnl for s in agent_stats)
 
         return {
             "total_equity":           total_equity,

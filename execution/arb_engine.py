@@ -182,13 +182,14 @@ class ArbEngine:
         self.dashboard = dashboard
         self.sim_mode  = settings.SIM_MODE if sim_mode is None else sim_mode
 
-        # Fund identity + ring-fencing knobs. Every default reproduces the
-        # original single-pool engine exactly, so existing callers/tests are
-        # unaffected — the MEXC-arb fund is the only caller that overrides:
+        # Fund identity + optional scoping knobs. Every default reproduces the
+        # original single-pool engine. The arb fund passes `exchanges` to scope
+        # itself to its approved venues; the remaining knobs let any future
+        # fund scope an engine instance:
         #   exchanges          — build clients for this subset only
         #   required_exchange  — only consider gaps with this venue as a leg
         #   capital_per_exchange_usd / daily_loss_halt_usd / consec_loss —
-        #                        this fund's own sizing cap + circuit breaker
+        #                        per-fund sizing cap + circuit-breaker thresholds
         self.fund_id              = fund_id
         self._required_exchange   = required_exchange
         self._exchange_filter     = set(exchanges) if exchanges is not None else None

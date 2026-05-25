@@ -1,24 +1,29 @@
 """tests/test_funds.py — ring-fenced fund architecture invariants.
 
-Four independent funds (signal / arb / mexc-scalp / mexc-arb), each a
-capital pool mapped 1:1 to an agent. Exchanges may be shared; capital
-never is. These guard the wiring so the funds can't silently drift.
+Three independent funds (signal / arb / mexc-scalp), each a capital pool
+mapped 1:1 to an agent. Exchanges may be shared (MEXC backs the scalp fund
+and is also an arb venue); capital never is. These guard the wiring so the
+funds can't silently drift.
 """
 from config import settings
 
 
 def test_fund_constants_present_and_positive():
     for name in ("FUND_SIGNAL_CAPITAL", "FUND_ARB_CAPITAL",
-                 "FUND_MEXC_SCALP_CAPITAL", "FUND_MEXC_ARB_CAPITAL",
-                 "FUND_DAILY_LOSS_HALT_PCT"):
+                 "FUND_MEXC_SCALP_CAPITAL", "FUND_DAILY_LOSS_HALT_PCT"):
         assert hasattr(settings, name), f"missing {name}"
         assert getattr(settings, name) > 0
 
 
+def test_mexc_arb_fund_constant_removed():
+    """MEXC-ARB was folded into the main ARB fund — its constant is gone."""
+    assert not hasattr(settings, "FUND_MEXC_ARB_CAPITAL")
+
+
 def test_starting_capital_is_sum_of_funds():
     total = (settings.FUND_SIGNAL_CAPITAL + settings.FUND_ARB_CAPITAL
-             + settings.FUND_MEXC_SCALP_CAPITAL + settings.FUND_MEXC_ARB_CAPITAL)
-    assert total == 1100.0
+             + settings.FUND_MEXC_SCALP_CAPITAL)
+    assert total == 1000.0
     assert settings.STARTING_CAPITAL == total
 
 
@@ -27,9 +32,9 @@ def test_legacy_aliases_track_fund_constants():
     assert settings.ARB_AGENT_CAPITAL == settings.FUND_ARB_CAPITAL
 
 
-def test_mexc_routing_in_strategy_map_and_fee_map():
+def test_mexc_folded_into_arb_routing_and_fee_map():
     assert settings.STRATEGY_EXCHANGE_MAP["scalp"] == ["mexc"]
-    assert "mexc" in settings.STRATEGY_EXCHANGE_MAP["arb"]
+    assert "mexc" in settings.STRATEGY_EXCHANGE_MAP["arb"]   # MEXC is an arb venue
     assert "mexc" in settings.ARB_FEE_MAP
 
 
@@ -39,7 +44,13 @@ def test_registered_funds_carry_their_allocation():
     assert by_id["signal"].capital_allocation == settings.FUND_SIGNAL_CAPITAL
     assert by_id["arb"].capital_allocation == settings.FUND_ARB_CAPITAL
     assert by_id["scalp"].capital_allocation == settings.FUND_MEXC_SCALP_CAPITAL
-    assert by_id["mexc-arb"].capital_allocation == settings.FUND_MEXC_ARB_CAPITAL
+    # MEXC-ARB agent removed entirely.
+    assert "mexc-arb" not in by_id
+
+
+def test_mexc_arb_wrapper_removed():
+    import agents
+    assert not hasattr(agents, "MexcArbAgentWrapper")
 
 
 def test_scalp_fund_size_decoupled_from_trading_budget():
@@ -51,22 +62,11 @@ def test_scalp_fund_size_decoupled_from_trading_budget():
     assert scalp._capital == settings.SCALP_CAPITAL
 
 
-def test_mexc_arb_fund_set_includes_mexc_main_arb_excludes_it():
-    from agents import MexcArbAgentWrapper
-    assert "mexc" in MexcArbAgentWrapper()._exchange_set()
-    # Main arb fund's venue list (computed in ArbAgentWrapper.start) excludes MEXC.
-    main_arb_venues = [e for e in settings.ARB_FEE_MAP if e != "mexc"]
-    assert "mexc" not in main_arb_venues
-    assert len(main_arb_venues) >= 2
-
-
 def test_sim_balance_ledger_sums_to_starting_capital_and_includes_mexc():
     """In sim, the per-venue ledger fully backs the funds: it spans every
-    venue the funds touch and sums to STARTING_CAPITAL."""
+    venue the funds touch and sums to STARTING_CAPITAL ($1,000)."""
     assert sum(settings.EXCHANGE_BALANCES.values()) == settings.STARTING_CAPITAL
-    assert settings.EXCHANGE_BALANCES["mexc"] == (
-        settings.FUND_MEXC_SCALP_CAPITAL + settings.FUND_MEXC_ARB_CAPITAL
-    )
+    assert settings.EXCHANGE_BALANCES["mexc"] == settings.FUND_MEXC_SCALP_CAPITAL
 
 
 def test_order_router_sizes_off_signal_fund_not_total():

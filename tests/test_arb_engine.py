@@ -216,12 +216,12 @@ def test_fund_overrides_capital_and_cb_thresholds():
 
     fund = ArbEngine(
         exchange_clients={"mexc": MagicMock(), "kraken": MagicMock()},
-        sim_mode=True, fund_id="mexc-arb",
+        sim_mode=True, fund_id="scoped-arb",
         capital_per_exchange_usd=100.0, daily_loss_halt_usd=10.0,
     )
-    assert fund.fund_id == "mexc-arb"
+    assert fund.fund_id == "scoped-arb"
     assert fund._capital_per_exchange == 100.0
-    assert fund.get_stats()["fund_id"] == "mexc-arb"
+    assert fund.get_stats()["fund_id"] == "scoped-arb"
     fund._daily_pnl_usd = -10.01      # just past the $10 (10% of $100) halt
     assert fund._cb_triggered() is True
 

@@ -337,7 +337,6 @@ class Dashboard:
                     "signal":   "SIGNAL",
                     "arb":      "ARB",
                     "scalp":    "MEXC-SCALP",
-                    "mexc-arb": "MEXC-ARB",
                 }
                 self._agent_stats_cache = [
                     {
@@ -733,7 +732,7 @@ class Dashboard:
 
         if not agent_stats:
             # Coordinator not wired — show the planned funds as OFFLINE.
-            for name in ("SIGNAL", "ARB", "MEXC-SCALP", "MEXC-ARB"):
+            for name in ("ARB", "SIGNAL", "MEXC-SCALP"):
                 t.add_row(name, "[dim]OFFLINE[/dim]", "[dim]—[/dim]",
                           "[dim]—[/dim]", "[dim]—[/dim]", "[dim]—[/dim]")
             t.add_row("[bold]TOTAL[/bold]", "", "[dim]—[/dim]",
