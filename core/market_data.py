@@ -495,33 +495,49 @@ class MarketData:
                     logger.error(f"Callback error: {e}")
 
     async def _stream_orderbooks(self, exchange_name, ex):
+        """Stream order books for the top-N active pairs — one small loop per
+        symbol, run concurrently. ccxt.pro's watch_order_book(symbol) blocks
+        until *that* symbol next ticks, so a single-symbol loop paces itself to
+        the real update rate. (The previous design swept many symbols in one
+        loop, where each call returned the cached book immediately and spun the
+        event loop at 100% CPU.)"""
         if not hasattr(ex, "watch_order_book"):
             return
+        pairs = self._active_pairs[:settings.ORDER_BOOK_STREAM_PAIRS]
+        await asyncio.gather(
+            *(self._stream_one_orderbook(exchange_name, ex, pair) for pair in pairs),
+            return_exceptions=True,
+        )
+
+    async def _stream_one_orderbook(self, exchange_name, ex, pair):
+        """One symbol's book-stream loop. Awaits the next update each iteration
+        (no busy-spin); on error it backs off so a failing symbol can't spin."""
         while self._running:
             try:
-                for pair in self._active_pairs[:20]:
+                ob = await asyncio.wait_for(
+                    ex.watch_order_book(pair, settings.ORDER_BOOK_DEPTH),
+                    timeout=settings.ORDER_BOOK_WATCH_TIMEOUT_S,
+                )
+                # Persist the latest book so consumers (scalping agent's spread
+                # gate, dashboard) can read it without subscribing to ofi_scorer.
+                self._last_book[(exchange_name, pair)] = ob
+                # Sample mid into the short-window history so the BTC
+                # correlation guard (get_change_pct) has the sub-minute
+                # resolution candles can't provide.
+                bids = ob.get("bids") or []
+                asks = ob.get("asks") or []
+                if bids and asks:
                     try:
-                        ob = await asyncio.wait_for(ex.watch_order_book(pair, settings.ORDER_BOOK_DEPTH), timeout=5.0)
-                        # Persist the latest book so consumers (scalping
-                        # agent's spread gate, dashboard) can read it
-                        # without subscribing to ofi_scorer.
-                        self._last_book[(exchange_name, pair)] = ob
-                        # Sample mid into the short-window history so the
-                        # BTC correlation guard (get_change_pct) has the
-                        # sub-minute resolution candles can't provide.
-                        bids = ob.get("bids") or []
-                        asks = ob.get("asks") or []
-                        if bids and asks:
-                            try:
-                                mid = (float(bids[0][0]) + float(asks[0][0])) / 2.0
-                                self._record_price_sample(exchange_name, pair, mid)
-                            except (IndexError, TypeError, ValueError):
-                                pass
-                        ofi_scorer.update_book(pair=pair, exchange=exchange_name, bids=ob.get("bids",[]), asks=ob.get("asks",[]))
-                    except asyncio.TimeoutError:
+                        mid = (float(bids[0][0]) + float(asks[0][0])) / 2.0
+                        self._record_price_sample(exchange_name, pair, mid)
+                    except (IndexError, TypeError, ValueError):
                         pass
-                    except Exception as e:
-                        logger.debug(f"OB {exchange_name} {pair}: {e}")
+                ofi_scorer.update_book(pair=pair, exchange=exchange_name,
+                                       bids=ob.get("bids", []), asks=ob.get("asks", []))
+            except asyncio.TimeoutError:
+                continue   # no update within the window — just re-await
+            except asyncio.CancelledError:
+                break
             except Exception as e:
-                logger.warning(f"OB error {exchange_name}: {e}")
-                await asyncio.sleep(5)
+                logger.debug(f"OB {exchange_name} {pair}: {e}")
+                await asyncio.sleep(settings.ORDER_BOOK_ERROR_BACKOFF_S)

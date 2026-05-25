@@ -109,6 +109,9 @@ EXCHANGE_BALANCES = {
 ENABLED_EXCHANGES  = ["binance", "kraken", "bybit", "kucoin"]
 MIN_LIQUIDITY_USD  = 50_000     # Minimum order book depth to trade a pair
 ORDER_BOOK_DEPTH   = 10         # Levels to stream per side for OFI
+ORDER_BOOK_STREAM_PAIRS    = 20    # test: 5-50   (top-N active pairs to stream books for)
+ORDER_BOOK_WATCH_TIMEOUT_S = 30.0  # test: 10-60  (max wait for one symbol's book update)
+ORDER_BOOK_ERROR_BACKOFF_S = 1.0   # test: 0.5-5  (backoff after a book-stream error — prevents busy-spin)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PAIR UNIVERSE
