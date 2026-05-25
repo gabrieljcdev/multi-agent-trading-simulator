@@ -21,7 +21,13 @@ logger = logging.getLogger(__name__)
 
 def _make_exchange(name):
     configs = {
-        "binance": {"apiKey": os.getenv("BINANCE_API_KEY"), "secret": os.getenv("BINANCE_SECRET"), "options": {"defaultType": "spot"}},
+        # Binance is a PUBLIC market-data feed here (OHLCV/orderbook) — the bot
+        # never signs to trade on it. fetchCurrencies=False skips the SIGNED
+        # sapi currencies call ccxt otherwise makes inside load_markets, which
+        # was failing with -1021 ("timestamp outside recvWindow") under WSL2
+        # clock drift + busy-startup latency. adjustForTimeDifference +
+        # recvWindow give any future signed call slack as well.
+        "binance": {"apiKey": os.getenv("BINANCE_API_KEY"), "secret": os.getenv("BINANCE_SECRET"), "options": {"defaultType": "spot", "adjustForTimeDifference": True, "recvWindow": 10000, "fetchCurrencies": False}},
         "kraken":  {"apiKey": os.getenv("KRAKEN_API_KEY"),  "secret": os.getenv("KRAKEN_SECRET")},
         "bybit":   {"apiKey": os.getenv("BYBIT_API_KEY"),   "secret": os.getenv("BYBIT_SECRET"),  "options": {"defaultType": "spot"}},
         "okx":     {"apiKey": os.getenv("OKX_API_KEY"),     "secret": os.getenv("OKX_SECRET"),    "password": os.getenv("OKX_PASSPHRASE"), "options": {"defaultType": "spot"}},
