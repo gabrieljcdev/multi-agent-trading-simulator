@@ -1303,3 +1303,80 @@ def get_arb_trades_all() -> list[dict]:
     with get_session() as s:
         rows = s.query(ArbTrade).order_by(desc(ArbTrade.timestamp)).all()
         return [_arb_trade_to_dict(r) for r in rows]
+
+
+# ── Scalp activation readiness (v1 + v2 observation→live gate) ──────────────
+
+def get_scalp_activation_stats() -> dict:
+    """Closed-entry stats both readiness checks consume, from
+    scalp_observations (would_entry=1, exit_price>0). Mirrors Query 8 in
+    scalping_v2/SCALPING_V2_RECALIBRATION.md."""
+    with get_session() as s:
+        rows = (
+            s.query(ScalpObservationModel)
+            .filter(ScalpObservationModel.would_entry == True,   # noqa: E712
+                    ScalpObservationModel.exit_price > 0)
+            .all()
+        )
+    n = len(rows)
+    if n == 0:
+        return {"n_closed": 0, "win_rate": 0.0, "avg_net_bps": 0.0,
+                "max_hold_pct": 0.0, "directional_accuracy_1m": 0.0}
+    wins     = sum(1 for r in rows if (r.pnl_bps or 0.0) > 0)
+    net_sum  = sum((r.pnl_bps or 0.0) - (r.round_trip_cost_bps or 0.0) for r in rows)
+    max_hold = sum(1 for r in rows if r.exit_reason == "MAX_HOLD")
+    dir_rows = [r for r in rows if r.price_1m and r.price_1m > 0 and r.entry_price]
+    dir_hits = sum(
+        1 for r in dir_rows
+        if (r.direction == "LONG"  and r.price_1m > r.entry_price)
+        or (r.direction == "SHORT" and r.price_1m < r.entry_price)
+    )
+    return {
+        "n_closed":                n,
+        "win_rate":                wins / n,
+        "avg_net_bps":             net_sum / n,
+        "max_hold_pct":            max_hold / n,
+        "directional_accuracy_1m": (dir_hits / len(dir_rows)) if dir_rows else 0.0,
+    }
+
+
+def _scalp_readiness(stats: dict, *, min_obs, min_wr, min_net,
+                     max_hold, min_dir) -> dict:
+    checks = []
+    if stats["n_closed"] < min_obs:
+        checks.append(f"n_closed {stats['n_closed']} < {min_obs}")
+    if stats["win_rate"] < min_wr:
+        checks.append(f"win_rate {stats['win_rate']:.3f} < {min_wr}")
+    if stats["avg_net_bps"] < min_net:
+        checks.append(f"avg_net_bps {stats['avg_net_bps']:.2f} < {min_net}")
+    if stats["max_hold_pct"] > max_hold:
+        checks.append(f"max_hold_pct {stats['max_hold_pct']:.3f} > {max_hold}")
+    if stats["directional_accuracy_1m"] < min_dir:
+        checks.append(f"directional_acc_1m {stats['directional_accuracy_1m']:.3f} < {min_dir}")
+    return {"ready": not checks, "reasons_failing": checks, "stats": stats}
+
+
+def get_scalp_activation_readiness() -> dict:
+    """v1 readiness — observation→live gate vs the SCALP_*_FOR_LIVE thresholds."""
+    from config import settings
+    return _scalp_readiness(
+        get_scalp_activation_stats(),
+        min_obs=settings.SCALP_MIN_OBSERVATIONS_FOR_LIVE,
+        min_wr=settings.SCALP_MIN_WIN_RATE_FOR_LIVE,
+        min_net=settings.SCALP_MIN_AVG_NET_BPS_FOR_LIVE,
+        max_hold=settings.SCALP_MAX_HOLD_EXIT_PCT,
+        min_dir=settings.SCALP_MIN_DIRECTIONAL_ACC_1M,
+    )
+
+
+def get_scalp_activation_readiness_v2() -> dict:
+    """v2 readiness — tighter thresholds (SCALP_*_FOR_LIVE_V2)."""
+    from config import settings
+    return _scalp_readiness(
+        get_scalp_activation_stats(),
+        min_obs=settings.SCALP_MIN_OBSERVATIONS_FOR_LIVE_V2,
+        min_wr=settings.SCALP_MIN_WIN_RATE_FOR_LIVE_V2,
+        min_net=settings.SCALP_MIN_AVG_NET_BPS_FOR_LIVE_V2,
+        max_hold=settings.SCALP_MAX_HOLD_EXIT_PCT_V2,
+        min_dir=settings.SCALP_MIN_DIRECTIONAL_ACC_1M_V2,
+    )
