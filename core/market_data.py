@@ -433,34 +433,43 @@ class MarketData:
             logger.debug(f"Regime update error: {e}")
 
     async def _stream_candles(self, exchange_name, ex):
+        """Stream OHLCV for the top-N active pairs × timeframes — one small loop
+        per (pair, timeframe), run concurrently. Same rationale as
+        _stream_orderbooks: a single-series watch_ohlcv blocks until that series
+        next ticks, so it can't busy-spin the event loop (the old single sweep
+        over all series returned cached candles immediately and pinned the CPU)."""
         if not hasattr(ex, "watch_ohlcv"):
             return
+        pairs = self._active_pairs[:settings.ORDER_BOOK_STREAM_PAIRS]
+        await asyncio.gather(
+            *(self._stream_one_candle(exchange_name, ex, pair, tf)
+              for pair in pairs for tf in settings.TIMEFRAMES),
+            return_exceptions=True,
+        )
+
+    async def _stream_one_candle(self, exchange_name, ex, pair, tf):
+        """One (symbol, timeframe) candle-stream loop. Awaits the next bar each
+        iteration; backs off on error so a failing series can't spin."""
         while self._running:
+            t0 = time.perf_counter()
             try:
-                for pair in self._active_pairs[:20]:
-                    for tf in settings.TIMEFRAMES:
-                        t0 = time.perf_counter()
-                        try:
-                            ohlcv = await asyncio.wait_for(
-                                ex.watch_ohlcv(pair, tf), timeout=10.0)
-                            latency_ms = (time.perf_counter() - t0) * 1000.0
-                            if ohlcv:
-                                await self._process_candle(exchange_name, pair, tf, ohlcv[-1])
-                            # Successful tick (or empty payload) — exchange is reachable
-                            self._report_health(exchange_name, latency_ms, connected=True)
-                        except asyncio.TimeoutError:
-                            self._report_health(exchange_name,
-                                                (time.perf_counter() - t0) * 1000.0,
-                                                connected=False)
-                        except Exception as e:
-                            logger.debug(f"Stream {exchange_name} {pair} {tf}: {e}")
-                            self._report_health(exchange_name,
-                                                (time.perf_counter() - t0) * 1000.0,
-                                                connected=False)
+                ohlcv = await asyncio.wait_for(
+                    ex.watch_ohlcv(pair, tf), timeout=settings.ORDER_BOOK_WATCH_TIMEOUT_S)
+                latency_ms = (time.perf_counter() - t0) * 1000.0
+                if ohlcv:
+                    await self._process_candle(exchange_name, pair, tf, ohlcv[-1])
+                # Successful tick (or empty payload) — exchange is reachable
+                self._report_health(exchange_name, latency_ms, connected=True)
+            except asyncio.TimeoutError:
+                self._report_health(exchange_name,
+                                    (time.perf_counter() - t0) * 1000.0, connected=False)
+            except asyncio.CancelledError:
+                break
             except Exception as e:
-                logger.warning(f"Stream error {exchange_name}: {e}")
-                self._report_health(exchange_name, 0.0, connected=False)
-                await asyncio.sleep(5)
+                logger.debug(f"Stream {exchange_name} {pair} {tf}: {e}")
+                self._report_health(exchange_name,
+                                    (time.perf_counter() - t0) * 1000.0, connected=False)
+                await asyncio.sleep(settings.ORDER_BOOK_ERROR_BACKOFF_S)
 
     async def _process_candle(self, exchange_name, pair, tf, raw):
         ts, open_, high, low, close, volume = raw

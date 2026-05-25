@@ -65,3 +65,48 @@ async def test_stream_orderbooks_noop_without_watch():
         pass
 
     await md._stream_orderbooks("binance", RestEx())   # must return, not raise
+
+
+@pytest.mark.asyncio
+async def test_stream_one_candle_processes_then_backs_off(monkeypatch):
+    md = MarketData()
+    md._running = True
+    candle = [1700000000000, 100.0, 101.0, 99.0, 100.5, 10.0]   # ts,o,h,l,c,v
+    calls = {"watch": 0, "sleep": 0, "proc": 0}
+
+    class FakeEx:
+        async def watch_ohlcv(self, pair, tf):
+            calls["watch"] += 1
+            if calls["watch"] == 1:
+                return [candle]
+            if calls["watch"] == 2:
+                raise RuntimeError("ws dropped")     # error path → must back off
+            md._running = False
+            return [candle]
+
+    async def fake_sleep(_s):
+        calls["sleep"] += 1
+
+    async def fake_process(exn, pair, tf, raw):
+        calls["proc"] += 1
+
+    monkeypatch.setattr("core.market_data.asyncio.sleep", fake_sleep)
+    monkeypatch.setattr(md, "_process_candle", fake_process)
+    monkeypatch.setattr(md, "_report_health", lambda *a, **k: None)
+
+    await md._stream_one_candle("kraken", FakeEx(), "BTC/USDT", "5m")
+
+    assert calls["proc"] >= 1     # processed a bar
+    assert calls["sleep"] >= 1    # backed off on error (no spin)
+    assert calls["watch"] >= 3
+
+
+@pytest.mark.asyncio
+async def test_stream_candles_noop_without_watch():
+    md = MarketData()
+    md._running = True
+
+    class RestEx:   # plain ccxt — no watch_ohlcv attribute
+        pass
+
+    await md._stream_candles("binance", RestEx())   # must return, not raise
