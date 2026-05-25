@@ -1242,8 +1242,11 @@ def _session_for_hour(hour: int) -> str:
 
 
 def get_session_pnl_today() -> dict:
-    """Today's closed trades grouped by session (derived from close time).
-    {"LONDON": {"pnl": 5.20, "trades": 4}, ...} — always all four keys."""
+    """Today's realised P&L grouped by UTC trading session — across every
+    fund. Combines the Trade ledger (signal + scalp fills, by close time)
+    and the ArbTrade ledger (arb fills, by execution time); arb is the most
+    active fund, so omitting it left the panel looking frozen. Always returns
+    all four session keys. {"LONDON": {"pnl": 5.20, "trades": 4}, ...}."""
     out = {s: {"pnl": 0.0, "trades": 0} for s in _SESSIONS}
     today = datetime.utcnow().date()
     with get_session() as s:
@@ -1257,6 +1260,16 @@ def get_session_pnl_today() -> dict:
             ts = t.timestamp_close or t.timestamp_open
             sess = _session_for_hour(ts.hour) if ts else "OFF_HOURS"
             out[sess]["pnl"] += float(t.pnl_usd or 0.0)
+            out[sess]["trades"] += 1
+        arb_rows = (
+            s.query(ArbTrade)
+            .filter(func.date(ArbTrade.timestamp) == today,
+                    ArbTrade.net_pnl_usd.isnot(None))
+            .all()
+        )
+        for r in arb_rows:
+            sess = _session_for_hour(r.timestamp.hour) if r.timestamp else "OFF_HOURS"
+            out[sess]["pnl"] += float(r.net_pnl_usd or 0.0)
             out[sess]["trades"] += 1
     for v in out.values():
         v["pnl"] = round(v["pnl"], 2)

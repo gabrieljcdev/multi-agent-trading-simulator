@@ -85,6 +85,26 @@ def test_arb_realized_pnl(temp_db):
     assert q.get_arb_realized_pnl(today=True) == pytest.approx(2.0)
 
 
+def test_session_pnl_includes_arb_and_trade(temp_db):
+    q, ddb = temp_db
+    from database.models import Trade, ArbTrade
+    today = datetime.utcnow().date()
+    london = datetime(today.year, today.month, today.day, 10, 0)   # 7..13 → LONDON
+    ny     = datetime(today.year, today.month, today.day, 15, 0)   # 13..20 → NEW_YORK
+    with ddb.get_session() as s:
+        s.add(Trade(pair="BTC/USDT", exchange="binance", side="long",
+                    entry_price=100.0, size_usd=50.0, pnl_usd=2.0,
+                    timestamp_close=london, strategy="default"))
+        s.add(ArbTrade(symbol="ETH/USDT", net_pnl_usd=3.0, timestamp=ny))
+    sp = q.get_session_pnl_today()
+    assert sp["LONDON"]["pnl"] == pytest.approx(2.0)
+    assert sp["LONDON"]["trades"] == 1
+    # Arb fills (separate table) are now folded in by execution time.
+    assert sp["NEW_YORK"]["pnl"] == pytest.approx(3.0)
+    assert sp["NEW_YORK"]["trades"] == 1
+    assert sp["ASIA"]["pnl"] == 0.0
+
+
 def _scalp_obs(would_entry, **kw):
     base = dict(
         symbol="BTC/USDT", exchange="mexc", timestamp=time.time(),
