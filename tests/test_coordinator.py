@@ -345,3 +345,43 @@ def test_set_dashboard_propagates_to_agents():
     coord.set_dashboard(dashboard)
     assert aware.dashboard_set is dashboard
     # unaware agent has no set_dashboard — must not raise
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Per-fund circuit breakers — independent, ring-fenced halts
+# ─────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_per_fund_circuit_breaker_halts_only_breaching_fund(monkeypatch):
+    """A fund breaching -FUND_DAILY_LOSS_HALT_PCT of its OWN size is paused
+    independently; healthy funds keep running. This is the ring-fence — a
+    MEXC fund tripping must not touch signal/arb."""
+    monkeypatch.setattr(settings, "FUND_DAILY_LOSS_HALT_PCT", 10.0)
+    # mexc-arb: -$11 on a $100 fund = -11% → breaches.
+    mexc = MockAgent(agent_id="mexc-arb", capital=100.0, daily_pnl=-11.0)
+    # signal: -$1 on a $400 fund = -0.25% → fine.
+    signal = MockAgent(agent_id="signal", capital=400.0, daily_pnl=-1.0)
+    coord = Coordinator(agents=[mexc, signal])
+
+    await coord._check_fund_circuit_breakers(await coord.get_agent_stats())
+
+    assert mexc.pause_called is True
+    assert signal.pause_called is False
+    assert "mexc-arb" in coord._fund_halted
+    assert "signal" not in coord._fund_halted
+
+
+@pytest.mark.asyncio
+async def test_per_fund_circuit_breaker_clears_when_pnl_recovers(monkeypatch):
+    """Once a fund's daily P&L recovers above the limit (e.g. after its UTC
+    daily reset), its halt marker clears so a later dip can re-trigger."""
+    monkeypatch.setattr(settings, "FUND_DAILY_LOSS_HALT_PCT", 10.0)
+    fund = MockAgent(agent_id="mexc-scalp", capital=100.0, daily_pnl=-15.0)
+    coord = Coordinator(agents=[fund])
+
+    await coord._check_fund_circuit_breakers(await coord.get_agent_stats())
+    assert "mexc-scalp" in coord._fund_halted
+
+    fund._daily_pnl = 0.0   # daily reset zeroed the loss
+    await coord._check_fund_circuit_breakers(await coord.get_agent_stats())
+    assert "mexc-scalp" not in coord._fund_halted

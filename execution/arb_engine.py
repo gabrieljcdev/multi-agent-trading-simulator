@@ -170,17 +170,49 @@ class ArbEngine:
         exchange_clients: Optional[dict] = None,
         dashboard=None,
         sim_mode:         Optional[bool] = None,
+        *,
+        fund_id:                  str             = "arb",
+        exchanges:                Optional[list]  = None,
+        required_exchange:        Optional[str]   = None,
+        watch_pairs:              Optional[list]  = None,
+        capital_per_exchange_usd: Optional[float] = None,
+        daily_loss_halt_usd:      Optional[float] = None,
+        consecutive_loss_halt:    Optional[int]   = None,
     ):
         self.dashboard = dashboard
         self.sim_mode  = settings.SIM_MODE if sim_mode is None else sim_mode
+
+        # Fund identity + ring-fencing knobs. Every default reproduces the
+        # original single-pool engine exactly, so existing callers/tests are
+        # unaffected — the MEXC-arb fund is the only caller that overrides:
+        #   exchanges          — build clients for this subset only
+        #   required_exchange  — only consider gaps with this venue as a leg
+        #   capital_per_exchange_usd / daily_loss_halt_usd / consec_loss —
+        #                        this fund's own sizing cap + circuit breaker
+        self.fund_id              = fund_id
+        self._required_exchange   = required_exchange
+        self._exchange_filter     = set(exchanges) if exchanges is not None else None
+        self._watch_pairs         = (list(watch_pairs) if watch_pairs is not None
+                                     else list(settings.ARB_WATCH_PAIRS))
+        self._capital_per_exchange = (float(capital_per_exchange_usd)
+                                      if capital_per_exchange_usd is not None
+                                      else float(settings.ARB_CAPITAL_PER_EXCHANGE))
+        self._daily_loss_halt_usd = (float(daily_loss_halt_usd)
+                                     if daily_loss_halt_usd is not None
+                                     else float(settings.ARB_DAILY_LOSS_HALT_USD))
+        self._consecutive_loss_halt = (int(consecutive_loss_halt)
+                                       if consecutive_loss_halt is not None
+                                       else int(settings.ARB_CONSECUTIVE_LOSS_HALT))
 
         # Exchange clients
         if exchange_clients is None:
             exchange_clients = self._build_clients()
         self._exchanges: dict = dict(exchange_clients)
         logger.info(
-            f"ArbEngine: {len(self._exchanges)} exchanges ready "
+            f"ArbEngine[{self.fund_id}]: {len(self._exchanges)} exchanges ready "
             f"({', '.join(self._exchanges) or '—'})"
+            + (f", required leg={self._required_exchange}"
+               if self._required_exchange else "")
         )
 
         # Lifecycle
@@ -205,7 +237,7 @@ class ArbEngine:
 
         # Concurrency primitives
         self._symbol_locks: dict[str, asyncio.Lock] = {
-            sym: asyncio.Lock() for sym in settings.ARB_WATCH_PAIRS
+            sym: asyncio.Lock() for sym in self._watch_pairs
         }
         self._semaphore = asyncio.Semaphore(settings.ARB_MAX_CONCURRENT)
         # Track in-flight count manually — asyncio.Semaphore has no public counter
@@ -272,6 +304,7 @@ class ArbEngine:
     def get_stats(self) -> dict:
         """Return a stats dict — ArbAgentWrapper translates this to AgentStats."""
         return {
+            "fund_id":               self.fund_id,
             "status":                self._status,
             "daily_pnl":             self._daily_pnl_usd,
             "total_pnl":             self._total_pnl_usd,
@@ -332,7 +365,7 @@ class ArbEngine:
         # Concurrent fetch of all books
         fetch_keys = []
         fetch_coros = []
-        for sym in settings.ARB_WATCH_PAIRS:
+        for sym in self._watch_pairs:
             for name in ex_names:
                 fetch_keys.append((name, sym))
                 fetch_coros.append(self._safe_fetch_book(self._exchanges[name], sym))
@@ -340,10 +373,17 @@ class ArbEngine:
         idx = {k: b for k, b in zip(fetch_keys, books) if b is not None}
 
         best: Optional[ArbOpportunity] = None
-        for sym in settings.ARB_WATCH_PAIRS:
+        for sym in self._watch_pairs:
             for a in ex_names:
                 for b in ex_names:
                     if a == b:
+                        continue
+                    # Ring-fence: a fund restricted to a venue (e.g. the
+                    # MEXC-arb fund) only takes gaps where that venue is one
+                    # of the two legs. Keeps its trades — and P&L — disjoint
+                    # from the main arb fund's.
+                    if (self._required_exchange is not None
+                            and self._required_exchange not in (a, b)):
                         continue
                     book_a = idx.get((a, sym))
                     book_b = idx.get((b, sym))
@@ -417,7 +457,7 @@ class ArbEngine:
                     max_size = min(
                         dynamic_size,
                         min(ask_liq, bid_liq) * 0.10,
-                        settings.ARB_CAPITAL_PER_EXCHANGE,
+                        self._capital_per_exchange,
                     )
 
                     candidate = ArbOpportunity(
@@ -679,9 +719,9 @@ class ArbEngine:
     # ── Circuit breakers ────────────────────────────────────────────────
 
     def _cb_triggered(self) -> bool:
-        if self._daily_pnl_usd <= -settings.ARB_DAILY_LOSS_HALT_USD:
+        if self._daily_pnl_usd <= -self._daily_loss_halt_usd:
             return True
-        if self._consecutive_losses >= settings.ARB_CONSECUTIVE_LOSS_HALT:
+        if self._consecutive_losses >= self._consecutive_loss_halt:
             return True
         return False
 
@@ -709,6 +749,8 @@ class ArbEngine:
         if ccxt is None:
             return clients
         for name in settings.ARB_FEE_MAP:
+            if self._exchange_filter is not None and name not in self._exchange_filter:
+                continue
             cls = getattr(ccxt, name, None)
             if cls is None:
                 logger.debug(f"ccxt has no exchange '{name}'")

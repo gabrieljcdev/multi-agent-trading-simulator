@@ -171,6 +171,62 @@ async def test_opportunity_above_threshold_returned(monkeypatch):
 
 
 # ─────────────────────────────────────────────────────────────────────────
+# Ring-fenced fund: required_exchange + per-fund overrides
+# ─────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_required_exchange_filters_non_mexc_legs(monkeypatch):
+    """A fund with required_exchange='mexc' ignores a fat gap between two
+    non-MEXC venues — the MEXC-arb fund only takes gaps with a MEXC leg."""
+    monkeypatch.setattr(settings, "ARB_WATCH_PAIRS", ["BTC/USDT"])
+    a = _mock_exchange(asks=[[100.00, 50.0]] * 3, bids=[[99.99, 50.0]] * 3)
+    b = _mock_exchange(asks=[[101.01, 50.0]] * 3, bids=[[101.00, 50.0]] * 3)
+    engine = ArbEngine(
+        exchange_clients={"bitget": a, "kraken": b}, sim_mode=True,
+        required_exchange="mexc", watch_pairs=["BTC/USDT"],
+    )
+    assert (await engine._find_best_opportunity()) is None
+
+
+@pytest.mark.asyncio
+async def test_required_exchange_allows_mexc_leg(monkeypatch):
+    """Same fat gap, but now one leg is MEXC → the opportunity surfaces
+    with MEXC as one of its legs."""
+    a = _mock_exchange(asks=[[100.00, 50.0]] * 3, bids=[[99.99, 50.0]] * 3)
+    b = _mock_exchange(asks=[[101.01, 50.0]] * 3, bids=[[101.00, 50.0]] * 3)
+    engine = ArbEngine(
+        exchange_clients={"mexc": a, "kraken": b}, sim_mode=True,
+        required_exchange="mexc", watch_pairs=["BTC/USDT"],
+    )
+    opp = await engine._find_best_opportunity()
+    assert opp is not None
+    assert "mexc" in (opp.buy_exchange, opp.sell_exchange)
+
+
+def test_fund_overrides_capital_and_cb_thresholds():
+    """Per-fund constructor overrides take effect; defaults still read the
+    global arb settings so the original single-pool engine is unchanged."""
+    default = ArbEngine(
+        exchange_clients={"bitget": MagicMock(), "kraken": MagicMock()},
+        sim_mode=True,
+    )
+    assert default.fund_id == "arb"
+    assert default._daily_loss_halt_usd == settings.ARB_DAILY_LOSS_HALT_USD
+    assert default._capital_per_exchange == settings.ARB_CAPITAL_PER_EXCHANGE
+
+    fund = ArbEngine(
+        exchange_clients={"mexc": MagicMock(), "kraken": MagicMock()},
+        sim_mode=True, fund_id="mexc-arb",
+        capital_per_exchange_usd=100.0, daily_loss_halt_usd=10.0,
+    )
+    assert fund.fund_id == "mexc-arb"
+    assert fund._capital_per_exchange == 100.0
+    assert fund.get_stats()["fund_id"] == "mexc-arb"
+    fund._daily_pnl_usd = -10.01      # just past the $10 (10% of $100) halt
+    assert fund._cb_triggered() is True
+
+
+# ─────────────────────────────────────────────────────────────────────────
 # Both legs fire concurrently — not sequentially
 # ─────────────────────────────────────────────────────────────────────────
 

@@ -1,0 +1,60 @@
+"""tests/test_funds.py — ring-fenced fund architecture invariants.
+
+Four independent funds (signal / arb / mexc-scalp / mexc-arb), each a
+capital pool mapped 1:1 to an agent. Exchanges may be shared; capital
+never is. These guard the wiring so the funds can't silently drift.
+"""
+from config import settings
+
+
+def test_fund_constants_present_and_positive():
+    for name in ("FUND_SIGNAL_CAPITAL", "FUND_ARB_CAPITAL",
+                 "FUND_MEXC_SCALP_CAPITAL", "FUND_MEXC_ARB_CAPITAL",
+                 "FUND_DAILY_LOSS_HALT_PCT"):
+        assert hasattr(settings, name), f"missing {name}"
+        assert getattr(settings, name) > 0
+
+
+def test_starting_capital_is_sum_of_funds():
+    total = (settings.FUND_SIGNAL_CAPITAL + settings.FUND_ARB_CAPITAL
+             + settings.FUND_MEXC_SCALP_CAPITAL + settings.FUND_MEXC_ARB_CAPITAL)
+    assert total == 1100.0
+    assert settings.STARTING_CAPITAL == total
+
+
+def test_legacy_aliases_track_fund_constants():
+    assert settings.SIGNAL_AGENT_CAPITAL == settings.FUND_SIGNAL_CAPITAL
+    assert settings.ARB_AGENT_CAPITAL == settings.FUND_ARB_CAPITAL
+
+
+def test_mexc_routing_in_strategy_map_and_fee_map():
+    assert settings.STRATEGY_EXCHANGE_MAP["scalp"] == ["mexc"]
+    assert "mexc" in settings.STRATEGY_EXCHANGE_MAP["arb"]
+    assert "mexc" in settings.ARB_FEE_MAP
+
+
+def test_registered_funds_carry_their_allocation():
+    from agents import REGISTERED_AGENTS
+    by_id = {a.agent_id: a for a in REGISTERED_AGENTS}
+    assert by_id["signal"].capital_allocation == settings.FUND_SIGNAL_CAPITAL
+    assert by_id["arb"].capital_allocation == settings.FUND_ARB_CAPITAL
+    assert by_id["scalp"].capital_allocation == settings.FUND_MEXC_SCALP_CAPITAL
+    assert by_id["mexc-arb"].capital_allocation == settings.FUND_MEXC_ARB_CAPITAL
+
+
+def test_scalp_fund_size_decoupled_from_trading_budget():
+    """Scalp shows the $100 MEXC-scalp fund as its allocation while its
+    trading budget stays SCALP_CAPITAL (observation when 0)."""
+    from agents import REGISTERED_AGENTS
+    scalp = next(a for a in REGISTERED_AGENTS if a.agent_id == "scalp")
+    assert scalp.capital_allocation == settings.FUND_MEXC_SCALP_CAPITAL
+    assert scalp._capital == settings.SCALP_CAPITAL
+
+
+def test_mexc_arb_fund_set_includes_mexc_main_arb_excludes_it():
+    from agents import MexcArbAgentWrapper
+    assert "mexc" in MexcArbAgentWrapper()._exchange_set()
+    # Main arb fund's venue list (computed in ArbAgentWrapper.start) excludes MEXC.
+    main_arb_venues = [e for e in settings.ARB_FEE_MAP if e != "mexc"]
+    assert "mexc" not in main_arb_venues
+    assert len(main_arb_venues) >= 2

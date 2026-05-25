@@ -314,11 +314,14 @@ def test_refresh_coordinator_data_caches_async_results():
         "daily_pnl_pct": 1.25,
     }
     assert dash._agent_stats_cache == [{
-        "name":    "Signal",
-        "status":  RUNNING,
-        "capital": 400.0,
-        "pnl_pct": 1.25,
-        "trades":  3,
+        "name":     "SIGNAL",
+        "status":   RUNNING,
+        "capital":  400.0,
+        "equity":   405.0,      # capital 400 + daily_pnl 5.0
+        "pnl_pct":  1.25,
+        "pnl_usd":  5.0,
+        "win_rate": 0.66,
+        "trades":   3,
     }]
 
     # Panels now render against populated caches without raising
@@ -670,11 +673,10 @@ def test_scalp_panel_renders_header_and_sections_when_available():
     }
     text = _render_to_string(dash._panel_scalp_feed())
 
-    # Header bits
+    # Header bits — scalp is MEXC-only now (STRATEGY_EXCHANGE_MAP["scalp"]).
     assert "SCALP"       in text
     assert "OFI-Primary" in text
     assert "MEXC"        in text
-    assert "BITGET"      in text
     assert "obs-mode"    in text
 
     # OFI strip — top 5 by |z|

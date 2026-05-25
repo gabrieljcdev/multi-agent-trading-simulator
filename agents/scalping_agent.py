@@ -518,7 +518,12 @@ class ScalpingAgent(BaseAgent):
         regime_detector:  Optional[Any] = None,
     ):
         super().__init__()
-        self.capital_allocation = float(settings.SCALP_CAPITAL)
+        # Fund allocation (the ring-fenced MEXC-scalp pool, shown on the
+        # dashboard) is decoupled from the *trading* budget: the latter
+        # stays SCALP_CAPITAL so observation mode (SCALP_CAPITAL=0) is
+        # preserved regardless of fund size. Flip to live by raising
+        # SCALP_CAPITAL once the DB confirms edge.
+        self.capital_allocation = float(settings.FUND_MEXC_SCALP_CAPITAL)
         self._capital           = float(settings.SCALP_CAPITAL)
 
         self._ofi_engine  = OFIEngine(

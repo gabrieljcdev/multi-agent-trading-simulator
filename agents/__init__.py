@@ -218,11 +218,18 @@ class ArbAgentWrapper(BaseAgent):
             self._status = OFFLINE
             return
         from execution.arb_engine import ArbEngine
-        self._engine = ArbEngine(dashboard=self._dashboard)
+        # Main arb fund — every approved arb venue EXCEPT MEXC. MEXC legs
+        # belong to the ring-fenced MEXC-arb fund (MexcArbAgentWrapper), so
+        # excluding it here keeps this fund's capital + P&L fully separate.
+        self._engine = ArbEngine(
+            dashboard=self._dashboard,
+            fund_id="arb",
+            exchanges=[e for e in settings.ARB_FEE_MAP if e != "mexc"],
+        )
         import time as _time
         self._status = RUNNING
         self._start_time = _time.time()
-        logger.info("ArbAgent: starting ArbEngine")
+        logger.info("ArbAgent: starting ArbEngine (main fund, excl. MEXC)")
         await self._engine.start()      # runs forever until stop()
 
     async def stop(self) -> None:
@@ -279,6 +286,77 @@ class ArbAgentWrapper(BaseAgent):
 
 
 # ─────────────────────────────────────────────────────────────────────────
+# MexcArbAgentWrapper — ring-fenced MEXC-only arb fund
+# ─────────────────────────────────────────────────────────────────────────
+
+class MexcArbAgentWrapper(ArbAgentWrapper):
+    """A second ArbEngine restricted to opportunities with a MEXC leg,
+    funded by FUND_MEXC_ARB_CAPITAL and circuit-broken independently of the
+    main arb fund. It shares exchanges with the main arb fund but never its
+    capital — the required-leg filter keeps the two funds' trade sets (and
+    therefore their P&L) disjoint.
+
+    Subclasses ArbAgentWrapper so stop/close_all_positions/get_stats are
+    inherited; only construction + availability differ.
+    """
+    agent_id     = "mexc-arb"
+    display_name = "MEXC-Arb Agent"
+
+    def __init__(self):
+        super().__init__()
+        self.capital_allocation = settings.FUND_MEXC_ARB_CAPITAL
+
+    def _exchange_set(self) -> list[str]:
+        """MEXC plus every arb-approved venue that also carries a fee entry."""
+        arb_map = settings.STRATEGY_EXCHANGE_MAP.get("arb", [])
+        return [e for e in arb_map if e in settings.ARB_FEE_MAP]
+
+    def is_available(self) -> bool:
+        try:
+            from execution.arb_engine import ArbEngine  # noqa: F401
+        except ImportError:
+            return False
+        exset = self._exchange_set()
+        if "mexc" not in exset or len(exset) < 2:
+            return False
+        if settings.SIM_MODE:
+            return True
+        # Live: need a routable MEXC key + ≥1 keyed counterpart venue.
+        mexc_keyed = bool(
+            os.getenv("MEXC_KEY_1_API_KEY") and os.getenv("MEXC_KEY_1_SECRET")
+        )
+        counterparts = sum(
+            1 for ex in exset if ex != "mexc"
+            and os.getenv(f"{ex.upper()}_API_KEY") and os.getenv(f"{ex.upper()}_SECRET")
+        )
+        return mexc_keyed and counterparts >= 1
+
+    async def start(self) -> None:
+        if not self.is_available():
+            self._status = OFFLINE
+            return
+        from execution.arb_engine import ArbEngine
+        halt_usd = (settings.FUND_MEXC_ARB_CAPITAL
+                    * settings.FUND_DAILY_LOSS_HALT_PCT / 100.0)
+        self._engine = ArbEngine(
+            dashboard=self._dashboard,
+            fund_id="mexc-arb",
+            exchanges=self._exchange_set(),
+            required_exchange="mexc",
+            capital_per_exchange_usd=settings.FUND_MEXC_ARB_CAPITAL,
+            daily_loss_halt_usd=halt_usd,
+        )
+        import time as _time
+        self._status = RUNNING
+        self._start_time = _time.time()
+        logger.info(
+            "MexcArbAgent: starting MEXC-restricted ArbEngine "
+            f"(fund=${settings.FUND_MEXC_ARB_CAPITAL:.0f}, halt=-${halt_usd:.0f})"
+        )
+        await self._engine.start()
+
+
+# ─────────────────────────────────────────────────────────────────────────
 # Placeholder agents — render on dashboard, no behaviour yet
 # ─────────────────────────────────────────────────────────────────────────
 
@@ -327,6 +405,7 @@ REGISTERED_AGENTS: list[BaseAgent] = [
     SignalAgentWrapper(),
     ArbAgentWrapper(),
     ScalpingAgent(),
+    MexcArbAgentWrapper(),
     MacroAgentPlaceholder(),
     SentimentAgentPlaceholder(),
     OnChainAgentPlaceholder(),
@@ -340,6 +419,7 @@ __all__ = [
     "AgentStats",
     "SignalAgentWrapper",
     "ArbAgentWrapper",
+    "MexcArbAgentWrapper",
     "ScalpingAgent",
     "MacroAgentPlaceholder",
     "SentimentAgentPlaceholder",

@@ -331,13 +331,27 @@ class Dashboard:
         if callable(getter):
             try:
                 stats_list = await getter() or []
+                # Map agent_id → fund label for the FUNDS panel; unknown
+                # agents fall back to a title-cased id.
+                fund_labels = {
+                    "signal":   "SIGNAL",
+                    "arb":      "ARB",
+                    "scalp":    "MEXC-SCALP",
+                    "mexc-arb": "MEXC-ARB",
+                }
                 self._agent_stats_cache = [
                     {
-                        "name":    (getattr(s, "agent_id", "?") or "?").title(),
-                        "status":  getattr(s, "status", "OFFLINE"),
-                        "capital": getattr(s, "capital_allocated", 0.0),
-                        "pnl_pct": getattr(s, "daily_pnl_pct",     0.0),
-                        "trades":  getattr(s, "trades_today",      0),
+                        "name":     fund_labels.get(
+                            getattr(s, "agent_id", "") or "",
+                            (getattr(s, "agent_id", "?") or "?").title()),
+                        "status":   getattr(s, "status", "OFFLINE"),
+                        "capital":  getattr(s, "capital_allocated", 0.0),
+                        "equity":   getattr(s, "capital_allocated", 0.0)
+                                    + getattr(s, "daily_pnl", 0.0),
+                        "pnl_pct":  getattr(s, "daily_pnl_pct", 0.0),
+                        "pnl_usd":  getattr(s, "daily_pnl", 0.0),
+                        "win_rate": getattr(s, "win_rate_today", 0.0),
+                        "trades":   getattr(s, "trades_today", 0),
                     }
                     for s in stats_list
                 ]
@@ -703,53 +717,59 @@ class Dashboard:
         return Panel(t, title="[bold]MARKET OVERVIEW[/bold]", border_style="cyan")
 
     def _panel_agents(self) -> Panel:
+        """Per-fund breakdown — one row per ring-fenced fund + a TOTAL.
+        Each fund is an independent capital pool (see settings FUND_*)."""
         t = Table(expand=True, show_header=True, header_style="bold")
-        t.add_column("Agent")
+        t.add_column("Fund")
         t.add_column("Status")
         t.add_column("Capital",   justify="right")
-        t.add_column("Today P&L", justify="right")
-        t.add_column("Trades",    justify="right")
+        t.add_column("Equity",    justify="right")
+        t.add_column("Daily P&L", justify="right")
+        t.add_column("Win Rate",  justify="right")
 
         # Populated by the async run() loop — see _refresh_coordinator_data.
-        agent_stats: list[dict] = list(self._agent_stats_cache)
+        # Only fund-bearing agents (capital > 0); placeholders sit at $0.
+        agent_stats = [a for a in self._agent_stats_cache if a.get("capital", 0.0) > 0]
 
         if not agent_stats:
-            # Coordinator not wired — show the planned roster as OFFLINE
-            for name in ("Arb", "Signal", "Sentiment", "Macro", "OnChain"):
+            # Coordinator not wired — show the planned funds as OFFLINE.
+            for name in ("SIGNAL", "ARB", "MEXC-SCALP", "MEXC-ARB"):
                 t.add_row(name, "[dim]OFFLINE[/dim]", "[dim]—[/dim]",
-                          "[dim]—[/dim]", "[dim]—[/dim]")
+                          "[dim]—[/dim]", "[dim]—[/dim]", "[dim]—[/dim]")
             t.add_row("[bold]TOTAL[/bold]", "", "[dim]—[/dim]",
-                      "[dim]—[/dim]", "[dim]—[/dim]")
-            return Panel(t, title="[bold]AGENTS[/bold]", border_style="dim")
+                      "[dim]—[/dim]", "[dim]—[/dim]", "[dim]—[/dim]")
+            return Panel(t, title="[bold]FUNDS[/bold]", border_style="dim")
 
-        total_cap = 0.0
-        total_pnl = 0.0
-        total_n   = 0
+        total_cap = total_eq = total_pnl_usd = 0.0
         for a in agent_stats:
             st = a.get("status", "OFFLINE")
             st_col = _status_colour(st)
             cap = a.get("capital", 0.0)
-            pnl = a.get("pnl_pct", 0.0)
-            n   = a.get("trades", 0)
-            total_cap += cap
-            total_pnl += pnl
-            total_n   += n
-            pnl_col = _pnl_colour(pnl)
+            eq  = a.get("equity", cap)
+            pnl_pct = a.get("pnl_pct", 0.0)
+            wr  = a.get("win_rate", 0.0)
+            total_cap     += cap
+            total_eq      += eq
+            total_pnl_usd += a.get("pnl_usd", 0.0)
+            pnl_col = _pnl_colour(pnl_pct)
             t.add_row(
                 a.get("name", "?"),
                 f"[{st_col}]{st}[/{st_col}]",
                 f"${cap:,.0f}",
-                f"[{pnl_col}]{pnl:+.2f}%[/{pnl_col}]",
-                str(n),
+                f"${eq:,.2f}",
+                f"[{pnl_col}]{pnl_pct:+.2f}%[/{pnl_col}]",
+                f"{wr*100:.0f}%",
             )
-        total_pnl_col = _pnl_colour(total_pnl)
+        total_pct = (total_pnl_usd / total_cap * 100.0) if total_cap else 0.0
+        total_col = _pnl_colour(total_pct)
         t.add_row(
             "[bold]TOTAL[/bold]", "",
             f"[bold]${total_cap:,.0f}[/bold]",
-            f"[bold {total_pnl_col}]{total_pnl:+.2f}%[/bold {total_pnl_col}]",
-            f"[bold]{total_n}[/bold]",
+            f"[bold]${total_eq:,.2f}[/bold]",
+            f"[bold {total_col}]{total_pct:+.2f}%[/bold {total_col}]",
+            "",
         )
-        return Panel(t, title="[bold]AGENTS[/bold]", border_style="cyan")
+        return Panel(t, title="[bold]FUNDS[/bold]", border_style="cyan")
 
     def _panel_circuit_breakers(self) -> Panel:
         cb = getattr(self._bot, "_cb_state", None)

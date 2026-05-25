@@ -50,6 +50,9 @@ class Coordinator:
         self._dashboard = dashboard
         self._running = False
         self._halted_by_portfolio_cb = False
+        # agent_ids currently halted by their own per-fund daily-loss CB.
+        # Cleared when a fund's daily P&L recovers above the limit.
+        self._fund_halted: set[str] = set()
 
         self._check_capital_sum()
 
@@ -220,11 +223,42 @@ class Coordinator:
         while self._running:
             await asyncio.sleep(settings.PORTFOLIO_MONITOR_INTERVAL_SEC)
             try:
+                agent_stats = await self.get_agent_stats()
                 stats = await self.get_portfolio_stats()
                 self._log_snapshot(stats)
+                # Per-fund CBs first (independent halts), then the
+                # portfolio-wide backstop (global emergency halt).
+                await self._check_fund_circuit_breakers(agent_stats)
                 await self._check_portfolio_circuit_breakers(stats)
             except Exception as e:
                 logger.error(f"portfolio monitor: {e}", exc_info=True)
+
+    async def _check_fund_circuit_breakers(self, agent_stats: list[AgentStats]) -> None:
+        """Per-fund daily-loss halt — independent of every other fund.
+
+        Each fund (agent) halts when its OWN daily P&L breaches
+        -FUND_DAILY_LOSS_HALT_PCT of its allocation, pausing only that agent.
+        A MEXC fund tripping never touches the signal/arb funds — that's the
+        ring-fence. Sits beside the portfolio-wide CB, which is a global
+        emergency backstop. Idempotent via self._fund_halted; an agent clears
+        once its daily P&L recovers above the limit (e.g. after the agent's
+        own UTC daily reset zeroes its P&L)."""
+        limit = settings.FUND_DAILY_LOSS_HALT_PCT
+        for s in agent_stats:
+            breached = s.daily_pnl_pct <= -limit
+            if breached and s.agent_id not in self._fund_halted:
+                self._fund_halted.add(s.agent_id)
+                logger.critical(
+                    f"FUND HALT — {s.agent_id} daily loss {s.daily_pnl_pct:.2f}% "
+                    f"breached -{limit:.0f}% of its ${s.capital_allocated:,.0f} fund"
+                )
+                self._log_event(s.agent_id, "FUND_HALTED",
+                                f"daily_loss {s.daily_pnl_pct:.2f}%")
+                agent = self.get_agent(s.agent_id)
+                if agent is not None:
+                    await self._safe_pause(agent)
+            elif not breached:
+                self._fund_halted.discard(s.agent_id)
 
     async def _check_portfolio_circuit_breakers(self, stats: dict) -> None:
         """Daily-loss + exposure CBs that sit above per-agent CBs."""

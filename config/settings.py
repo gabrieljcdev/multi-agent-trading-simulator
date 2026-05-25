@@ -250,6 +250,7 @@ ARB_FEE_MAP = {
     "gateio":   0.0020,
     "bitfinex": 0.0020,
     "bybit":    0.0010,
+    "mexc":     0.0000,    # 0% spot — confirmed standard rate (see SCALP_FEE_OVERRIDES)
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -516,19 +517,35 @@ PREDICTIVE_PENALTY_WEAK         = 15
 # MULTI-AGENT COORDINATOR
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Total starting equity for the portfolio. Drives CircuitBreakerState
-# baseline + falls back as initial value when the DB has no prior
-# portfolio_snapshot to recover from (see core/bot.py startup).
-STARTING_CAPITAL     = 1000.0    # test: 200–10000
+# ── Ring-fenced fund architecture ───────────────────────────────────────
+# Each fund is an independent capital pool mapped 1:1 to an agent.
+# Exchanges may be SHARED across funds, but capital is NEVER shared: a loss
+# in one fund cannot draw from another, profits stay in their own fund, and
+# circuit breakers are per-fund. The two MEXC funds form a $200 pot that is
+# fully ring-fenced from the main binance/bybit/kraken portfolio.
+FUND_SIGNAL_CAPITAL     = 400.0   # signal agent  — binance/bybit/kraken
+FUND_ARB_CAPITAL        = 500.0   # arb agent     — kraken/bybit/bitget/... (excludes MEXC)
+FUND_MEXC_SCALP_CAPITAL = 100.0   # scalping, MEXC only (observation until SCALP_CAPITAL>0)
+FUND_MEXC_ARB_CAPITAL   = 100.0   # arb legs that include a MEXC venue only
 
-# Per-agent capital allocation (USD). Sum should match STARTING_CAPITAL;
-# the coordinator warns at startup if their sum exceeds total
-# EXCHANGE_BALANCES.
-SIGNAL_AGENT_CAPITAL = 400.0     # test: 100–800
-ARB_AGENT_CAPITAL    = 600.0     # test: 100–1000  (sum of per-exchange budgets)
+# Per-fund daily-loss halt: each fund halts independently at this % of its
+# OWN size, so a MEXC fund tripping never touches signal/arb. Enforced by
+# Coordinator._check_fund_circuit_breakers, alongside the portfolio CB.
+FUND_DAILY_LOSS_HALT_PCT = 10.0   # test: 5–20
 
-# Arb engine reserves this much per exchange leg — caps how aggressive
-# any single venue can get. 6 configured exchanges × this = ARB_AGENT_CAPITAL.
+# Total starting equity for the portfolio — the sum of all funds. Drives
+# CircuitBreakerState baseline + falls back as initial value when the DB
+# has no prior portfolio_snapshot (see core/bot.py startup). Reference only.
+STARTING_CAPITAL     = 1100.0    # test: 200–10000   (= sum of FUND_* above)
+
+# Legacy aliases — existing code/tests read these names. Pointed at the
+# fund constants so there is a single source of truth for each pool.
+SIGNAL_AGENT_CAPITAL = FUND_SIGNAL_CAPITAL   # test: 100–800
+ARB_AGENT_CAPITAL    = FUND_ARB_CAPITAL      # test: 100–1000  (main arb, excl. MEXC)
+
+# Arb engine reserves this much per exchange leg — caps how aggressive any
+# single venue can get. Each fund's engine can override it (the MEXC-arb
+# fund caps per-leg at its own $100 size).
 ARB_CAPITAL_PER_EXCHANGE = 100.0   # test: 50–200
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -539,8 +556,8 @@ ARB_CAPITAL_PER_EXCHANGE = 100.0   # test: 50–200
 # exchange to a strategy = one line change here, no code changes (the
 # agent reads this map directly).
 STRATEGY_EXCHANGE_MAP = {
-    "scalp":     ["mexc", "bitget"],
-    "arb":       ["kraken", "bybit", "bitget", "bitstamp", "gateio", "bitfinex"],
+    "scalp":     ["mexc"],
+    "arb":       ["kraken", "bybit", "bitget", "bitstamp", "gateio", "bitfinex", "mexc"],
     "momentum":  ["binance", "bybit", "kraken"],
     "reversion": ["binance", "bybit", "kraken"],
     "sweep":     ["binance", "bybit"],
