@@ -555,10 +555,10 @@ STRATEGY_EXCHANGE_MAP = {
 
 SCALP_CAPITAL             = 0.0     # test: 0-100   ($0 = observation only)
 
-# Universe = the 95 of 102 candidate pairs that at least one MEXC key is
+# Universe = the 96 of 102 candidate pairs that at least one MEXC key is
 # API-allowlisted to trade, discovered by probing each key's selfSymbols
-# endpoint (2026-05-25). 7 candidates dropped — no key covers them:
-# POL, FTM, EOS, MKR, BRETT, HMSTR, NEIROCTO (FTM/EOS/MKR/BRETT aren't
+# endpoint (2026-05-25). 6 candidates dropped — no key covers them:
+# FTM, EOS, MKR, BRETT, HMSTR, NEIROCTO (FTM/EOS/MKR/BRETT aren't
 # active MEXC USDT spot markets at all). Every pair here has a route in
 # MEXC_PAIR_KEY_MAP below; re-run scripts/mexc_probe.py after changing
 # a key's allowlist on MEXC and update both lists together.
@@ -584,10 +584,10 @@ SCALP_PAIRS = [
     "PNUT/USDT", "ACT/USDT",  "GOAT/USDT", "MOODENG/USDT","POPCAT/USDT",
     "MOG/USDT",  "LUNC/USDT", "CFX/USDT",  "ROSE/USDT", "JASMY/USDT",
     "HOT/USDT",  "AR/USDT",
-    # ── Key 4 (13) ──
+    # ── Key 4 (14) ──
     "CHZ/USDT",  "ENJ/USDT",  "MAGIC/USDT","RON/USDT",  "BEAM/USDT",
     "PORTAL/USDT","HNT/USDT", "KAVA/USDT", "EGLD/USDT", "FLOW/USDT",
-    "ONE/USDT",  "ZIL/USDT",  "KSM/USDT",
+    "ONE/USDT",  "ZIL/USDT",  "KSM/USDT",  "POL/USDT",
 ]
 
 # MEXC supports per-key pair allowlists — one account can hold many API
@@ -629,7 +629,7 @@ MEXC_PAIR_KEY_MAP: dict[str, int] = {
     "CHZ/USDT": 4,  "ENJ/USDT": 4,  "MAGIC/USDT": 4,"RON/USDT": 4,
     "BEAM/USDT": 4, "PORTAL/USDT": 4,"HNT/USDT": 4, "KAVA/USDT": 4,
     "EGLD/USDT": 4, "FLOW/USDT": 4, "ONE/USDT": 4,  "ZIL/USDT": 4,
-    "KSM/USDT": 4,
+    "KSM/USDT": 4,  "POL/USDT": 4,
 }
 
 # Fee-aware profit targeting — TP/SL are computed dynamically, not fixed.
