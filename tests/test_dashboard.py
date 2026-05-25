@@ -701,17 +701,26 @@ def test_scalp_panel_renders_header_and_sections_when_available():
     assert "avg-net"     in text
 
 
-def test_scalp_panel_shows_live_label_when_capital_positive():
-    """SCALP_CAPITAL > 0 → header shows LIVE (red), not obs-mode."""
+def test_scalp_panel_sim_and_live_badges(monkeypatch):
+    """SCALP_CAPITAL > 0 → header shows SIM in sim mode (LIVE only when
+    SIM_MODE is False), never obs-mode."""
+    from config import settings as s
     dash = Dashboard(_mock_bot())
     dash._scalp_data_cache = {
         "available": True, "live": True,
         "fee_viability": {}, "ofi_top": [],
         "open_positions": [], "recent_closed": [], "stats": {},
     }
+    monkeypatch.setattr(s, "SIM_MODE", True)
     text = _render_to_string(dash._panel_scalp_feed())
-    assert "LIVE"     in text
+    assert "SIM"      in text
+    assert "LIVE"     not in text
     assert "obs-mode" not in text
+
+    monkeypatch.setattr(s, "SIM_MODE", False)
+    text_live = _render_to_string(dash._panel_scalp_feed())
+    assert "LIVE"     in text_live
+    assert "obs-mode" not in text_live
 
 
 def test_scalp_panel_handles_missing_agent_state(monkeypatch):

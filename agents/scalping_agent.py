@@ -48,9 +48,12 @@ Live wiring (no longer stubs)
       execution.mexc_key_router (one account, many pair-restricted
       keys); other exchanges fall through to market_data._exchanges.
 
-Remaining stub
---------------
-  _place_order(...)                  → Phase 2: execution/router.py
+Execution
+---------
+  _place_order(...)  → SIM_MODE: persists a sim Trade row (mirrors the
+      signal agent's OrderRouter._sim_execute) so scalp fills land in the
+      trades table + P&L queries. Live execution (SIM_MODE=False) is the
+      remaining follow-up → execution/router.py.
 
 When MarketData is absent (offline / test mode), every getter falls
 through to its permissive default so observation mode still hums
@@ -114,6 +117,9 @@ class ScalpPosition:
     sl_bps:              float
     round_trip_cost_bps: float
     observation_only:    bool
+    # Sim Trade row id (set by _place_order when observation_only is False)
+    # so _exit_position can close the same row. None in observation mode.
+    trade_id:            Optional[int] = None
 
 
 @dataclass
@@ -546,7 +552,11 @@ class ScalpingAgent(BaseAgent):
         self._pending_flush: list[ScalpObservation]   = []
 
         # Per-agent circuit breakers (independent of the portfolio breaker).
+        # _daily_loss accumulates only losses (drives the daily-loss halt);
+        # _daily_pnl is the NET realised daily P&L (wins + losses) used for
+        # equity reporting against SCALP_CAPITAL. Both reset at UTC rollover.
         self._daily_loss:      float = 0.0
+        self._daily_pnl:       float = 0.0
         self._consec_losses:   int   = 0
         self._halted:          bool  = False
         self._halt_reason:     str   = ""
@@ -658,14 +668,16 @@ class ScalpingAgent(BaseAgent):
 
     async def get_stats(self) -> AgentStats:
         capital_deployed = sum(p.size_usd for p in self._positions.values())
-        daily_pnl_pct = (self._daily_loss / self.capital_allocation * 100.0) \
+        # Equity tracks net daily P&L against the fund (SCALP_CAPITAL): the
+        # coordinator reads fund equity as capital_allocated + daily_pnl.
+        daily_pnl_pct = (self._daily_pnl / self.capital_allocation * 100.0) \
             if self.capital_allocation else 0.0
         return AgentStats(
             agent_id=self.agent_id,
             status=HALTED if self._halted else (RUNNING if self._running else OFFLINE),
             capital_allocated=self.capital_allocation,
             capital_deployed=capital_deployed,
-            daily_pnl=float(self._daily_loss),
+            daily_pnl=float(self._daily_pnl),
             daily_pnl_pct=daily_pnl_pct,
             total_pnl=float(self._stats["total_pnl"]),
             trades_today=int(self._stats["entries_today"]),
@@ -826,19 +838,45 @@ class ScalpingAgent(BaseAgent):
                 return float(change)
         return 0.0
 
-    async def _place_order(
-        self,
-        symbol: str,
-        exchange: str,
-        direction: str,
-        size_usd: float,
-        price: float,
-    ) -> None:
-        # TODO Phase 2: route through execution/router.py.
-        log.info(
-            "[ScalpingAgent] _place_order STUB %s %s %s $%.2f @ %.4f",
-            symbol, exchange, direction, size_usd, price,
-        )
+    async def _place_order(self, pos: "ScalpPosition") -> Optional[int]:
+        """Execute a scalp entry.
+
+        SIM_MODE: persist a sim Trade row — mirrors the signal agent's
+        OrderRouter._sim_execute (sim_mode=True) so scalp fills appear in the
+        trades table and the shared P&L queries alongside signal/arb. Returns
+        the Trade id, stored on the position so _exit_position can close the
+        same row. Never raises — a DB hiccup must not stop trading.
+
+        Live (SIM_MODE=False): still a stub → execution/router.py follow-up.
+        """
+        if not settings.SIM_MODE:
+            log.info(
+                "[ScalpingAgent] _place_order LIVE stub %s:%s %s $%.2f @ %.4f",
+                pos.symbol, pos.exchange, pos.direction, pos.size_usd, pos.entry_price,
+            )
+            return None
+
+        trade_data = {
+            "signal_id":      None,   # scalp has no Signal row; FK is nullable
+            "pair":           pos.symbol,
+            "exchange":       pos.exchange,
+            "side":           "long" if pos.direction == "LONG" else "short",
+            "signal_type":    "scalp",
+            "entry_price":    pos.entry_price,
+            "size_usd":       pos.size_usd,
+            "size_base":      pos.size_usd / pos.entry_price if pos.entry_price > 0 else 0.0,
+            "stop_loss":      pos.sl_price,
+            "take_profit":    pos.tp_price,
+            "sim_mode":       True,
+            "profile":        settings.ACTIVE_PROFILE,
+            "strategy":       "scalp",
+            "timestamp_open": datetime.utcnow(),
+        }
+        try:
+            return await asyncio.to_thread(db_queries.save_trade, trade_data)
+        except Exception as e:
+            log.warning("[ScalpingAgent] sim _place_order save_trade failed: %s", e)
+            return None
 
     # ── Main loop ───────────────────────────────────────────────────────
 
@@ -1113,12 +1151,10 @@ class ScalpingAgent(BaseAgent):
                 symbol, exchange, direction, entry_price,
             )
         else:
-            await self._place_order(
-                symbol, exchange, direction, pos.size_usd, entry_price,
-            )
+            pos.trade_id = await self._place_order(pos)
             log.info(
-                "[ScalpingAgent] ENTRY %s:%s %s @ %.4f tp=%.4f sl=%.4f",
-                symbol, exchange, direction, entry_price, tp_price, sl_price,
+                "[ScalpingAgent] ENTRY (SIM) %s:%s %s @ %.4f tp=%.4f sl=%.4f size=$%.2f",
+                symbol, exchange, direction, entry_price, tp_price, sl_price, pos.size_usd,
             )
 
     def _log_skip(
@@ -1268,7 +1304,8 @@ class ScalpingAgent(BaseAgent):
         # Circuit breakers — only count real trades.
         if pos.size_usd > 0:
             self._stats["total_pnl"] += pnl_usd
-            self._daily_loss += min(pnl_usd, 0.0)
+            self._daily_pnl  += pnl_usd            # net realised P&L → equity
+            self._daily_loss += min(pnl_usd, 0.0)  # losses only → halt trigger
             if pnl_usd < 0:
                 self._consec_losses += 1
             else:
@@ -1277,6 +1314,19 @@ class ScalpingAgent(BaseAgent):
                 self._halt(f"Daily loss halt: ${abs(self._daily_loss):.2f}")
             if self._consec_losses >= settings.SCALP_CONSEC_LOSS_PAUSE:
                 self._halt(f"Consecutive losses: {self._consec_losses}")
+
+        # Close the sim Trade row for a real (non-observation) fill so the
+        # trades table carries the exit + P&L. Fund equity (SCALP_CAPITAL +
+        # net daily P&L) is surfaced via get_stats.daily_pnl. Never raises.
+        if not pos.observation_only and pos.trade_id is not None:
+            pnl_pct = (pnl_usd / pos.size_usd * 100.0) if pos.size_usd > 0 else 0.0
+            try:
+                await asyncio.to_thread(
+                    db_queries.close_trade,
+                    pos.trade_id, exit_price, reason, pnl_usd, pnl_pct,
+                )
+            except Exception as e:
+                log.warning("[ScalpingAgent] sim close_trade failed: %s", e)
 
         self._stats["exits_today"] += 1
         if pos_key in self._positions:
@@ -1297,6 +1347,7 @@ class ScalpingAgent(BaseAgent):
         today = datetime.utcnow().date()
         if today > self._last_reset_date:
             self._daily_loss = 0.0
+            self._daily_pnl = 0.0
             self._consec_losses = 0
             self._stats["entries_today"] = 0
             self._stats["exits_today"]   = 0

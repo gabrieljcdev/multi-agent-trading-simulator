@@ -577,11 +577,13 @@ STRATEGY_EXCHANGE_MAP = {
 # ══════════════════════════════════════════════════════════════════════════════
 # SCALPING AGENT (agents/scalping_agent.py)
 # ══════════════════════════════════════════════════════════════════════════════
-# SCALP_CAPITAL = 0.0 → observation mode only. No orders placed.
-# Activate: set to e.g. 50.0 AFTER DB confirms edge (win_rate > 52%,
-# avg_net_bps > 0). Also requires MEXC API key in keys.env.
+# SCALP_CAPITAL = 0.0 → observation mode only (no orders placed).
+# >0 enables execution: in SIM_MODE it places simulated scalp trades sized
+# at SCALP_POSITION_SIZE_USD and tracks P&L against this pool. Live
+# execution (SIM_MODE=False) is still a follow-up. Set AFTER DB confirms
+# edge (win_rate > 52%, avg_net_bps > 0); live also needs MEXC keys.
 
-SCALP_CAPITAL             = 0.0     # test: 0-100   ($0 = observation only)
+SCALP_CAPITAL             = 100.0   # test: 0-100   ($0 = observation; >0 = sim execution)
 
 # Universe = the 96 of 102 candidate pairs that at least one MEXC key is
 # API-allowlisted to trade, discovered by probing each key's selfSymbols

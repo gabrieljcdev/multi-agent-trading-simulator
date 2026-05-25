@@ -1256,7 +1256,11 @@ class Dashboard:
             header.append("] ", style="white")
         header.append("│ ", style="dim")
         if live:
-            header.append("LIVE", style="red bold")
+            # capital > 0: SIM badge in sim mode, LIVE (real money) otherwise.
+            if settings.SIM_MODE:
+                header.append("SIM", style="yellow bold")
+            else:
+                header.append("LIVE", style="red bold")
         else:
             header.append("obs-mode", style="yellow")
 

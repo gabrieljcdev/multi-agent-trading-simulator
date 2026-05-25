@@ -327,6 +327,80 @@ async def test_circuit_breaker_daily_loss():
 
 
 # ─────────────────────────────────────────────────────────────────────────
+# SIM EXECUTION (_place_order persists a sim trade; _exit_position closes it)
+# ─────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_place_order_records_sim_trade(monkeypatch):
+    """In SIM_MODE, _place_order persists a sim Trade row (mirroring the
+    signal agent) and returns its id."""
+    captured = {}
+
+    def _fake_save_trade(data):
+        captured.update(data)
+        return 4242
+
+    monkeypatch.setattr(settings, "SIM_MODE", True)
+    monkeypatch.setattr("database.queries.save_trade", _fake_save_trade)
+
+    agent = _agent_with_capital(100.0)
+    pos = ScalpPosition(
+        symbol="BTC/USDT", exchange="mexc", direction="LONG",
+        entry_price=50_000.0, entry_time=time.time(),
+        entry_ofi_z=2.0, entry_tfi=1.0, size_usd=25.0,
+        tp_price=50_015.0, sl_price=49_990.0,
+        tp_bps=3.0, sl_bps=1.9, round_trip_cost_bps=0.0,
+        observation_only=False,
+    )
+    tid = await agent._place_order(pos)
+    assert tid == 4242
+    assert captured["sim_mode"] is True
+    assert captured["strategy"] == "scalp"
+    assert captured["signal_id"] is None
+    assert captured["pair"] == "BTC/USDT"
+    assert captured["exchange"] == "mexc"
+    assert captured["side"] == "long"
+    assert captured["size_usd"] == 25.0
+
+
+@pytest.mark.asyncio
+async def test_exit_closes_sim_trade_and_tracks_net_equity(monkeypatch):
+    """A real (non-observation) fill: exit closes the Trade row and net
+    daily P&L (equity vs SCALP_CAPITAL) reflects wins, not just losses."""
+    closed = {}
+
+    def _fake_close(trade_id, exit_price, exit_reason, pnl_usd, pnl_pct):
+        closed.update(trade_id=trade_id, exit_price=exit_price,
+                      reason=exit_reason, pnl_usd=pnl_usd, pnl_pct=pnl_pct)
+
+    monkeypatch.setattr("database.queries.close_trade", _fake_close)
+
+    agent = _agent_with_capital(100.0)
+    agent._get_mid_price = AsyncMock(return_value=50_100.0)
+    pos = ScalpPosition(
+        symbol="BTC/USDT", exchange="mexc", direction="LONG",
+        entry_price=50_000.0, entry_time=time.time(),
+        entry_ofi_z=2.0, entry_tfi=1.0, size_usd=50.0,
+        tp_price=50_100.0, sl_price=49_900.0,
+        tp_bps=3.0, sl_bps=1.9, round_trip_cost_bps=0.0,
+        observation_only=False, trade_id=7,
+    )
+    pos_key = "BTC/USDT:mexc"
+    agent._positions[pos_key] = pos
+
+    # +20 bps on $50 → pnl_usd = +0.10 (a win).
+    await agent._exit_position(pos_key, pos, "TP", exit_price=50_100.0)
+
+    assert closed["trade_id"] == 7
+    assert closed["pnl_usd"] == pytest.approx(0.10)
+    # Net daily P&L (equity) reflects the win; the losses-only tracker stays 0.
+    assert agent._daily_pnl == pytest.approx(0.10)
+    assert agent._daily_loss == 0.0
+    stats = await agent.get_stats()
+    assert stats.daily_pnl == pytest.approx(0.10)
+
+
+# ─────────────────────────────────────────────────────────────────────────
 # ADDITIONAL TESTS (17-20)
 # ─────────────────────────────────────────────────────────────────────────
 
