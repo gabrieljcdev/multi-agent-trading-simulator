@@ -704,10 +704,21 @@ class ScalpingAgent(BaseAgent):
             log.debug("[ScalpingAgent] regime_detector import failed: %s", e)
             return None
 
+    def _reconstruct_pnl(self) -> None:
+        """Seed in-memory P&L counters from closed scalp observations so a
+        restart resumes from the fund's accumulated figure rather than zero.
+        pnl_usd is gross, which equals net at MEXC's 0% fees."""
+        try:
+            self._stats["total_pnl"] = db_queries.get_scalp_realized_pnl()
+            self._daily_pnl = db_queries.get_scalp_realized_pnl(today=True)
+        except Exception as e:
+            log.debug("[ScalpingAgent] P&L reconstruction skipped: %s", e)
+
     async def start(self) -> None:
         self._running = True
         self._status = RUNNING
         self._start_time = time.time()
+        self._reconstruct_pnl()
         log.info(
             "[ScalpingAgent] starting in %s mode (capital=$%.0f)",
             "OBSERVATION" if self._capital == 0 else "LIVE",

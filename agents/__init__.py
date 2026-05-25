@@ -135,8 +135,6 @@ class SignalAgentWrapper(BaseAgent):
             )
 
         cb = getattr(self._bot, "_cb_state", None)
-        daily_pnl_pct = getattr(cb, "daily_pnl_pct", 0.0) if cb else 0.0
-        daily_pnl_usd = daily_pnl_pct / 100.0 * self.capital_allocation
         consec        = getattr(cb, "consecutive_losses", 0) if cb else 0
         halted        = bool(getattr(cb, "halted", False))
 
@@ -144,6 +142,11 @@ class SignalAgentWrapper(BaseAgent):
         # Scalp fills live in the shared trades table but belong to the
         # MEXC-scalp fund — exclude strategy="scalp" so they don't pollute
         # the signal fund's trade count, win rate, or deployed capital.
+        #
+        # P&L is read from the persisted ledger rather than the in-memory
+        # _cb_state counters (which reseed to STARTING_CAPITAL every launch),
+        # so a restart resumes from the fund's accumulated figure: daily_pnl =
+        # today's realised, total_pnl = all-time realised.
         try:
             today  = [t for t in db_queries.get_today_trades()
                       if (t.strategy or "") != "scalp"]
@@ -151,8 +154,18 @@ class SignalAgentWrapper(BaseAgent):
             wr_all = db_queries.get_signal_win_rate(days=365, exclude_strategy="scalp")
             open_t = [t for t in db_queries.get_open_trades()
                       if (t.strategy or "") != "scalp"]
+            daily_pnl_usd = db_queries.get_trade_realized_pnl(
+                exclude_strategy="scalp", today=True)
+            total_pnl_usd = db_queries.get_trade_realized_pnl(exclude_strategy="scalp")
         except Exception:
             today, wr_t, wr_all, open_t = [], {"total": 0}, {"total": 0}, []
+            # DB unreachable → fall back to the in-memory daily figure.
+            dpp = getattr(cb, "daily_pnl_pct", 0.0) if cb else 0.0
+            daily_pnl_usd = dpp / 100.0 * self.capital_allocation
+            total_pnl_usd = 0.0
+
+        daily_pnl_pct = (daily_pnl_usd / self.capital_allocation * 100.0) \
+            if self.capital_allocation else 0.0
 
         trades_today = len(today)
         capital_deployed = sum((t.size_usd or 0.0) for t in open_t)
@@ -170,7 +183,7 @@ class SignalAgentWrapper(BaseAgent):
             capital_deployed=capital_deployed,
             daily_pnl=daily_pnl_usd,
             daily_pnl_pct=daily_pnl_pct,
-            total_pnl=0.0,                # all-time P&L tracking is a future job
+            total_pnl=total_pnl_usd,
             trades_today=trades_today,
             win_rate_today=wr_t.get("win_rate", 0.0) if wr_t.get("total") else 0.0,
             win_rate_alltime=wr_all.get("win_rate", 0.0) if wr_all.get("total") else 0.0,
@@ -231,11 +244,22 @@ class ArbAgentWrapper(BaseAgent):
             fund_id="arb",
             exchanges=list(settings.STRATEGY_EXCHANGE_MAP.get("arb", [])),
         )
+        self._reconstruct_engine_pnl(self._engine)
         import time as _time
         self._status = RUNNING
         self._start_time = _time.time()
         logger.info("ArbAgent: starting ArbEngine (arb fund, incl. MEXC)")
         await self._engine.start()      # runs forever until stop()
+
+    @staticmethod
+    def _reconstruct_engine_pnl(engine) -> None:
+        """Seed the engine's in-memory P&L counters from the persisted arb
+        ledger so a restart resumes from accumulated P&L rather than zero."""
+        try:
+            engine._total_pnl_usd = db_queries.get_arb_realized_pnl()
+            engine._daily_pnl_usd = db_queries.get_arb_realized_pnl(today=True)
+        except Exception as e:
+            logger.debug(f"arb P&L reconstruction skipped: {e}")
 
     async def stop(self) -> None:
         if self._engine is not None:

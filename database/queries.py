@@ -656,6 +656,67 @@ def get_last_equity() -> Optional[float]:
     return float(row[0])
 
 
+# ── Realised-P&L reconstruction (equity recovery on restart) ────────────────
+# Each fund tracks daily/total P&L in in-memory counters that reset on every
+# launch. These sum the persisted ledger so an agent can resume from its
+# accumulated figure after a restart — or a hard kill, which never runs the
+# clean-shutdown snapshot. `today=True` restricts to the current UTC date,
+# matching the daily-P&L reset semantics.
+
+def get_trade_realized_pnl(*, only_strategy: Optional[str] = None,
+                           exclude_strategy: Optional[str] = None,
+                           today: bool = False) -> float:
+    """Sum realised pnl_usd over closed trades in the Trade ledger. Signal-fund
+    fills and scalp fills share this table (arb lives in ArbTrade), so callers
+    scope by strategy: the signal fund uses exclude_strategy="scalp"."""
+    today_d = datetime.utcnow().date()
+    with get_session() as s:
+        rows = s.query(Trade).filter(Trade.pnl_usd.isnot(None)).all()
+    total = 0.0
+    for t in rows:
+        strat = t.strategy or ""
+        if only_strategy is not None and strat != only_strategy:
+            continue
+        if exclude_strategy is not None and strat == exclude_strategy:
+            continue
+        if today and not (t.timestamp_close and t.timestamp_close.date() == today_d):
+            continue
+        total += float(t.pnl_usd or 0.0)
+    return round(total, 2)
+
+
+def get_arb_realized_pnl(*, today: bool = False) -> float:
+    """Sum realised net_pnl_usd over the arb fund's ledger (ArbTrade)."""
+    today_d = datetime.utcnow().date()
+    with get_session() as s:
+        rows = s.query(ArbTrade).filter(ArbTrade.net_pnl_usd.isnot(None)).all()
+    total = 0.0
+    for r in rows:
+        if today and not (r.timestamp and r.timestamp.date() == today_d):
+            continue
+        total += float(r.net_pnl_usd or 0.0)
+    return round(total, 2)
+
+
+def get_scalp_realized_pnl(*, today: bool = False) -> float:
+    """Sum realised P&L over closed scalp observations (would_entry,
+    exit_price>0). pnl_usd is gross, which equals net at MEXC's 0% fees."""
+    today_d = datetime.utcnow().date()
+    with get_session() as s:
+        rows = (
+            s.query(ScalpObservationModel)
+            .filter(ScalpObservationModel.would_entry == True,   # noqa: E712
+                    ScalpObservationModel.exit_price > 0)
+            .all()
+        )
+    total = 0.0
+    for r in rows:
+        if today and not (r.created_at and r.created_at.date() == today_d):
+            continue
+        total += float(r.pnl_usd or 0.0)
+    return round(total, 2)
+
+
 def get_portfolio_history(hours: int = 24) -> list:
     since = datetime.utcnow() - timedelta(hours=hours)
     with get_session() as s:
