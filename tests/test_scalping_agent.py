@@ -532,6 +532,108 @@ def test_market_data_get_spread_bps_math():
     assert md.get_spread_bps("mexc", "ETH/USDT") is None
 
 
+def test_market_data_get_change_pct_returns_pct_over_window():
+    """MarketData.get_change_pct: % between latest sample and the one
+    at-or-before window_sec ago. 100 → 101 over 60s = +1.00%."""
+    from core.market_data import MarketData
+    md = MarketData()
+    md._record_price_sample("mexc", "BTC/USDT", 100.0)
+    # Backdate the first sample so it sits ~70s in the past
+    buf = md._price_history[("mexc", "BTC/USDT")]
+    buf[0] = (time.time() - 70.0, 100.0)
+    md._record_price_sample("mexc", "BTC/USDT", 101.0)
+    assert md.get_change_pct("mexc", "BTC/USDT", 60) == pytest.approx(1.0, abs=1e-3)
+
+
+def test_market_data_get_change_pct_none_with_no_history():
+    """No samples → None (not 0.0) so callers can distinguish 'no
+    data yet' from 'no movement'."""
+    from core.market_data import MarketData
+    md = MarketData()
+    assert md.get_change_pct("mexc", "BTC/USDT", 60) is None
+
+
+def test_market_data_get_change_pct_none_when_window_predates_history():
+    """If the buffer's oldest sample is younger than window_sec, return
+    None — we'd otherwise be measuring a window we can't actually see."""
+    from core.market_data import MarketData
+    md = MarketData()
+    md._record_price_sample("mexc", "BTC/USDT", 100.0)
+    md._record_price_sample("mexc", "BTC/USDT", 101.0)
+    # Both samples are fresh, but the 1-minute window pre-dates them.
+    assert md.get_change_pct("mexc", "BTC/USDT", 60) is None
+
+
+def test_market_data_record_price_sample_trims_old_entries():
+    """Samples older than PRICE_HISTORY_WINDOW_SEC must drop off so memory
+    stays bounded regardless of how long the bot runs."""
+    from core.market_data import MarketData
+    md = MarketData()
+    md._record_price_sample("mexc", "BTC/USDT", 100.0)
+    buf = md._price_history[("mexc", "BTC/USDT")]
+    # Backdate well past the trim cutoff
+    buf[0] = (time.time() - md.PRICE_HISTORY_WINDOW_SEC - 60, 100.0)
+    md._record_price_sample("mexc", "BTC/USDT", 101.0)
+    assert len(buf) == 1
+    assert buf[0][1] == 101.0
+
+
+@pytest.mark.asyncio
+async def test_get_btc_1m_change_wired_to_market_data():
+    """Scalp agent's _get_btc_1m_change delegates to
+    MarketData.get_change_pct on the first enabled exchange that has
+    enough history."""
+    from unittest.mock import MagicMock
+
+    md = MagicMock()
+    # First enabled exchange returns None (no history); second returns +0.5%
+    enabled = list(settings.ENABLED_EXCHANGES)
+
+    def _change(ex, pair, window):
+        return 0.5 if ex == enabled[1] else None
+
+    md.get_change_pct.side_effect = _change
+
+    agent = _agent_with_capital(0.0)
+    agent.set_market_data(md)
+    assert await agent._get_btc_1m_change() == pytest.approx(0.5)
+    # Confirmed: called on BTC/USDT at a 60s lookback
+    args = md.get_change_pct.call_args_list[-1].args
+    assert args[1] == "BTC/USDT"
+    assert args[2] == 60
+
+
+@pytest.mark.asyncio
+async def test_get_btc_1m_change_returns_zero_when_no_data():
+    """Cold start (no history on any exchange) → 0.0 so the correlation
+    guard stays permissive on boot rather than spuriously blocking."""
+    from unittest.mock import MagicMock
+    md = MagicMock()
+    md.get_change_pct.return_value = None
+    agent = _agent_with_capital(0.0)
+    agent.set_market_data(md)
+    assert await agent._get_btc_1m_change() == 0.0
+
+
+@pytest.mark.asyncio
+async def test_get_btc_1m_change_zero_when_market_data_missing():
+    """No MarketData wired → 0.0 (the gate stays permissive)."""
+    agent = _agent_with_capital(0.0)
+    agent._market_data = None
+    import sys
+    fake = type(sys)("agents")
+    fake.REGISTERED_AGENTS = []
+    monkey_orig = sys.modules.get("agents")
+    sys.modules["agents"] = fake
+    try:
+        assert await agent._get_btc_1m_change() == 0.0
+    finally:
+        if monkey_orig is not None:
+            sys.modules["agents"] = monkey_orig
+        else:
+            sys.modules.pop("agents", None)
+
+
 @pytest.mark.asyncio
 async def test_micro_price_tracker_backfills_30s():
     """One pass of the tracker loop fills price_30s on a 35s-old entry

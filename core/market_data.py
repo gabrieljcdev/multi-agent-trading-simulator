@@ -6,6 +6,7 @@ import asyncio
 import logging
 import os
 import time
+from collections import deque
 import pandas as pd
 import ta
 import ccxt.async_support as ccxt
@@ -57,6 +58,14 @@ def _compute_indicators(df):
     return df
 
 class MarketData:
+    # Per-(exchange, pair) ring buffer of (timestamp, mid_price) samples,
+    # fed by every order-book update from _stream_orderbooks. Powers the
+    # short-window get_change_pct accessor — the scalping agent's BTC
+    # correlation guard wants a ~60s lookback, finer than 5m candles
+    # allow. 5 minutes of buffer holds enough headroom for windows up
+    # to ~300s without rewriting older points on every poll.
+    PRICE_HISTORY_WINDOW_SEC = 300
+
     def __init__(self, dashboard=None):
         self._exchanges:   dict = {}
         self._candles:     dict = {}
@@ -66,6 +75,9 @@ class MarketData:
         # get_spread_bps; the scalping agent reads it for its spread
         # gate. Empty dict on fresh boot.
         self._last_book:   dict = {}
+        # Short-window (timestamp, mid) history per (exchange, pair).
+        # Append-only, capped by trim_history() at PRICE_HISTORY_WINDOW_SEC.
+        self._price_history: dict = {}
         self._callbacks:   list = []
         self._active_pairs: list = []
         self._running = False
@@ -131,6 +143,57 @@ class MarketData:
         if mid <= 0:
             return None
         return (best_ask - best_bid) / mid * 10000.0
+
+    def get_change_pct(self, exchange, pair, window_sec):
+        """% change between the latest mid sample and the one nearest
+        `window_sec` seconds ago, or None when insufficient history.
+
+        Powers the scalping agent's BTC 1m correlation guard. The
+        candles cadence (5m) is too coarse for a sub-minute window —
+        this taps the orderbook-stream sample buffer instead.
+        Returns None (not 0.0) so the caller can distinguish "no
+        data yet" from "no movement".
+        """
+        history = self._price_history.get((exchange, pair))
+        if not history or len(history) < 2:
+            return None
+        now_ts, now_price = history[-1]
+        if now_price <= 0 or window_sec <= 0:
+            return None
+        target_ts = now_ts - float(window_sec)
+        # Walk backwards from newest to oldest, take the first sample
+        # at-or-before the target — closest match without scanning the
+        # whole deque twice.
+        baseline_price = None
+        for ts, price in reversed(history):
+            if ts <= target_ts and price > 0:
+                baseline_price = price
+                break
+        if baseline_price is None:
+            # Window pre-dates our oldest sample — not enough history.
+            return None
+        return (now_price - baseline_price) / baseline_price * 100.0
+
+    def _record_price_sample(self, exchange, pair, mid_price):
+        """Append a (now, mid) sample to the per-pair history buffer.
+
+        Called from _stream_orderbooks on every book update so the
+        sampling rate matches the WebSocket tick rate. Trims samples
+        older than PRICE_HISTORY_WINDOW_SEC each call — bounded memory
+        per pair regardless of how long the bot runs.
+        """
+        if mid_price is None or mid_price <= 0:
+            return
+        key = (exchange, pair)
+        buf = self._price_history.get(key)
+        if buf is None:
+            buf = deque()
+            self._price_history[key] = buf
+        now = time.time()
+        buf.append((now, float(mid_price)))
+        cutoff = now - self.PRICE_HISTORY_WINDOW_SEC
+        while buf and buf[0][0] < cutoff:
+            buf.popleft()
 
     def active_pairs(self):
         return self._active_pairs
@@ -296,6 +359,17 @@ class MarketData:
                         # agent's spread gate, dashboard) can read it
                         # without subscribing to ofi_scorer.
                         self._last_book[(exchange_name, pair)] = ob
+                        # Sample mid into the short-window history so the
+                        # BTC correlation guard (get_change_pct) has the
+                        # sub-minute resolution candles can't provide.
+                        bids = ob.get("bids") or []
+                        asks = ob.get("asks") or []
+                        if bids and asks:
+                            try:
+                                mid = (float(bids[0][0]) + float(asks[0][0])) / 2.0
+                                self._record_price_sample(exchange_name, pair, mid)
+                            except (IndexError, TypeError, ValueError):
+                                pass
                         ofi_scorer.update_book(pair=pair, exchange=exchange_name, bids=ob.get("bids",[]), asks=ob.get("asks",[]))
                     except asyncio.TimeoutError:
                         pass

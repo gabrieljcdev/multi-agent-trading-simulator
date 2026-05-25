@@ -37,20 +37,24 @@ no orders are placed. Once 48h of logs confirm edge (win_rate > 52%,
 avg_net_bps > 0 — see database/queries.get_scalp_summary), set
 SCALP_CAPITAL > 0 and supply the MEXC keys.
 
-Phase-2 wiring TODOs
---------------------
-The agent uses four stub methods today; each is marked with a
-TODO comment in this file:
-
-  _get_mid_price(symbol, exchange)   → wire to market_data.get_mid_price
-  _get_spread_bps(symbol, exchange)  → wire to market_data.get_spread_bps
-  _get_regime(symbol)                → wire to regime_detector.get
+Live wiring (no longer stubs)
+-----------------------------
+  _get_mid_price(symbol, exchange)   → MarketData.get_price + fallback
+  _get_spread_bps(symbol, exchange)  → MarketData.get_spread_bps
+  _get_regime(symbol)                → regime_detector.get_primary
+  _get_btc_1m_change()               → MarketData.get_change_pct
+                                       (fed by orderbook sample buffer)
   _get_ccxt_exchange(exchange_id, symbol=...) → MEXC routes through
       execution.mexc_key_router (one account, many pair-restricted
       keys); other exchanges fall through to market_data._exchanges.
 
-Until wired, FeeManager falls back to SCALP_FEE_OVERRIDES (correct
-MEXC + Bitget values hardcoded) and observation mode hums along.
+Remaining stub
+--------------
+  _place_order(...)                  → Phase 2: execution/router.py
+
+When MarketData is absent (offline / test mode), every getter falls
+through to its permissive default so observation mode still hums
+along.
 
 # TODO (dashboard, Phase 2): expose self._observations[-15:] as a
 # property so ui/dashboard.py can render a "scalp feed" panel alongside
@@ -793,13 +797,28 @@ class ScalpingAgent(BaseAgent):
     async def _get_btc_1m_change(self) -> float:
         """BTC 1-minute % change for the correlation guard (gate 13).
 
-        Still a stub — MarketData doesn't keep a 1-minute price history
-        (TIMEFRAMES = 5m / 15m / 1h). To wire: either add a 1m candle
-        feed in market_data._fetch_candles, or accumulate (timestamp,
-        price) samples on every get_price call and compute the delta
-        over the last ~60s window. Returning 0.0 keeps the gate
-        permissive until that ships.
+        Wired: MarketData.get_change_pct(exchange, "BTC/USDT", 60). The
+        orderbook stream feeds (ts, mid) samples into a per-pair ring
+        buffer, so this query is O(buffer size) and gets sub-minute
+        resolution the 5m candles can't.
+
+        Tries every enabled exchange in turn — the first one with
+        sufficient history wins. Returns 0.0 when no exchange has
+        accumulated 60s of samples yet (cold start), which leaves the
+        correlation guard permissive on boot rather than spuriously
+        blocking entries.
         """
+        md = self._resolve_market_data()
+        if md is None or not hasattr(md, "get_change_pct"):
+            return 0.0
+        for ex in settings.ENABLED_EXCHANGES:
+            try:
+                change = md.get_change_pct(ex, "BTC/USDT", 60)
+            except Exception as e:
+                log.debug("[ScalpingAgent] _get_btc_1m_change %s: %s", ex, e)
+                continue
+            if change is not None:
+                return float(change)
         return 0.0
 
     async def _place_order(

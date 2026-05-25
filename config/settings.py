@@ -554,7 +554,41 @@ STRATEGY_EXCHANGE_MAP = {
 # avg_net_bps > 0). Also requires MEXC API key in keys.env.
 
 SCALP_CAPITAL             = 0.0     # test: 0-100   ($0 = observation only)
-SCALP_PAIRS               = ["BTC/USDT", "ETH/USDT"]
+
+# Universe = the 95 of 102 candidate pairs that at least one MEXC key is
+# API-allowlisted to trade, discovered by probing each key's selfSymbols
+# endpoint (2026-05-25). 7 candidates dropped — no key covers them:
+# POL, FTM, EOS, MKR, BRETT, HMSTR, NEIROCTO (FTM/EOS/MKR/BRETT aren't
+# active MEXC USDT spot markets at all). Every pair here has a route in
+# MEXC_PAIR_KEY_MAP below; re-run scripts/mexc_probe.py after changing
+# a key's allowlist on MEXC and update both lists together.
+SCALP_PAIRS = [
+    # ── Key 1 (28) ──
+    "BTC/USDT",  "ETH/USDT",  "SOL/USDT",  "XRP/USDT",  "BNB/USDT",
+    "DOGE/USDT", "ADA/USDT",  "TON/USDT",  "AVAX/USDT", "LINK/USDT",
+    "DOT/USDT",  "LTC/USDT",  "SHIB/USDT", "TRX/USDT",  "NEAR/USDT",
+    "UNI/USDT",  "APT/USDT",  "SUI/USDT",  "ARB/USDT",  "OP/USDT",
+    "INJ/USDT",  "ATOM/USDT", "PEPE/USDT", "WIF/USDT",  "BONK/USDT",
+    "TAO/USDT",  "RENDER/USDT", "FET/USDT",
+    # ── Key 2 (27) ──
+    "JUP/USDT",  "TIA/USDT",  "SEI/USDT",  "PYTH/USDT", "ONDO/USDT",
+    "WLD/USDT",  "FLOKI/USDT","BOME/USDT", "TURBO/USDT","GALA/USDT",
+    "SAND/USDT", "MANA/USDT", "AXS/USDT",  "ICP/USDT",  "FIL/USDT",
+    "VET/USDT",  "HBAR/USDT", "ALGO/USDT", "XLM/USDT",  "AAVE/USDT",
+    "CAKE/USDT", "RUNE/USDT", "GRT/USDT",  "LDO/USDT",  "SNX/USDT",
+    "CRV/USDT",  "DYDX/USDT",
+    # ── Key 3 (27) ──
+    "NOT/USDT",  "DOGS/USDT", "CATI/USDT", "MAJOR/USDT","ORDI/USDT",
+    "SATS/USDT", "ENA/USDT",  "ETHFI/USDT","EIGEN/USDT","IO/USDT",
+    "ZRO/USDT",  "STRK/USDT", "MANTA/USDT","REZ/USDT",  "BLAST/USDT",
+    "PNUT/USDT", "ACT/USDT",  "GOAT/USDT", "MOODENG/USDT","POPCAT/USDT",
+    "MOG/USDT",  "LUNC/USDT", "CFX/USDT",  "ROSE/USDT", "JASMY/USDT",
+    "HOT/USDT",  "AR/USDT",
+    # ── Key 4 (13) ──
+    "CHZ/USDT",  "ENJ/USDT",  "MAGIC/USDT","RON/USDT",  "BEAM/USDT",
+    "PORTAL/USDT","HNT/USDT", "KAVA/USDT", "EGLD/USDT", "FLOW/USDT",
+    "ONE/USDT",  "ZIL/USDT",  "KSM/USDT",
+]
 
 # MEXC supports per-key pair allowlists — one account can hold many API
 # keys, each restricted to a different subset of pairs. The scalper
@@ -562,12 +596,40 @@ SCALP_PAIRS               = ["BTC/USDT", "ETH/USDT"]
 # 1-based and matches the MEXC_KEY_{N}_API_KEY / _SECRET env vars in
 # config/keys.env. Pairs not listed here can't be traded on MEXC;
 # extend the map (and add the matching env vars) when you provision
-# a new key. Empty by default so observation mode runs without keys.
+# a new key. Populated from each key's MEXC selfSymbols allowlist (the
+# real per-key cap, ~13–28 pairs each) via scripts/mexc_probe.py on
+# 2026-05-25. Must stay 1:1 with SCALP_PAIRS — every scalp pair needs a
+# route. Re-probe and regenerate both when an allowlist changes on MEXC.
 MEXC_PAIR_KEY_MAP: dict[str, int] = {
-    # "BTC/USDT": 1,
-    # "ETH/USDT": 1,
-    # "SOL/USDT": 2,
-    # ... — fill in as keys are provisioned.
+    # ── Key 1 (MEXC_KEY_1_*) ──
+    "BTC/USDT": 1,  "ETH/USDT": 1,  "SOL/USDT": 1,  "XRP/USDT": 1,
+    "BNB/USDT": 1,  "DOGE/USDT": 1, "ADA/USDT": 1,  "TON/USDT": 1,
+    "AVAX/USDT": 1, "LINK/USDT": 1, "DOT/USDT": 1,  "LTC/USDT": 1,
+    "SHIB/USDT": 1, "TRX/USDT": 1,  "NEAR/USDT": 1, "UNI/USDT": 1,
+    "APT/USDT": 1,  "SUI/USDT": 1,  "ARB/USDT": 1,  "OP/USDT": 1,
+    "INJ/USDT": 1,  "ATOM/USDT": 1, "PEPE/USDT": 1, "WIF/USDT": 1,
+    "BONK/USDT": 1, "TAO/USDT": 1,  "RENDER/USDT": 1, "FET/USDT": 1,
+    # ── Key 2 (MEXC_KEY_2_*) ──
+    "JUP/USDT": 2,  "TIA/USDT": 2,  "SEI/USDT": 2,  "PYTH/USDT": 2,
+    "ONDO/USDT": 2, "WLD/USDT": 2,  "FLOKI/USDT": 2,"BOME/USDT": 2,
+    "TURBO/USDT": 2,"GALA/USDT": 2, "SAND/USDT": 2, "MANA/USDT": 2,
+    "AXS/USDT": 2,  "ICP/USDT": 2,  "FIL/USDT": 2,  "VET/USDT": 2,
+    "HBAR/USDT": 2, "ALGO/USDT": 2, "XLM/USDT": 2,  "AAVE/USDT": 2,
+    "CAKE/USDT": 2, "RUNE/USDT": 2, "GRT/USDT": 2,  "LDO/USDT": 2,
+    "SNX/USDT": 2,  "CRV/USDT": 2,  "DYDX/USDT": 2,
+    # ── Key 3 (MEXC_KEY_3_*) ──
+    "NOT/USDT": 3,  "DOGS/USDT": 3, "CATI/USDT": 3, "MAJOR/USDT": 3,
+    "ORDI/USDT": 3, "SATS/USDT": 3, "ENA/USDT": 3,  "ETHFI/USDT": 3,
+    "EIGEN/USDT": 3,"IO/USDT": 3,   "ZRO/USDT": 3,  "STRK/USDT": 3,
+    "MANTA/USDT": 3,"REZ/USDT": 3,  "BLAST/USDT": 3,"PNUT/USDT": 3,
+    "ACT/USDT": 3,  "GOAT/USDT": 3, "MOODENG/USDT": 3,"POPCAT/USDT": 3,
+    "MOG/USDT": 3,  "LUNC/USDT": 3, "CFX/USDT": 3,  "ROSE/USDT": 3,
+    "JASMY/USDT": 3,"HOT/USDT": 3,  "AR/USDT": 3,
+    # ── Key 4 (MEXC_KEY_4_*) ──
+    "CHZ/USDT": 4,  "ENJ/USDT": 4,  "MAGIC/USDT": 4,"RON/USDT": 4,
+    "BEAM/USDT": 4, "PORTAL/USDT": 4,"HNT/USDT": 4, "KAVA/USDT": 4,
+    "EGLD/USDT": 4, "FLOW/USDT": 4, "ONE/USDT": 4,  "ZIL/USDT": 4,
+    "KSM/USDT": 4,
 }
 
 # Fee-aware profit targeting — TP/SL are computed dynamically, not fixed.
