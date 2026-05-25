@@ -1117,8 +1117,14 @@ def get_scalp_observations(
 
 # ── Analytics helpers (used by predictive engine) ──────────
 
-def get_signal_win_rate(signal_type: str = None, days: int = 30) -> dict:
-    """Return win rate stats for model training and UI display."""
+def get_signal_win_rate(signal_type: str = None, days: int = 30,
+                        exclude_strategy: str = None) -> dict:
+    """Return win rate stats for model training and UI display.
+
+    exclude_strategy drops trades whose `strategy` matches (e.g. "scalp"):
+    other funds write to the shared trades table, so the signal fund's win
+    rate must not count them.
+    """
     with get_session() as s:
         q = s.query(Trade).filter(
             Trade.timestamp_open >= datetime.utcnow() - timedelta(days=days),
@@ -1127,6 +1133,8 @@ def get_signal_win_rate(signal_type: str = None, days: int = 30) -> dict:
         if signal_type:
             q = q.filter(Trade.signal_type == signal_type)
         trades = q.all()
+        if exclude_strategy:
+            trades = [t for t in trades if t.strategy != exclude_strategy]
 
     if not trades:
         return {"total": 0, "wins": 0, "losses": 0, "win_rate": 0.0, "avg_pnl": 0.0}

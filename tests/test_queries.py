@@ -111,3 +111,31 @@ def test_get_trade_by_id_returns_row(temp_db):
     assert row is not None
     assert row.pair == "BTC/USDT"
     assert row.entry_price == 100.0
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# get_signal_win_rate — exclude_strategy (fund segregation)
+# ─────────────────────────────────────────────────────────────────────────
+
+def test_get_signal_win_rate_excludes_strategy(temp_db):
+    """exclude_strategy drops trades of that strategy so the signal fund's
+    win rate isn't polluted by scalp fills sharing the trades table."""
+    q = temp_db
+    # A signal win (strategy="default") + a scalp loss (strategy="scalp").
+    sig = q.save_trade({
+        "pair": "BTC/USDT", "exchange": "binance", "side": "long",
+        "signal_type": "momentum", "entry_price": 100.0, "size_usd": 50.0,
+        "sim_mode": True, "strategy": "default",
+    })
+    q.close_trade(sig, exit_price=101.0, exit_reason="tp", pnl_usd=0.5, pnl_pct=1.0)
+    scl = q.save_trade({
+        "pair": "ETH/USDT", "exchange": "mexc", "side": "long",
+        "signal_type": "scalp", "entry_price": 100.0, "size_usd": 25.0,
+        "sim_mode": True, "strategy": "scalp",
+    })
+    q.close_trade(scl, exit_price=99.0, exit_reason="sl", pnl_usd=-0.25, pnl_pct=-1.0)
+
+    assert q.get_signal_win_rate(days=1)["total"] == 2          # both by default
+    sig_wr = q.get_signal_win_rate(days=1, exclude_strategy="scalp")
+    assert sig_wr["total"] == 1                                  # scalp excluded
+    assert sig_wr["win_rate"] == 1.0                            # only the signal win

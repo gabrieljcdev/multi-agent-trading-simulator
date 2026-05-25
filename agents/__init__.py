@@ -141,11 +141,16 @@ class SignalAgentWrapper(BaseAgent):
         halted        = bool(getattr(cb, "halted", False))
 
         # Pull DB-derived figures, but never let a DB hiccup poison get_stats.
+        # Scalp fills live in the shared trades table but belong to the
+        # MEXC-scalp fund — exclude strategy="scalp" so they don't pollute
+        # the signal fund's trade count, win rate, or deployed capital.
         try:
-            today  = db_queries.get_today_trades()
-            wr_t   = db_queries.get_signal_win_rate(days=1)
-            wr_all = db_queries.get_signal_win_rate(days=365)
-            open_t = db_queries.get_open_trades()
+            today  = [t for t in db_queries.get_today_trades()
+                      if (t.strategy or "") != "scalp"]
+            wr_t   = db_queries.get_signal_win_rate(days=1,   exclude_strategy="scalp")
+            wr_all = db_queries.get_signal_win_rate(days=365, exclude_strategy="scalp")
+            open_t = [t for t in db_queries.get_open_trades()
+                      if (t.strategy or "") != "scalp"]
         except Exception:
             today, wr_t, wr_all, open_t = [], {"total": 0}, {"total": 0}, []
 
