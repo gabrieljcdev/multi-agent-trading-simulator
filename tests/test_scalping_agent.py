@@ -263,9 +263,13 @@ async def test_entry_observation_logged_mexc(monkeypatch):
     """Strong + persistent OFI on MEXC → observation logged with
     would_entry=True, observation_only=True (capital is 0).
 
-    Session window patched to 0-24 so the test runs at any UTC hour."""
+    Session window patched to 0-24 so the test runs at any UTC hour. The v2
+    confluence layer is disabled here — this test covers the v1 gates 1-13 +
+    observation logging; v2 selectivity is exercised in tests/test_scalping_v2.py
+    and test_scalp_v2_integration.py."""
     monkeypatch.setattr(settings, "SCALP_SESSION_START_UTC", 0)
     monkeypatch.setattr(settings, "SCALP_SESSION_END_UTC",   24)
+    monkeypatch.setattr(settings, "SCALP_USE_CONFLUENCE", False)
     agent = _agent_with_capital(0.0)
 
     # Stub the four async market-data methods.

@@ -90,6 +90,25 @@ from agents.base import (
 log = logging.getLogger(__name__)
 
 
+class _LazyMarketData:
+    """Forwards v2 accessor calls to the agent's resolved MarketData,
+    re-resolving on each access so the ConfluenceChecker / ATRStopCalculator
+    (built in __init__, before market_data is wired) always reach the live
+    feed. Raises AttributeError when md isn't available yet — the gates treat
+    that as 'data unavailable' and fail open."""
+
+    __slots__ = ("_resolve",)
+
+    def __init__(self, resolver):
+        self._resolve = resolver
+
+    def __getattr__(self, name):
+        md = self._resolve()
+        if md is None:
+            raise AttributeError(f"market_data unavailable for {name!r}")
+        return getattr(md, name)
+
+
 # ─────────────────────────────────────────────────────────────────────────
 # Dataclasses
 # ─────────────────────────────────────────────────────────────────────────
@@ -581,6 +600,15 @@ class ScalpingAgent(BaseAgent):
             zscore_window=settings.SCALP_ZSCORE_WINDOW,
         )
         self._fee_manager = FeeManager(settings.SCALP_FEE_OVERRIDES)
+
+        # v2 selectivity layer (scalping_v2). Built once; market_data is wired
+        # after __init__, so the checkers get a lazy proxy that resolves it per
+        # call. Each gate is individually SCALP_USE_*-flagged.
+        from agents.scalping_confluence import ConfluenceChecker
+        from agents.scalping_atr_sl import ATRStopCalculator
+        _lazy_md = _LazyMarketData(self._resolve_market_data)
+        self.confluence = ConfluenceChecker(_lazy_md, self._ofi_engine, settings)
+        self.atr_calc   = ATRStopCalculator(_lazy_md, settings)
 
         # Optional injected dependencies. Any of these can be None — the
         # agent then runs in pure-stub mode (or lazy-resolves at first
@@ -1147,14 +1175,46 @@ class ScalpingAgent(BaseAgent):
                                spread_bps=spread_bps, regime=regime)
                 return
 
-        # ── Passed every gate ─────────────────────────────────────────
+        # ── Passed gates 1–13 ─────────────────────────────────────────
         entry_price = await self._get_mid_price(symbol, exchange)
         if entry_price == 0.0:
             return     # market_data unwired — silent skip, no observation
-        tp_bps, sl_bps = self._fee_manager.compute_tp_sl(exchange, symbol)
+        direction = ofi["direction"]
+
+        # ── V2 selectivity layer (runs after gate 13) ─────────────────
+        v2_fields: dict = {}
+        if settings.SCALP_USE_CONFLUENCE:
+            conf = self.confluence.run_all_gates(
+                symbol=symbol, exchange=exchange, direction=direction,
+                primary_z=ofi["z"],
+                position_size_usd=settings.SCALP_POSITION_SIZE_USD,
+            )
+            v2_fields = self._unpack_confluence(conf)
+            if not conf.passed:
+                # Log a skipped observation. entry_price carries the mid at
+                # evaluation time (so the recalibration skip-analysis can ask
+                # "would it have won?"), and the v2 diagnostics are recorded
+                # even on a skip.
+                obs = self._make_observation(
+                    symbol, exchange, now, ofi=ofi,
+                    would_entry=False, skip_reason=f"V2:{conf.blocking_reason}",
+                    entry_price=entry_price,
+                    tp_bps=0.0, sl_bps=0.0, rt_bps=rt_bps, min_wr=1.0,
+                    spread_bps=spread_bps, regime=regime,
+                )
+                self._annotate_v2(obs, v2_fields)
+                self._observations.append(obs)
+                self._pending_flush.append(obs)
+                return
+
+        # ── ATR-aware TP/SL (replaces fee_manager.compute_tp_sl on pass) ─
+        tpsl = self.atr_calc.compute_tp_sl_v2(
+            symbol=symbol, exchange=exchange,
+            round_trip_bps=self._fee_manager.round_trip_bps(exchange, symbol),
+        )
+        tp_bps, sl_bps = tpsl.tp_bps, tpsl.sl_bps
         min_wr = self._fee_manager.breakeven_win_rate(exchange, symbol,
                                                      tp_bps, sl_bps)
-        direction = ofi["direction"]
         if direction == "LONG":
             tp_price = entry_price * (1 + tp_bps / 10000.0)
             sl_price = entry_price * (1 - sl_bps / 10000.0)
@@ -1170,6 +1230,7 @@ class ScalpingAgent(BaseAgent):
             rt_bps=rt_bps, min_wr=min_wr,
             spread_bps=spread_bps, regime=regime,
         )
+        self._annotate_v2(obs, v2_fields, tpsl=tpsl)
         self._observations.append(obs)
         self._pending_flush.append(obs)
 
@@ -1199,6 +1260,39 @@ class ScalpingAgent(BaseAgent):
                 "[ScalpingAgent] ENTRY (SIM) %s:%s %s @ %.4f tp=%.4f sl=%.4f size=$%.2f",
                 symbol, exchange, direction, entry_price, tp_price, sl_price, pos.size_usd,
             )
+
+    @staticmethod
+    def _unpack_confluence(conf) -> dict:
+        """Flatten a CombinedConfluenceResult into the obs v2 diagnostic
+        fields (recorded whether the signal passed or was blocked)."""
+        fields = {
+            "confluence_score":      conf.confluence_score,
+            "strength_label":        conf.strength_label,
+            "cross_exchange_agrees": conf.cross_exchange_agrees,
+            "btc_compatible":        conf.btc_compatible,
+            "adverse_selection_ok":  conf.adverse_selection_ok,
+            "depth_ok":              conf.depth_ok,
+        }
+        for r in conf.individual_results:
+            if r.gate_name == "VWAP":
+                fields["vwap_aligned"] = r.passed and r.score >= 0.99
+            elif r.gate_name == "HTF":
+                fields["htf_aligned"] = r.passed and r.score >= 0.99
+            elif r.gate_name == "VOLUME":
+                fields["volume_adequate"] = r.passed and r.score >= 0.99
+        return fields
+
+    @staticmethod
+    def _annotate_v2(obs, fields: dict, tpsl=None) -> None:
+        """Write the v2 confluence fields (and, on entry, the ATR TP/SL
+        diagnostics) onto a ScalpObservation."""
+        for k, v in fields.items():
+            setattr(obs, k, v)
+        if tpsl is not None:
+            obs.atr_bps      = tpsl.atr_bps
+            obs.atr_adjusted = tpsl.atr_adjusted
+            obs.sl_clamped   = tpsl.sl_clamped
+            obs.rr_actual    = tpsl.rr_actual
 
     def _log_skip(
         self,
