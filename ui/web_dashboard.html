@@ -154,6 +154,11 @@
       <h2>Open Positions</h2><div class="scroll" id="positions"></div>
     </div>
 
+    <div class="grid2" style="margin-bottom:10px">
+      <div class="card"><h2>Live Arb Feed</h2><div class="scroll" id="arbFeed"></div></div>
+      <div class="card"><h2>Live Scalp Feed</h2><div class="scroll" id="scalpFeed"></div></div>
+    </div>
+
     <div class="card">
       <h2>Session P&amp;L</h2><div class="sessions" id="sessions"></div>
     </div>
@@ -258,7 +263,7 @@ wireKill($("killBtn")); wireKill($("killBtn2"));
 /* ---------- helpers ---------- */
 const fmtUsd = (v) => (v==null? "—" : (v<0?"-$":"$") + Math.abs(v).toFixed(2));
 const fmtPct = (v) => (v==null? "—" : (v>=0?"+":"") + Number(v).toFixed(2) + "%");
-const cls = (v) => (v==null||v==0? "" : (v>0? "pos":"neg"));
+const cls = (v) => (v==null? "" : (v===0? "dim" : (v>0? "pos":"neg")));
 const esc = (s) => String(s==null?"":s).replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
 function fmtAge(s){ s=Math.max(0,s|0); const h=s/3600|0,m=(s%3600)/60|0; return h?`${h}h${m}m`:(m?`${m}m`:`${s}s`); }
 function fmtUp(s){ s=s|0; const h=s/3600|0,m=(s%3600)/60|0; return `up ${h}h${String(m).padStart(2,"0")}m`; }
@@ -367,6 +372,23 @@ function updateUI(s){
        <td class="${cls(x.pnl_usd)}">${fmtUsd(x.pnl_usd)} ${fmtPct(x.pnl_pct)}</td><td class="dim">${fmtAge(x.age_s)}</td></tr>`).join("")
      || `<tr><td colspan="8" class="muted">no open positions</td></tr>`) + `</tbody></table>`;
 
+  // live arb feed (dashboard) — most recent trades incl. per-row fees
+  const af = s.arb_feed || [];
+  $("arbFeed").innerHTML = `<table><thead><tr><th>t</th><th>pair</th><th>route</th><th>gap%</th><th>net</th><th>fees</th></tr></thead><tbody>` +
+    (af.map(x =>
+      `<tr><td class="dim">${esc(x.ts)}</td><td>${esc(x.pair)}</td>
+       <td class="dim">${esc(x.buy_exchange)}→${esc(x.sell_exchange)}</td><td>${x.gap_pct}</td>
+       <td class="${cls(x.net_pnl)}">${fmtUsd(x.net_pnl)}</td><td class="dim">${fmtUsd(x.fees)}</td></tr>`).join("")
+     || `<tr><td colspan="6" class="muted">no arb trades</td></tr>`) + `</tbody></table>`;
+
+  // live scalp feed (dashboard) — open positions on the scalp agent only
+  const scalp = (s.positions||[]).filter(x => x.agent === "scalp");
+  $("scalpFeed").innerHTML = `<table><thead><tr><th>pair</th><th>dir</th><th>entry</th><th>cur</th><th>P&amp;L</th><th>age</th></tr></thead><tbody>` +
+    (scalp.map(x =>
+      `<tr><td>${esc(x.pair)}</td><td>${esc(x.direction)}</td><td>${x.entry}</td><td>${x.current}</td>
+       <td class="${cls(x.pnl_usd)}">${fmtUsd(x.pnl_usd)} ${fmtPct(x.pnl_pct)}</td><td class="dim">${fmtAge(x.age_s)}</td></tr>`).join("")
+     || `<tr><td colspan="6" class="muted">no scalp positions</td></tr>`) + `</tbody></table>`;
+
   // session P&L
   const sp = s.session_pnl || {};
   $("sessions").innerHTML = ["LONDON","NEW_YORK","ASIA","OFF_HOURS"].map(k => {
@@ -383,12 +405,12 @@ function updateUI(s){
   $("a-pnl").innerHTML = `<span class="${cls(ah.reduce((a,x)=>a+(x.net_pnl||0),0))}">${fmtUsd(ah.reduce((a,x)=>a+(x.net_pnl||0),0))}</span>`;
   $("a-fees").textContent = fmtUsd(ah.reduce((a,x)=>a+(x.fees||0),0));
   $("a-fill").textContent = ah.length? (ah.reduce((a,x)=>a+(x.fill_ms||0),0)/ah.length).toFixed(0)+"ms" : "—";
-  $("arbTable").innerHTML = `<table><thead><tr><th>t</th><th>pair</th><th>buy</th><th>sell</th><th>gap%</th><th>size</th><th>net</th><th>fill</th><th>status</th></tr></thead><tbody>` +
+  $("arbTable").innerHTML = `<table><thead><tr><th>t</th><th>pair</th><th>buy</th><th>sell</th><th>gap%</th><th>size</th><th>net</th><th>fees</th><th>fill</th><th>status</th></tr></thead><tbody>` +
     (ah.map(x =>
       `<tr><td class="dim">${esc(x.ts)}</td><td>${esc(x.pair)}</td><td class="dim">${esc(x.buy_exchange)}</td>
        <td class="dim">${esc(x.sell_exchange)}</td><td>${x.gap_pct}</td><td>${fmtUsd(x.size_usd)}</td>
-       <td class="${cls(x.net_pnl)}">${fmtUsd(x.net_pnl)}</td><td class="dim">${x.fill_ms}ms</td><td class="dim">${esc(x.status)}</td></tr>`).join("")
-     || `<tr><td colspan="9" class="muted">no arb trades</td></tr>`) + `</tbody></table>`;
+       <td class="${cls(x.net_pnl)}">${fmtUsd(x.net_pnl)}</td><td class="dim">${fmtUsd(x.fees)}</td><td class="dim">${x.fill_ms}ms</td><td class="dim">${esc(x.status)}</td></tr>`).join("")
+     || `<tr><td colspan="10" class="muted">no arb trades</td></tr>`) + `</tbody></table>`;
 
   // insights
   $("topPairs").innerHTML = `<table><thead><tr><th>pair</th><th>P&amp;L</th><th>trades</th><th>wr</th></tr></thead><tbody>` +
