@@ -675,10 +675,10 @@ SCALP_FEE_OVERRIDES       = {      # overrides CCXT data where known to be wrong
 }
 
 # OFI signal parameters
-SCALP_OFI_Z_ENTRY         = 1.5    # test: 1.0-2.5   (z-score entry threshold)
+SCALP_OFI_Z_ENTRY         = 2.0    # test: 1.0-2.5   (z-score entry threshold; v2 raised 1.5→2.0)
 SCALP_OFI_Z_EXIT          = 0.3    # test: 0.1-0.7   (OFI exhaustion exit)
 SCALP_OFI_Z_CONTRADICT    = -0.8   # test: -0.4 to -1.5 (OFI flip exit)
-SCALP_OFI_PERSIST_TICKS   = 3      # test: 2-6       (consecutive ticks above threshold)
+SCALP_OFI_PERSIST_TICKS   = 5      # test: 2-6       (consecutive ticks above threshold; v2 raised 3→5)
 SCALP_OFI_LEVELS          = 10     # test: 1-10      (book depth levels)
 SCALP_OFI_WINDOW_SEC      = 20     # test: 10-40     (bucket accumulation window seconds)
 SCALP_ZSCORE_WINDOW       = 80     # test: 40-150    (rolling z-score normalisation periods)
@@ -698,8 +698,8 @@ SCALP_CONSEC_LOSS_PAUSE   = 4      # test: 3-6       (consecutive loss pause cou
 # both of which thin out outside London/NY overlap. The main bot's
 # dead zone (02:00-06:00 UTC) is contained inside this window — these
 # are additive gates, not redundant.
-SCALP_SESSION_START_UTC   = 7      # test: 6-9       (London open)
-SCALP_SESSION_END_UTC     = 17     # test: 15-20     (NY afternoon)
+SCALP_SESSION_START_UTC   = 12     # test: 6-13      (v2: London/NY overlap start, raised 7→12)
+SCALP_SESSION_END_UTC     = 16     # test: 14-20     (v2: overlap end, lowered 17→16)
 
 # News guard — when the sentiment aggregator's news_guard_active fires,
 # scalp setups stop being reliable (correlated cross-pair flows + spread
@@ -725,6 +725,66 @@ SCALP_DEPTH_WEIGHTS       = {
     0: 1.0,  1: 0.70, 2: 0.50, 3: 0.35, 4: 0.25,
     5: 0.18, 6: 0.12, 7: 0.08, 8: 0.06, 9: 0.04,
 }
+
+# ── Scalp v2 selectivity layer (scalping_v2/SCALPING_V2.md) ─────────────────
+# Additive gates + ATR-aware SL on top of the existing 13-gate flow, each
+# individually togglable (all default ON). The entry-threshold / persistence /
+# session-window tightening lives with the v1 OFI constants above
+# (SCALP_OFI_Z_ENTRY, SCALP_OFI_PERSIST_TICKS, SCALP_SESSION_*), raised to v2
+# values in place.
+
+# Confluence gates (VWAP + HTF trend + volume): require N of 3.
+SCALP_USE_CONFLUENCE          = True
+SCALP_CONFLUENCE_REQUIRED     = 2      # test: 1-3
+SCALP_USE_VWAP_GATE           = True
+SCALP_USE_HTF_TREND_GATE      = True
+SCALP_HTF_TIMEFRAME           = "5m"
+SCALP_HTF_EMA_FAST            = 8
+SCALP_HTF_EMA_SLOW            = 21
+SCALP_USE_VOLUME_GATE         = True
+SCALP_VOLUME_LOOKBACK_MIN     = 20     # test: 10-40
+SCALP_VOLUME_THRESHOLD_RATIO  = 1.0    # test: 0.8-1.5  (current 1m vol ≥ ratio × median)
+
+# Cross-exchange OFI confirmation — block when another venue strongly opposes.
+SCALP_USE_CROSS_EXCHANGE_OFI        = True
+SCALP_CROSS_EXCHANGE_DISAGREE_BLOCK = True
+SCALP_CROSS_EXCHANGE_AGREE_Z_MIN    = 0.5   # test: 0.3-1.0
+
+# BTC directional gate — alts can't fight BTC's order-flow direction.
+SCALP_USE_BTC_DIRECTIONAL  = True
+SCALP_BTC_OFI_NEUTRAL_BAND = 0.5    # test: 0.3-0.8  (|BTC z| below this = neutral)
+
+# Adverse-selection guard — skip if mid moved against the signal recently.
+SCALP_USE_ADVERSE_SELECTION_GUARD = True
+SCALP_ADVERSE_MID_MOVE_BPS        = 1.0    # test: 0.5-2.0
+SCALP_ADVERSE_MOVE_WINDOW_MS      = 100    # test: 50-300
+
+# Depth adequacy — don't enter where our position would move the book.
+SCALP_USE_DEPTH_GATE            = True
+SCALP_MIN_TOP5_DEPTH_MULTIPLIER = 5.0    # test: 3-10
+SCALP_MAX_TOP1_CONSUME_PCT      = 20.0   # test: 10-40
+
+# ATR-aware stop loss — SL scales with realised volatility, clamped.
+SCALP_USE_ATR_AWARE_SL   = True
+SCALP_ATR_PERIOD         = 20     # test: 10-30
+SCALP_ATR_TIMEFRAME      = "1m"
+SCALP_ATR_SL_MULTIPLIER  = 0.3    # test: 0.2-0.5
+SCALP_ATR_SL_FLOOR_BPS   = 1.5    # test: 1.0-3.0   (never tighter than this)
+SCALP_ATR_SL_CEILING_BPS = 8.0    # test: 6-12      (never wider than this)
+
+# Activation criteria — v1 (original) and v2 (tighter). Both readiness checks
+# read these; see database/queries.get_scalp_activation_readiness[_v2].
+SCALP_MIN_OBSERVATIONS_FOR_LIVE = 200
+SCALP_MIN_WIN_RATE_FOR_LIVE     = 0.52
+SCALP_MIN_AVG_NET_BPS_FOR_LIVE  = 0.0
+SCALP_MAX_HOLD_EXIT_PCT         = 0.30
+SCALP_MIN_DIRECTIONAL_ACC_1M    = 0.55
+
+SCALP_MIN_OBSERVATIONS_FOR_LIVE_V2 = 300    # was 200
+SCALP_MIN_WIN_RATE_FOR_LIVE_V2     = 0.55   # was 0.52
+SCALP_MIN_AVG_NET_BPS_FOR_LIVE_V2  = 0.5    # was 0
+SCALP_MAX_HOLD_EXIT_PCT_V2         = 0.25   # was 0.30
+SCALP_MIN_DIRECTIONAL_ACC_1M_V2    = 0.57   # was 0.55
 
 # Portfolio-level circuit breakers — sit on TOP of per-agent breakers.
 # Per-agent CBs (in settings.CIRCUIT_BREAKERS) fire first; these catch
