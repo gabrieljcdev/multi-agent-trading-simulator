@@ -112,6 +112,7 @@ ORDER_BOOK_DEPTH   = 10         # Levels to stream per side for OFI
 ORDER_BOOK_STREAM_PAIRS    = 20    # test: 5-50   (top-N active pairs to stream books for)
 ORDER_BOOK_WATCH_TIMEOUT_S = 30.0  # test: 10-60  (max wait for one symbol's book update)
 ORDER_BOOK_ERROR_BACKOFF_S = 1.0   # test: 0.5-5  (backoff after a book-stream error — prevents busy-spin)
+ORDER_BOOK_MAX_STREAMS_PER_CONN = 24   # test: 12-30  (per-ws-connection subscription cap; MEXC silently drops subs above ~30, so book streams shard across this many symbols per connection)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PAIR UNIVERSE

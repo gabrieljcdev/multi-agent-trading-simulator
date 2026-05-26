@@ -101,6 +101,10 @@ class MarketData:
         # The scalp agent's OFIEngine registers here so it sees the same
         # stream that feeds ofi_scorer / _last_book.
         self._book_callbacks: list = []
+        # Dedicated ccxt.pro clients for sharded order-book streaming — a venue
+        # whose symbol set exceeds the per-connection subscription cap (MEXC's
+        # full scalp universe) is split across several of these. Closed in stop().
+        self._ob_conns:    list = []
         self._active_pairs: list = []
         self._running = False
         # Optional Dashboard reference; main.py wires this via set_dashboard
@@ -387,7 +391,7 @@ class MarketData:
 
     async def stop(self):
         self._running = False
-        for ex in self._exchanges.values():
+        for ex in list(self._exchanges.values()) + self._ob_conns:
             try:
                 await ex.close()
             except:
@@ -541,9 +545,61 @@ class MarketData:
             logger.warning(f"{exchange_name}: watchOrderBook unsupported — "
                            "order-book stream disabled (OFI will be empty)")
             return
-        pairs = self._active_pairs[:settings.ORDER_BOOK_STREAM_PAIRS]
+        pairs = self._orderbook_pairs_for(exchange_name, ex)
+        if not pairs:
+            return
+        max_per = max(1, settings.ORDER_BOOK_MAX_STREAMS_PER_CONN)
+        if len(pairs) <= max_per:
+            # Fits one connection — stream on the shared REST/candle client,
+            # exactly as before (no extra sockets for the signal venues).
+            await asyncio.gather(
+                *(self._stream_one_orderbook(exchange_name, ex, p) for p in pairs),
+                return_exceptions=True,
+            )
+            return
+        # Over the per-connection cap (e.g. MEXC's ~30-sub limit on the full
+        # 96-pair scalp universe): shard across dedicated ws connections so
+        # every symbol actually gets a subscription. ccxt routes all of a
+        # client's subscriptions to one socket, so the extra symbols need
+        # extra clients, not extra loops on the same one.
+        chunks = [pairs[i:i + max_per] for i in range(0, len(pairs), max_per)]
+        logger.info(f"{exchange_name}: streaming {len(pairs)} order books across "
+                    f"{len(chunks)} connections (<= {max_per}/conn)")
         await asyncio.gather(
-            *(self._stream_one_orderbook(exchange_name, ex, pair) for pair in pairs),
+            *(self._stream_orderbook_shard(exchange_name, chunk) for chunk in chunks),
+            return_exceptions=True,
+        )
+
+    def _orderbook_pairs_for(self, exchange_name, ex):
+        """Order-book symbols to stream on this venue. Base = the top-N active
+        pairs (feeds signal-side OFI + _last_book). Scalp venues additionally
+        stream the full SCALP_PAIRS universe, so the scalp agent's OFIEngine
+        sees every pair it scans — not just the volume-ranked top-N. Filtered
+        to symbols the venue actually lists (avoids dead subscriptions)."""
+        pairs = list(self._active_pairs[:settings.ORDER_BOOK_STREAM_PAIRS])
+        if exchange_name in settings.STRATEGY_EXCHANGE_MAP.get("scalp", []):
+            seen = set(pairs)
+            for p in settings.SCALP_PAIRS:
+                if p not in seen:
+                    pairs.append(p)
+                    seen.add(p)
+        markets = getattr(ex, "markets", None) or {}
+        if markets:
+            pairs = [p for p in pairs if p in markets]
+        return pairs
+
+    async def _stream_orderbook_shard(self, exchange_name, pairs):
+        """Stream one shard of order-book symbols on its own dedicated ws
+        connection. Used when a venue's symbol set exceeds the per-connection
+        subscription cap. The client is tracked in _ob_conns and closed in stop()."""
+        ex = _make_exchange(exchange_name)
+        self._ob_conns.append(ex)
+        try:
+            await ex.load_markets()
+        except Exception as e:
+            logger.warning(f"{exchange_name}: OB shard load_markets failed — {e}")
+        await asyncio.gather(
+            *(self._stream_one_orderbook(exchange_name, ex, p) for p in pairs),
             return_exceptions=True,
         )
 

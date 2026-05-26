@@ -70,6 +70,67 @@ async def test_stream_one_orderbook_fires_book_callbacks(monkeypatch):
     assert received == [("mexc", "BTC/USDT", book["bids"], book["asks"])]
 
 
+def test_orderbook_pairs_for_scalp_venue_streams_full_universe():
+    """A scalp venue (mexc) streams the whole SCALP_PAIRS universe, not just
+    the volume-ranked top-N; a signal venue gets only the active top-N. Both
+    are filtered to symbols the venue actually lists."""
+    from config import settings
+
+    md = MarketData()
+    md._active_pairs = ["BTC/USDT", "ETH/USDT", "DEAD/USDT"]
+
+    class FakeEx:
+        # lists every scalp pair + the live actives, but NOT DEAD/USDT
+        markets = {**{p: {} for p in settings.SCALP_PAIRS},
+                   "BTC/USDT": {}, "ETH/USDT": {}}
+
+    mexc_pairs = md._orderbook_pairs_for("mexc", FakeEx())
+    assert set(settings.SCALP_PAIRS).issubset(set(mexc_pairs))   # full universe
+    assert "DEAD/USDT" not in mexc_pairs                          # dead listing filtered
+
+    binance_pairs = md._orderbook_pairs_for("binance", FakeEx())
+    assert "BTC/USDT" in binance_pairs
+    assert "JUP/USDT" not in binance_pairs   # scalp-only pair isn't streamed on a signal venue
+
+
+@pytest.mark.asyncio
+async def test_stream_orderbooks_shards_over_cap(monkeypatch):
+    """When a venue's symbol set exceeds the per-connection cap, the streamer
+    shards across dedicated ws clients so every symbol gets a subscription
+    (MEXC's ~30-sub limit on the 96-pair scalp universe)."""
+    md = MarketData()
+    md._running = True
+    pairs = [f"P{i}/USDT" for i in range(10)]
+
+    class FakeEx:
+        def __init__(self):
+            self.has = {"watchOrderBook": True}
+            self.markets = {p: {} for p in pairs}
+
+        async def load_markets(self):
+            return self.markets
+
+    md._active_pairs = pairs
+    monkeypatch.setattr("core.market_data.settings.ORDER_BOOK_MAX_STREAMS_PER_CONN", 4)
+
+    made = []
+    monkeypatch.setattr("core.market_data._make_exchange",
+                        lambda name: (made.append(FakeEx()), made[-1])[1])
+
+    streamed = []
+
+    async def fake_one(exn, ex, pair):
+        streamed.append(pair)
+
+    monkeypatch.setattr(md, "_stream_one_orderbook", fake_one)
+
+    await md._stream_orderbooks("mexc", FakeEx())
+
+    assert sorted(streamed) == sorted(pairs)   # every symbol streamed
+    assert len(md._ob_conns) == 3              # 10 pairs / 4 per conn -> 3 shards
+    assert len(made) == 3                      # one dedicated client per shard
+
+
 @pytest.mark.asyncio
 async def test_stream_one_orderbook_skips_when_not_running():
     md = MarketData()
