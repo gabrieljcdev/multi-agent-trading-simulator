@@ -469,6 +469,11 @@ CIRCUIT_BREAKER_HALT_REQUIRES_MANUAL = True
 # Off by default in tests via monkeypatch; on for normal runs.
 SHUTDOWN_LOG_EVENT = True
 
+# Max seconds to wait for a graceful teardown (coordinator.stop + web server)
+# on SIGINT/SIGTERM before forcing task cancellation. Bounds the shutdown so a
+# stuck ws close can't leave the process hanging until SIGKILL.
+SHUTDOWN_TIMEOUT_SEC = 15   # test: 5-30
+
 # ══════════════════════════════════════════════════════════════════════════════
 # EXECUTION
 # ══════════════════════════════════════════════════════════════════════════════

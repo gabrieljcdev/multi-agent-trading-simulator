@@ -252,21 +252,12 @@ class CryptoBot:
         logger.info(f"  Strategy: {self._strategy.name}")
         logger.info(f"  Approval: {settings.APPROVAL_MODE}")
 
-        # Convert Ctrl+C into the same clean shutdown path the `q`
-        # command uses, so Ctrl+C writes a final snapshot rather than
-        # tearing the loop down hard. Windows and non-main threads
-        # don't support add_signal_handler — fall through to
-        # KeyboardInterrupt in main.py in that case.
-        import signal as _signal
-        try:
-            asyncio.get_running_loop().add_signal_handler(
-                _signal.SIGINT,
-                lambda: asyncio.get_running_loop().create_task(
-                    self.shutdown("sigint"),
-                ),
-            )
-        except (NotImplementedError, ValueError, RuntimeError) as e:
-            logger.debug(f"SIGINT handler not installed: {e}")
+        # SIGINT/SIGTERM are handled at the process level in main.py, which
+        # drives a coordinated shutdown of every agent + the web server. (A
+        # bot-local SIGINT handler here would override main's via
+        # add_signal_handler and stop only this agent's loop — the exact gap
+        # that left the process hanging until SIGKILL.) The `q` command and
+        # coordinator.stop() still reach this bot through shutdown()/stop().
 
         # Keyboard approval handler — reads stdin in a daemon thread,
         # dispatches a/s/k/q onto this loop via run_coroutine_threadsafe.

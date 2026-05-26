@@ -1002,6 +1002,14 @@ class ScalpingAgent(BaseAgent):
         while self._running:
             try:
                 await asyncio.sleep(interval)
+                # Make sure the OFIEngine is subscribed to the book stream.
+                # The entry gates silent-skip on stale OFI *before* reaching
+                # the market_data accessors, so we can't rely on those to
+                # trigger the lazy resolve — drive it here every tick until it
+                # sticks (idempotent: cached + a one-shot subscribe flag). This
+                # is what breaks the chicken-and-egg (no books -> stale OFI ->
+                # gate-2 skip -> never resolve -> never subscribe -> no books).
+                self._resolve_market_data()
                 if self._halted:
                     continue
                 approved = settings.STRATEGY_EXCHANGE_MAP.get("scalp", [])

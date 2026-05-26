@@ -100,34 +100,79 @@ async def _run(profile, strategy, dashboard: bool, web_ui: bool = False):
 
     coordinator = Coordinator()
 
-    tasks = [coordinator.start()]
+    # Long-running components become tracked tasks so shutdown can cancel them.
+    component_tasks = [asyncio.ensure_future(coordinator.start())]
 
     if dashboard:
         from ui.dashboard import Dashboard
         dash = Dashboard(coordinator=coordinator)
         coordinator.set_dashboard(dash)
-        tasks.append(dash.run())
+        component_tasks.append(asyncio.ensure_future(dash.run()))
 
-    # Web control panel — never let its startup crash the bot.
+    # Web control panel — start() returns once the aiohttp runner is up (its
+    # teardown is web_server.stop()). Never let its startup crash the bot.
     web_server = None
     if web_ui:
         try:
             settings.WEB_UI_ENABLED = True
             from ui.web_server import WebServer
             web_server = WebServer(coordinator=coordinator, bot=None)
-            tasks.append(web_server.start())
+            await web_server.start()
         except Exception as e:
             logger.error(f"Web UI failed to start: {e}", exc_info=True)
             web_server = None
 
+    # Coordinated shutdown. SIGINT/SIGTERM set an event; we then stop the
+    # coordinator (which stops every agent) and the web server under a bounded
+    # timeout, then force-cancel anything still running. Previously SIGINT was
+    # handled inside the signal bot and only stopped its own loop, leaving the
+    # coordinator, the other agents, the data/macro refresh loops, and the web
+    # server alive — the process hung until SIGKILL (exit 9).
+    loop = asyncio.get_running_loop()
+    stop_event = asyncio.Event()
+    import signal as _signal
+
+    def _request_stop(signame: str):
+        logger.info(f"Shutdown requested ({signame})")
+        stop_event.set()
+
+    for _sig in (_signal.SIGINT, _signal.SIGTERM):
+        try:
+            loop.add_signal_handler(_sig, _request_stop, _sig.name)
+        except (NotImplementedError, ValueError, RuntimeError):
+            # Windows / non-main thread: fall back to KeyboardInterrupt in main()
+            pass
+
+    # Wake when shutdown is requested OR a component exits on its own (crash).
+    stop_waiter = asyncio.ensure_future(stop_event.wait())
     try:
-        await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.wait([*component_tasks, stop_waiter],
+                           return_when=asyncio.FIRST_COMPLETED)
     finally:
+        stop_waiter.cancel()
+        timeout = settings.SHUTDOWN_TIMEOUT_SEC
+        logger.info("Shutting down — stopping agents and web server")
+        try:
+            await asyncio.wait_for(coordinator.stop(), timeout)
+        except asyncio.TimeoutError:
+            logger.warning("coordinator.stop() timed out — forcing cancel")
+        except Exception as e:
+            logger.warning(f"coordinator.stop: {e}")
         if web_server is not None:
             try:
-                await web_server.stop()
+                await asyncio.wait_for(web_server.stop(), timeout)
             except Exception as e:
                 logger.debug(f"web server stop: {e}")
+        # Force-cancel any component still running, bounded so a wedged task
+        # can't hold the process open.
+        for t in component_tasks:
+            t.cancel()
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*component_tasks, return_exceptions=True), timeout)
+        except asyncio.TimeoutError:
+            logger.warning("some components did not cancel in time")
+        logger.info("Shutdown complete")
 
 
 if __name__ == "__main__":
