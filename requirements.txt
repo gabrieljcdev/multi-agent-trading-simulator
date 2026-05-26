@@ -1,5 +1,6 @@
 # Exchange connectivity
-ccxt==4.3.26
+ccxt==4.5.54          # includes ccxt.pro (WebSocket watch_* streaming)
+protobuf==5.29.5      # required by ccxt.pro to decode MEXC's WS order-book feed
 
 # Technical indicators
 pandas-ta==0.3.14b

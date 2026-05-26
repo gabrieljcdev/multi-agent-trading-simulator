@@ -9,7 +9,13 @@ import time
 from collections import deque, namedtuple
 import pandas as pd
 import ta
-import ccxt.async_support as ccxt
+import ccxt.pro as ccxt   # WebSocket streaming (watch_*). REST methods are
+                          # inherited from ccxt.async_support, so fetch_ohlcv /
+                          # fetch_tickers / load_markets keep working unchanged.
+                          # NB: ccxt.async_support exposes watch_* as raising
+                          # stubs (NotSupported), so it must NOT be used here —
+                          # that silently killed every order-book/candle stream.
+from ccxt.base.errors import NotSupported
 from dotenv import load_dotenv
 from config import settings
 from core.regime_detector import regime_detector
@@ -91,6 +97,10 @@ class MarketData:
         # Append-only, capped by trim_history() at PRICE_HISTORY_WINDOW_SEC.
         self._price_history: dict = {}
         self._callbacks:   list = []
+        # Subscribers fired on every order-book tick (see on_book_update).
+        # The scalp agent's OFIEngine registers here so it sees the same
+        # stream that feeds ofi_scorer / _last_book.
+        self._book_callbacks: list = []
         self._active_pairs: list = []
         self._running = False
         # Optional Dashboard reference; main.py wires this via set_dashboard
@@ -113,6 +123,14 @@ class MarketData:
 
     def on_candle_close(self, fn):
         self._callbacks.append(fn)
+
+    def on_book_update(self, fn):
+        """Register a callback fired on every order-book tick, as
+        fn(exchange, pair, bids, asks). Runs inline on the stream loop for
+        every update — keep it fast and non-blocking. Mirrors on_candle_close
+        but for books; the scalp agent's OFIEngine subscribes here so its OFI
+        is computed from the same stream that feeds ofi_scorer."""
+        self._book_callbacks.append(fn)
 
     def get_candles(self, exchange, pair, timeframe):
         return self._candles.get((exchange, pair, timeframe))
@@ -438,7 +456,12 @@ class MarketData:
         _stream_orderbooks: a single-series watch_ohlcv blocks until that series
         next ticks, so it can't busy-spin the event loop (the old single sweep
         over all series returned cached candles immediately and pinned the CPU)."""
-        if not hasattr(ex, "watch_ohlcv"):
+        # Gate on the ccxt capability flag, not hasattr: every exchange *has*
+        # the watch_ohlcv method (a stub that may raise NotSupported), so
+        # hasattr is always True and would let us spin on an unsupported venue.
+        if not getattr(ex, "has", {}).get("watchOHLCV"):
+            logger.warning(f"{exchange_name}: watchOHLCV unsupported — "
+                           "live candle stream disabled")
             return
         pairs = self._active_pairs[:settings.ORDER_BOOK_STREAM_PAIRS]
         await asyncio.gather(
@@ -510,7 +533,13 @@ class MarketData:
         the real update rate. (The previous design swept many symbols in one
         loop, where each call returned the cached book immediately and spun the
         event loop at 100% CPU.)"""
-        if not hasattr(ex, "watch_order_book"):
+        # Gate on the ccxt capability flag, not hasattr: every exchange *has*
+        # the watch_order_book method (a stub that raises NotSupported on
+        # unsupported venues), so hasattr is always True. Under ccxt.async_support
+        # that let us call a raising stub and silently feed nothing to ofi_scorer.
+        if not getattr(ex, "has", {}).get("watchOrderBook"):
+            logger.warning(f"{exchange_name}: watchOrderBook unsupported — "
+                           "order-book stream disabled (OFI will be empty)")
             return
         pairs = self._active_pairs[:settings.ORDER_BOOK_STREAM_PAIRS]
         await asyncio.gather(
@@ -542,11 +571,26 @@ class MarketData:
                     except (IndexError, TypeError, ValueError):
                         pass
                 ofi_scorer.update_book(pair=pair, exchange=exchange_name,
-                                       bids=ob.get("bids", []), asks=ob.get("asks", []))
+                                       bids=bids, asks=asks)
+                # Fan the same tick out to registered subscribers (scalp
+                # OFIEngine). Sync + best-effort: a slow/throwing subscriber
+                # must not stall or kill the stream loop.
+                for cb in self._book_callbacks:
+                    try:
+                        cb(exchange_name, pair, bids, asks)
+                    except Exception as e:
+                        logger.debug(f"book callback {exchange_name} {pair}: {e}")
             except asyncio.TimeoutError:
                 continue   # no update within the window — just re-await
             except asyncio.CancelledError:
                 break
+            except NotSupported as e:
+                # Capability/dependency gap (e.g. MEXC needs protobuf, or the
+                # venue lacks ws books). Retrying forever just hides it — log
+                # loudly once and stop this symbol's stream.
+                logger.warning(f"OB {exchange_name} {pair}: unsupported, "
+                               f"stopping stream — {e}")
+                return
             except Exception as e:
                 logger.debug(f"OB {exchange_name} {pair}: {e}")
                 await asyncio.sleep(settings.ORDER_BOOK_ERROR_BACKOFF_S)

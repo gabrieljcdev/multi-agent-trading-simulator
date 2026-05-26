@@ -45,6 +45,32 @@ async def test_stream_one_orderbook_processes_then_backs_off(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_stream_one_orderbook_fires_book_callbacks(monkeypatch):
+    """Regression: the order-book stream must fan every tick out to
+    on_book_update subscribers (the scalp agent's OFIEngine). The whole
+    'zero scalp_observations' bug was that nothing was wired to the stream."""
+    md = MarketData()
+    md._running = True
+    book = {"bids": [[100.0, 1.0]], "asks": [[100.5, 1.0]]}
+    received = []
+
+    class FakeEx:
+        async def watch_order_book(self, pair, depth):
+            if md._running:
+                md._running = False          # one tick, then stop the loop
+                return book
+            return book
+
+    md.on_book_update(lambda exchange, pair, bids, asks:
+                      received.append((exchange, pair, bids, asks)))
+    monkeypatch.setattr("core.market_data.ofi_scorer.update_book", lambda **k: None)
+
+    await md._stream_one_orderbook("mexc", FakeEx(), "BTC/USDT")
+
+    assert received == [("mexc", "BTC/USDT", book["bids"], book["asks"])]
+
+
+@pytest.mark.asyncio
 async def test_stream_one_orderbook_skips_when_not_running():
     md = MarketData()
     md._running = False

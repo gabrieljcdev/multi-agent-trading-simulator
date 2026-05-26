@@ -621,6 +621,11 @@ class ScalpingAgent(BaseAgent):
         self._positions:     dict[str, ScalpPosition] = {}
         self._observations:  list[ScalpObservation]   = []
         self._pending_flush: list[ScalpObservation]   = []
+        # One-shot guard: we subscribe the OFIEngine to market_data's
+        # order-book stream the first time market_data resolves (see
+        # _ensure_book_subscription). Without that the engine never sees a
+        # book and every entry silent-skips on stale OFI.
+        self._book_subscribed = False
 
         # Per-agent circuit breakers (independent of the portfolio breaker).
         # _daily_loss accumulates only losses (drives the daily-loss halt);
@@ -675,6 +680,7 @@ class ScalpingAgent(BaseAgent):
         signal agent's bot if REGISTERED_AGENTS is reachable. None when
         nothing is wired — caller falls back to stub behaviour."""
         if self._market_data is not None:
+            self._ensure_book_subscription(self._market_data)
             return self._market_data
         try:
             from agents import REGISTERED_AGENTS
@@ -687,10 +693,31 @@ class ScalpingAgent(BaseAgent):
                 md = getattr(bot, "_market_data", None)
                 if md is not None:
                     self._market_data = md     # cache to skip the walk next time
+                    self._ensure_book_subscription(md)
                     return md
         except Exception as e:
             log.debug("[ScalpingAgent] market_data lookup failed: %s", e)
         return None
+
+    def _ensure_book_subscription(self, md) -> None:
+        """Subscribe our OFIEngine to market_data's order-book stream, once.
+
+        market_data fans every book tick out to on_book_update callbacks as
+        (exchange, pair, bids, asks); OFIEngine.on_book wants
+        (symbol, exchange, bids, asks), so we adapt the argument order. This
+        is the missing link that left the engine empty (root cause of zero
+        scalp_observations): the stream fed ofi_scorer but nothing fed us.
+        None-safe — a market_data without on_book_update (older / test stub)
+        is silently skipped and the agent falls back to stale-OFI behaviour."""
+        if self._book_subscribed:
+            return
+        register = getattr(md, "on_book_update", None)
+        if not callable(register):
+            return
+        register(lambda exchange, pair, bids, asks:
+                 self.on_book(pair, exchange, bids, asks))
+        self._book_subscribed = True
+        log.info("[ScalpingAgent] subscribed OFIEngine to order-book stream")
 
     def _resolve_regime_detector(self):
         """Return cached / injected detector, else the module singleton."""
