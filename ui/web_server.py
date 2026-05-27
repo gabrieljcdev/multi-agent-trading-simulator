@@ -43,6 +43,18 @@ logger = logging.getLogger(__name__)
 _HTML_PATH = Path(__file__).parent / "web_dashboard.html"
 _VALID_MODES = ("per_trade", "window", "autonomous")
 
+# Agent ids that have a dedicated page. Matches REGISTERED_AGENTS exactly —
+# note the sentiment placeholder registers as "sentiment_agent".
+_VALID_AGENTS = ("signal", "arb", "scalp", "macro", "sentiment_agent", "onchain")
+_SESSIONS = ("LONDON", "NEW_YORK", "ASIA", "OFF_HOURS")
+# Anchor city per session for the local clock + session-page header.
+_SESSION_TZ = {
+    "LONDON":    ("Europe/London",    "LON"),
+    "NEW_YORK":  ("America/New_York",  "NYC"),
+    "ASIA":      ("Asia/Tokyo",        "TYO"),
+    "OFF_HOURS": ("UTC",               "UTC"),
+}
+
 
 def _session_for_hour(hour: int) -> str:
     if 7 <= hour < 13:
@@ -52,6 +64,16 @@ def _session_for_hour(hour: int) -> str:
     if 0 <= hour < 7:
         return "ASIA"
     return "OFF_HOURS"
+
+
+def _local_time(tz: str) -> str:
+    """HH:MM local time for an IANA tz, computed server-side for the session
+    endpoint. Falls back to UTC if the zone isn't available."""
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo(tz)).strftime("%H:%M")
+    except Exception:
+        return datetime.utcnow().strftime("%H:%M")
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -132,6 +154,8 @@ class WebServer:
         app.add_routes([
             web.get("/",   self.handle_index),
             web.get("/ws", self.handle_ws),
+            web.get("/api/agent/{agent_id}",       self.handle_agent_detail),
+            web.get("/api/session/{session_name}", self.handle_session_detail),
             web.post("/action/approve",        self.handle_approve),
             web.post("/action/skip",           self.handle_skip),
             web.post("/action/kill",           self.handle_kill),
@@ -372,6 +396,55 @@ class WebServer:
         except Exception as e:
             return web.json_response({"ok": False, "error": str(e)})
 
+    # ── REST detail endpoints (agent + session pages) ────────────────────
+
+    def _agent_trades(self, agent_id: str) -> list:
+        """Trade log for an agent page. Each fund reads from its own ledger;
+        the placeholder agents (macro / sentiment_agent / onchain) have none."""
+        if agent_id == "signal":
+            return self._safe(lambda: db_queries.get_signal_trade_history(100), [])
+        if agent_id == "arb":
+            return self._safe(db_queries.get_arb_trades_all, [])
+        if agent_id == "scalp":
+            return self._safe(lambda: db_queries.get_scalp_trade_history(100), [])
+        return []
+
+    async def handle_agent_detail(self, request) -> web.Response:
+        """GET /api/agent/{agent_id} → {trades, insights} for the agent page.
+        Unknown ids 404. Placeholders return empty lists."""
+        agent_id = request.match_info.get("agent_id", "")
+        if agent_id not in _VALID_AGENTS:
+            return web.json_response({"error": "unknown agent"}, status=404)
+        trades = self._agent_trades(agent_id)
+        insights = self._safe(
+            lambda: db_queries.get_postmortems_by_agent(agent_id, 3), [])
+        return web.json_response(
+            {"trades": trades, "insights": insights},
+            dumps=lambda o: json.dumps(o, default=str),
+        )
+
+    async def handle_session_detail(self, request) -> web.Response:
+        """GET /api/session/{session_name} → today's closed trades for that
+        session, aggregated across funds. Unknown sessions 404."""
+        session = request.match_info.get("session_name", "").upper()
+        if session not in _SESSIONS:
+            return web.json_response({"error": "unknown session"}, status=404)
+        trades = self._safe(
+            lambda: db_queries.get_closed_trades_by_session(session, "today"), [])
+        try:
+            total_pnl = sum(float(t.get("pnl_usd", 0.0) or 0.0) for t in trades)
+        except Exception:
+            total_pnl = 0.0
+        tz, _label = _SESSION_TZ.get(session, ("UTC", "UTC"))
+        return web.json_response({
+            "session":     session,
+            "local_time":  _local_time(tz),
+            "tz":          tz,
+            "total_pnl":   round(total_pnl, 2),
+            "trade_count": len(trades),
+            "trades":      trades,
+        }, dumps=lambda o: json.dumps(o, default=str))
+
     # ── Snapshot ─────────────────────────────────────────────────────────
 
     def _build_snapshot(self) -> dict:
@@ -381,6 +454,14 @@ class WebServer:
         now = datetime.utcnow()
         bot = self._resolve_bot()
         arb = self._safe(db_queries.get_arb_trades_all, [])
+        # Positions are read once per push: live exposure (Change 3) is the sum
+        # of every open position's size, recomputed here — never cached. Scalp
+        # spiking up/down as positions open/close in seconds is expected.
+        positions = self._snap_positions(bot)
+        try:
+            exposure_usd = sum(float(p.get("size_usd", 0.0) or 0.0) for p in positions)
+        except Exception:
+            exposure_usd = 0.0
         return {
             "ts":            now.strftime("%H:%M:%S"),
             "session":       _session_for_hour(now.hour),
@@ -388,7 +469,7 @@ class WebServer:
             "mode":          "SIM" if settings.SIM_MODE else "LIVE",
             "paused":        bool(getattr(bot, "_paused", False)),
             "approval_mode": getattr(settings, "APPROVAL_MODE", "per_trade"),
-            "portfolio":         self._snap_portfolio(),
+            "portfolio":         self._snap_portfolio(exposure_usd),
             "agents":            self._snap_agents(),
             "circuit_breakers":  self._snap_circuit_breakers(bot),
             "regime":            self._snap_regime(),
@@ -396,7 +477,8 @@ class WebServer:
             "exchanges":         self._snap_exchanges(bot),
             "signals":           self._snap_signals(),
             "pending_signal":    self._snap_pending(bot),
-            "positions":         self._snap_positions(bot),
+            "positions":         positions,
+            "scalp":             self._snap_scalp(bot),
             "arb_feed":          arb[:10],
             "session_pnl":       self._safe(db_queries.get_session_pnl_today, {
                 s: {"pnl": 0.0, "trades": 0}
@@ -418,28 +500,101 @@ class WebServer:
             logger.debug(f"web snapshot field failed: {e}")
             return fallback
 
-    def _snap_portfolio(self) -> dict:
+    def _snap_portfolio(self, exposure_usd: float = 0.0) -> dict:
+        """Bankroll is persistent (Change 1): STARTING_CAPITAL_TOTAL + all-time
+        realised P&L, recomputed from the ledger every snapshot so it can never
+        drift or reset. Daily P&L is the only metric that resets at UTC
+        midnight; daily_pnl_pct + exposure_pct are now expressed against
+        bankroll. exposure_usd is passed in from the live positions array."""
         p = self._portfolio_cache or {}
-        agents = self._agents_cache or []
-        total_pnl = 0.0
-        try:
-            total_pnl = sum(float(getattr(a, "total_pnl", 0.0) or 0.0) for a in agents)
-        except Exception:
-            total_pnl = 0.0
-        start_cap = float(getattr(settings, "STARTING_CAPITAL", 0.0) or 0.0)
+        starting = (
+            float(getattr(settings, "FUND_SIGNAL_CAPITAL", 0.0) or 0.0)
+            + float(getattr(settings, "FUND_ARB_CAPITAL", 0.0) or 0.0)
+            + float(getattr(settings, "FUND_MEXC_SCALP_CAPITAL", 0.0) or 0.0)
+        )
+        realised = float(self._safe(db_queries.get_alltime_realised_pnl, 0.0) or 0.0)
+        bankroll = starting + realised
+        daily_pnl = float(p.get("total_daily_pnl", 0.0) or 0.0)
+        daily_fees = float(self._safe(db_queries.get_daily_fees, 0.0) or 0.0)
+        daily_pnl_pct = (daily_pnl / bankroll * 100.0) if bankroll > 0 else 0.0
+        exposure_pct = (exposure_usd / bankroll * 100.0) if bankroll > 0 else 0.0
         wr_all = self._safe(lambda: db_queries.get_signal_win_rate(
             days=365, exclude_strategy="scalp"), {})
         return {
-            "equity":           round(float(p.get("total_equity", 0.0) or 0.0), 2),
-            "daily_pnl":        round(float(p.get("total_daily_pnl", 0.0) or 0.0), 2),
-            "daily_pnl_pct":    round(float(p.get("total_daily_pnl_pct", 0.0) or 0.0), 2),
-            "total_pnl":        round(total_pnl, 2),
-            "total_pnl_pct":    round(total_pnl / start_cap * 100, 2) if start_cap else 0.0,
-            "exposure_pct":     round(float(p.get("total_exposure_pct", 0.0) or 0.0), 1),
-            "win_rate_today":   round(float(p.get("overall_win_rate_today", 0.0) or 0.0) * 100, 1),
-            "win_rate_alltime": round(float(wr_all.get("win_rate", 0.0) or 0.0) * 100, 1),
-            "trades_today":     int(p.get("total_trades_today", 0) or 0),
+            "bankroll":             round(bankroll, 2),
+            "bankroll_alltime_pnl": round(realised, 2),
+            "daily_pnl":            round(daily_pnl, 2),
+            "daily_pnl_pct":        round(daily_pnl_pct, 2),
+            "daily_fees":           round(daily_fees, 2),
+            "exposure_pct":         round(exposure_pct, 1),
+            "exposure_usd":         round(exposure_usd, 2),
+            "win_rate_today":       round(float(p.get("overall_win_rate_today", 0.0) or 0.0) * 100, 1),
+            "win_rate_alltime":     round(float(wr_all.get("win_rate", 0.0) or 0.0) * 100, 1),
+            "trades_today":         int(p.get("total_trades_today", 0) or 0),
         }
+
+    def _snap_scalp(self, bot) -> dict:
+        """Scalp feed (Change 5): live (open) scalp positions on top, persisted
+        closed trades below — newest first, capped at WEB_UI_SCALP_FEED_HISTORY.
+        The DB backs closed_trades, so they survive restarts and don't vanish
+        when newer trades arrive."""
+        limit = int(getattr(settings, "WEB_UI_SCALP_FEED_HISTORY", 30) or 30)
+        return {
+            "live_trades":   self._snap_scalp_live(bot),
+            "closed_trades": self._safe(
+                lambda: db_queries.get_scalp_trade_history(limit), []),
+        }
+
+    def _snap_scalp_live(self, bot) -> list:
+        """Open scalp positions from the scalp agent's in-memory book, each with
+        a running unrealised-bps figure. Defensive: returns [] when the
+        coordinator, the scalp agent, or its positions aren't reachable."""
+        coord = self._coordinator
+        agent = None
+        if coord is not None:
+            getter = getattr(coord, "get_agent", None)
+            if callable(getter):
+                try:
+                    agent = getter("scalp")
+                except Exception:
+                    agent = None
+        positions = getattr(agent, "_positions", None) or {}
+        md = getattr(bot, "_market_data", None)
+        now = time.time()
+        out = []
+        for pos in list(positions.values()):
+            try:
+                entry = float(getattr(pos, "entry_price", 0.0) or 0.0)
+                direction = getattr(pos, "direction", "?")
+                current = entry
+                if md is not None:
+                    try:
+                        pr = md.get_price(getattr(pos, "exchange", None),
+                                          getattr(pos, "symbol", None))
+                        if pr:
+                            current = float(pr)
+                    except Exception:
+                        pass
+                if entry > 0 and current > 0:
+                    raw_bps = (current - entry) / entry * 10000.0
+                    unreal = raw_bps if direction != "SHORT" else -raw_bps
+                else:
+                    unreal = 0.0
+                entry_time = float(getattr(pos, "entry_time", 0.0) or 0.0)
+                hold = int(now - entry_time) if entry_time else 0
+                out.append({
+                    "symbol":         getattr(pos, "symbol", "?"),
+                    "exchange":       getattr(pos, "exchange", "?"),
+                    "direction":      direction,
+                    "entry_price":    round(entry, 6),
+                    "tp_price":       round(float(getattr(pos, "tp_price", 0.0) or 0.0), 6),
+                    "sl_price":       round(float(getattr(pos, "sl_price", 0.0) or 0.0), 6),
+                    "unrealised_bps": round(unreal, 1),
+                    "hold_sec":       hold,
+                })
+            except Exception:
+                continue
+        return out
 
     def _snap_agents(self) -> list:
         out = []

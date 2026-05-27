@@ -44,12 +44,18 @@
   .tabs{display:flex;gap:6px;margin-bottom:10px}
   .tab{padding:6px 14px} .tab.active{background:var(--tx0);color:var(--bg0);border-color:var(--tx0)}
   .panel{display:none} .panel.active{display:block}
+  /* hash-routed top-level views */
+  .view[hidden]{display:none}
   /* metric cards */
-  .metrics{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin-bottom:10px}
+  .metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:10px}
   .metric .v{font-size:20px;font-weight:bold}
+  .metric .sub{font-size:11px;color:var(--tx2);margin-top:2px}
   /* agent grid */
   .agents{display:grid;grid-template-columns:repeat(6,1fr);gap:10px;margin-bottom:10px}
   .agent.offline{opacity:.4}
+  .agent.clickable{cursor:pointer}
+  .agent.clickable:hover{border-color:var(--tx1)}
+  .agent.clickable:focus{outline:2px solid var(--tx1);outline-offset:1px}
   .agent .id{font-weight:bold;text-transform:capitalize}
   .st{font-size:11px;padding:1px 6px;border-radius:3px;background:var(--bg2)}
   .st.RUNNING{color:var(--pos)} .st.HALTED,.st.ERROR{color:var(--neg)} .st.PAUSED{color:var(--warn)}
@@ -57,6 +63,10 @@
   th,td{text-align:left;padding:4px 6px;border-bottom:1px solid var(--line)}
   th{color:var(--tx1);font-weight:normal}
   .scroll{max-height:260px;overflow:auto}
+  tr.win td{background:rgba(59,109,17,.06)} tr.loss td{background:rgba(163,45,45,.06)}
+  .tag{font-size:10px;padding:0 5px;border-radius:3px;font-weight:bold}
+  .tag.win{background:var(--pos);color:#fff} .tag.loss{background:var(--neg);color:#fff}
+  .tag.live{background:var(--warn);color:#fff}
   /* bars */
   .bar{height:8px;background:var(--bg2);border-radius:4px;overflow:hidden;margin:3px 0 8px}
   .bar > i{display:block;height:100%}
@@ -75,16 +85,24 @@
   .grid3{display:grid;grid-template-columns:2fr 1fr;gap:10px}
   .sessions{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
   .session.active{outline:2px solid var(--tx1)}
+  .session.clickable{cursor:pointer}
+  .session.clickable:hover{border-color:var(--tx1)}
+  .session.clickable:focus{outline:2px solid var(--tx1);outline-offset:1px}
+  .session .clock{font-size:11px;color:var(--tx2);margin-top:2px}
   .logline{padding:4px 0;border-bottom:1px solid var(--line)}
   .filters{display:flex;gap:4px;flex-wrap:wrap;margin-bottom:8px}
   .filters button.on{background:var(--tx0);color:var(--bg0)}
   .muted{color:var(--tx2);font-style:italic}
+  /* agent / session pages */
+  .pagehead{display:flex;align-items:center;gap:12px;flex-wrap:wrap;
+    background:var(--bg0);border:1px solid var(--line);border-radius:4px;padding:8px 10px;margin-bottom:10px}
+  .pagetitle{font-weight:bold;text-transform:capitalize;font-size:14px}
 </style>
 </head>
 <body>
 <div class="wrap" id="root">
 
-  <!-- TOP BAR -->
+  <!-- TOP BAR (always visible) -->
   <div class="topbar">
     <span id="modeBadge" class="badge sim">SIM</span>
     <span id="clock">--:--:--</span>
@@ -105,95 +123,123 @@
     <button id="killBtn2" class="kill">Kill All</button>
   </div>
 
-  <!-- TABS -->
-  <div class="tabs">
-    <button class="tab active" data-tab="dashboard">Dashboard</button>
-    <button class="tab" data-tab="arb">Arb History</button>
-    <button class="tab" data-tab="insights">Insights</button>
-    <button class="tab" data-tab="log">Log</button>
-  </div>
+  <!-- ───────────────────────── DASHBOARD VIEW ───────────────────────── -->
+  <div id="view-dashboard" class="view">
 
-  <!-- DASHBOARD -->
-  <div id="panel-dashboard" class="panel active">
-    <div class="metrics">
-      <div class="card metric"><h2>Total Equity</h2><div class="v" id="m-eq">—</div></div>
-      <div class="card metric"><h2>Daily P&amp;L</h2><div class="v" id="m-dpnl">—</div></div>
-      <div class="card metric"><h2>Total P&amp;L</h2><div class="v" id="m-tpnl">—</div></div>
-      <div class="card metric"><h2>Exposure</h2><div class="v" id="m-exp">—</div></div>
-      <div class="card metric"><h2>Win Rate</h2><div class="v" id="m-wr">—</div></div>
+    <!-- TABS (Insights tab removed — insights live on agent pages) -->
+    <div class="tabs">
+      <button class="tab active" data-tab="dashboard">Dashboard</button>
+      <button class="tab" data-tab="arb">Arb History</button>
+      <button class="tab" data-tab="log">Log</button>
     </div>
 
-    <div class="agents" id="agents"></div>
+    <!-- DASHBOARD -->
+    <div id="panel-dashboard" class="panel active">
+      <div class="metrics">
+        <div class="card metric"><h2>Total Bankroll</h2>
+          <div class="v" id="m-bank">—</div><div class="sub" id="m-bank-sub">—</div></div>
+        <div class="card metric"><h2>Daily P&amp;L</h2>
+          <div class="v" id="m-dpnl">—</div><div class="sub" id="m-dfees">—</div></div>
+        <div class="card metric"><h2>Exposure</h2>
+          <div class="v" id="m-exp">—</div><div class="sub" id="m-exp-sub">—</div></div>
+        <div class="card metric"><h2>Win Rate</h2>
+          <div class="v" id="m-wr">—</div><div class="sub" id="m-wr-sub">—</div></div>
+      </div>
 
-    <div class="grid2" style="margin-bottom:10px">
-      <div class="card"><h2>Regime</h2><div id="regime"></div></div>
-      <div class="card"><h2>Sentiment</h2><div id="sentiment"></div></div>
-    </div>
+      <div class="agents" id="agents"></div>
 
-    <div class="grid3" style="margin-bottom:10px">
-      <div class="card"><h2>Signal Feed</h2><div class="scroll" id="signals"></div></div>
-      <div class="card">
-        <h2>Approval</h2>
-        <div id="pending"></div>
-        <div style="margin-top:8px">
-          <span class="dim">mode:</span>
-          <button class="modeBtn" data-mode="per_trade">per_trade</button>
-          <button class="modeBtn" data-mode="window">window</button>
-          <button class="modeBtn" data-mode="autonomous">autonomous</button>
+      <div class="grid2" style="margin-bottom:10px">
+        <div class="card"><h2>Regime</h2><div id="regime"></div></div>
+        <div class="card"><h2>Sentiment</h2><div id="sentiment"></div></div>
+      </div>
+
+      <div class="grid3" style="margin-bottom:10px">
+        <div class="card"><h2>Signal Feed</h2><div class="scroll" id="signals"></div></div>
+        <div class="card">
+          <h2>Approval</h2>
+          <div id="pending"></div>
+          <div style="margin-top:8px">
+            <span class="dim">mode:</span>
+            <button class="modeBtn" data-mode="per_trade">per_trade</button>
+            <button class="modeBtn" data-mode="window">window</button>
+            <button class="modeBtn" data-mode="autonomous">autonomous</button>
+          </div>
+          <div style="margin-top:6px"><button id="windowBtn">Approve 60m window</button></div>
         </div>
-        <div style="margin-top:6px"><button id="windowBtn">Approve 60m window</button></div>
+      </div>
+
+      <div class="grid2" style="margin-bottom:10px">
+        <div class="card"><h2>Circuit Breakers</h2><div id="breakers"></div></div>
+        <div class="card"><h2>Exchanges</h2><div id="exchanges"></div></div>
+      </div>
+
+      <div class="card" style="margin-bottom:10px">
+        <h2>Open Positions</h2><div class="scroll" id="positions"></div>
+      </div>
+
+      <div class="card" style="margin-bottom:10px">
+        <h2>Live Arb Feed</h2><div class="scroll" id="arbFeed"></div>
+      </div>
+
+      <div class="card">
+        <h2>Session P&amp;L</h2><div class="sessions" id="sessions"></div>
       </div>
     </div>
 
-    <div class="grid2" style="margin-bottom:10px">
-      <div class="card"><h2>Circuit Breakers</h2><div id="breakers"></div></div>
-      <div class="card"><h2>Exchanges</h2><div id="exchanges"></div></div>
+    <!-- ARB HISTORY -->
+    <div id="panel-arb" class="panel">
+      <div class="metrics" style="grid-template-columns:repeat(4,1fr)">
+        <div class="card metric"><h2>Arb Trades</h2><div class="v" id="a-n">—</div></div>
+        <div class="card metric"><h2>Net P&amp;L</h2><div class="v" id="a-pnl">—</div></div>
+        <div class="card metric"><h2>Fees</h2><div class="v" id="a-fees">—</div></div>
+        <div class="card metric"><h2>Avg Fill</h2><div class="v" id="a-fill">—</div></div>
+      </div>
+      <div class="card"><h2>All Arb Trades</h2><div class="scroll" id="arbTable"></div></div>
     </div>
 
+    <!-- LOG -->
+    <div id="panel-log" class="panel">
+      <div class="filters" id="logFilters">
+        <button class="on" data-f="ALL">ALL</button>
+        <button data-f="exec">EXEC</button><button data-f="skip">SKIP</button>
+        <button data-f="arb">ARB</button><button data-f="info">INFO</button>
+        <button data-f="warn">WARN</button><button data-f="err">ERR</button>
+        <button data-f="kill">KILL</button>
+      </div>
+      <div class="card scroll" id="logFeed" style="max-height:600px"></div>
+    </div>
+  </div>
+
+  <!-- ───────────────────────── AGENT VIEW ───────────────────────── -->
+  <div id="view-agent" class="view" hidden>
+    <div class="pagehead">
+      <button class="back" onclick="location.hash='#/'">← Back</button>
+      <span id="ag-name" class="pagetitle">—</span>
+      <span id="ag-status" class="st">—</span>
+      <span class="dim">cap</span><span id="ag-cap">—</span>
+      <span class="dim">daily</span><span id="ag-pnl">—</span>
+      <span class="dim">WR</span><span id="ag-wr">—</span>
+    </div>
+    <div id="ag-live" style="margin-bottom:10px"></div>
     <div class="card" style="margin-bottom:10px">
-      <h2>Open Positions</h2><div class="scroll" id="positions"></div>
+      <h2>Trade Log</h2><div class="scroll" id="ag-trades" style="max-height:400px"></div>
     </div>
+    <div class="card"><h2>Insights</h2><div id="ag-insights"></div></div>
+  </div>
 
-    <div class="grid2" style="margin-bottom:10px">
-      <div class="card"><h2>Live Arb Feed</h2><div class="scroll" id="arbFeed"></div></div>
-      <div class="card"><h2>Live Scalp Feed</h2><div class="scroll" id="scalpFeed"></div></div>
+  <!-- ───────────────────────── SESSION VIEW ───────────────────────── -->
+  <div id="view-session" class="view" hidden>
+    <div class="pagehead">
+      <button class="back" onclick="location.hash='#/'">← Back</button>
+      <span id="se-name" class="pagetitle">—</span>
+      <span id="se-clock" class="dim">—</span>
+      <span class="dim">P&amp;L today</span><span id="se-pnl">—</span>
+      <span id="se-count" class="dim">—</span>
     </div>
-
     <div class="card">
-      <h2>Session P&amp;L</h2><div class="sessions" id="sessions"></div>
+      <h2>Closed Trades (Today)</h2>
+      <div class="scroll" id="se-trades" style="max-height:600px"></div>
     </div>
-  </div>
-
-  <!-- ARB HISTORY -->
-  <div id="panel-arb" class="panel">
-    <div class="metrics" style="grid-template-columns:repeat(4,1fr)">
-      <div class="card metric"><h2>Arb Trades</h2><div class="v" id="a-n">—</div></div>
-      <div class="card metric"><h2>Net P&amp;L</h2><div class="v" id="a-pnl">—</div></div>
-      <div class="card metric"><h2>Fees</h2><div class="v" id="a-fees">—</div></div>
-      <div class="card metric"><h2>Avg Fill</h2><div class="v" id="a-fill">—</div></div>
-    </div>
-    <div class="card"><h2>All Arb Trades</h2><div class="scroll" id="arbTable"></div></div>
-  </div>
-
-  <!-- INSIGHTS -->
-  <div id="panel-insights" class="panel">
-    <div class="grid2" style="margin-bottom:10px">
-      <div class="card"><h2>Top Pairs</h2><div id="topPairs"></div></div>
-      <div class="card"><h2>Strategy Performance</h2><div id="topStrats"></div></div>
-    </div>
-    <div class="card"><h2>Claude Self-Review</h2><div id="insights"></div></div>
-  </div>
-
-  <!-- LOG -->
-  <div id="panel-log" class="panel">
-    <div class="filters" id="logFilters">
-      <button class="on" data-f="ALL">ALL</button>
-      <button data-f="exec">EXEC</button><button data-f="skip">SKIP</button>
-      <button data-f="arb">ARB</button><button data-f="info">INFO</button>
-      <button data-f="warn">WARN</button><button data-f="err">ERR</button>
-      <button data-f="kill">KILL</button>
-    </div>
-    <div class="card scroll" id="logFeed" style="max-height:600px"></div>
   </div>
 
 </div>
@@ -204,9 +250,25 @@ const $ = (id) => document.getElementById(id);
 let STATE = {};
 let logFilter = "ALL";
 
+const AGENT_ORDER = ["signal","arb","scalp","macro","sentiment_agent","onchain"];
+const AGENT_NAME = {
+  signal:"Signal Agent", arb:"Arb Agent", scalp:"Scalp Agent",
+  macro:"Macro Agent", sentiment_agent:"Sentiment Agent", onchain:"On-Chain Agent",
+};
+const PLACEHOLDER_AGENTS = ["macro","sentiment_agent","onchain"];
+const SESSION_KEYS = ["LONDON","NEW_YORK","ASIA","OFF_HOURS"];
+const SESSION_TZ = {
+  LONDON:["Europe/London","LON"], NEW_YORK:["America/New_York","NYC"],
+  ASIA:["Asia/Tokyo","TYO"], OFF_HOURS:["UTC","UTC"],
+};
+const SCALP_MAX_HOLD_SEC = 180;   // colour hold red past this (mirrors SCALP_MAX_HOLD_SEC)
+
+/* current top-level view, driven by the hash router */
+let CURRENT = {view:"dashboard", agent:null, session:null};
+let detailTimer = null;
+
 /* ---------- dark mode ---------- */
 function applyDark(on){
-  $("root").parentElement; // noop
   document.body.classList.toggle("dark", on);
   $("darkBtn").textContent = on ? "☀" : "☾";
 }
@@ -217,7 +279,7 @@ $("darkBtn").onclick = () => {
   applyDark(on);
 };
 
-/* ---------- tabs ---------- */
+/* ---------- tabs (within the dashboard view) ---------- */
 document.querySelectorAll(".tab").forEach(b => b.onclick = () => {
   document.querySelectorAll(".tab").forEach(t => t.classList.remove("active"));
   document.querySelectorAll(".panel").forEach(p => p.classList.remove("active"));
@@ -258,17 +320,46 @@ function wireKill(btn){
 }
 wireKill($("killBtn")); wireKill($("killBtn2"));
 
-/* approval queue buttons are wired per-render (approve/skip) */
-
 /* ---------- helpers ---------- */
 const fmtUsd = (v) => (v==null? "—" : (v<0?"-$":"$") + Math.abs(v).toFixed(2));
 const fmtPct = (v) => (v==null? "—" : (v>=0?"+":"") + Number(v).toFixed(2) + "%");
+const fmtBps = (v) => (v==null? "—" : (v>=0?"+":"") + Number(v).toFixed(1) + " bps");
 const cls = (v) => (v==null? "" : (v===0? "dim" : (v>0? "pos":"neg")));
 const esc = (s) => String(s==null?"":s).replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
 function fmtAge(s){ s=Math.max(0,s|0); const h=s/3600|0,m=(s%3600)/60|0; return h?`${h}h${m}m`:(m?`${m}m`:`${s}s`); }
 function fmtUp(s){ s=s|0; const h=s/3600|0,m=(s%3600)/60|0; return `up ${h}h${String(m).padStart(2,"0")}m`; }
+function localTime(tz){
+  try{
+    return new Intl.DateTimeFormat('en-GB',
+      {timeZone:tz, hour:'2-digit', minute:'2-digit', hour12:false}).format(new Date());
+  }catch(e){ return "--:--"; }
+}
 
-/* ---------- render ---------- */
+/* ---------- hash router ---------- */
+function showView(id){
+  document.querySelectorAll(".view").forEach(v => v.hidden = (v.id !== id));
+}
+function route(){
+  const h = location.hash || "#/";
+  const ma = h.match(/^#\/agent\/([a-z_]+)$/);
+  const ms = h.match(/^#\/session\/([a-z_]+)$/);
+  if(detailTimer){ clearInterval(detailTimer); detailTimer = null; }
+  if(ma){
+    CURRENT = {view:"agent", agent:ma[1], session:null};
+    showView("view-agent");
+    openAgentPage(ma[1]);
+  }else if(ms){
+    CURRENT = {view:"session", agent:null, session:ms[1].toUpperCase()};
+    showView("view-session");
+    openSessionPage(ms[1].toUpperCase());
+  }else{
+    CURRENT = {view:"dashboard", agent:null, session:null};
+    showView("view-dashboard");
+  }
+}
+window.addEventListener("hashchange", route);
+
+/* ---------- dashboard render ---------- */
 function updateUI(s){
   STATE = s;
   // top bar
@@ -286,28 +377,41 @@ function updateUI(s){
   document.querySelectorAll(".modeBtn").forEach(b =>
     b.classList.toggle("on", b.dataset.mode === s.approval_mode));
 
-  // metrics
+  // metrics (4 cards)
   const p = s.portfolio || {};
-  $("m-eq").textContent = fmtUsd(p.equity);
-  $("m-dpnl").innerHTML = `<span class="${cls(p.daily_pnl)}">${fmtUsd(p.daily_pnl)} ${fmtPct(p.daily_pnl_pct)}</span>`;
-  $("m-tpnl").innerHTML = `<span class="${cls(p.total_pnl)}">${fmtUsd(p.total_pnl)}</span>`;
+  $("m-bank").textContent = fmtUsd(p.bankroll);
+  const ap = p.bankroll_alltime_pnl;
+  $("m-bank-sub").innerHTML =
+    `<span class="${cls(ap)}">${(ap==null?"—":(ap>=0?"+$":"-$")+Math.abs(ap).toFixed(2))} since start</span>`;
+  $("m-dpnl").innerHTML =
+    `<span class="${cls(p.daily_pnl)}">${fmtUsd(p.daily_pnl)} (${fmtPct(p.daily_pnl_pct)} of bankroll)</span>`;
+  $("m-dfees").textContent = "Fees: " + fmtUsd(p.daily_fees);
   $("m-exp").textContent = (p.exposure_pct==null?"—":p.exposure_pct.toFixed(1)+"%");
-  $("m-wr").textContent = (p.win_rate_today==null?"—":p.win_rate_today.toFixed(0)+"%");
+  $("m-exp-sub").textContent = (p.exposure_usd==null?"—":fmtUsd(p.exposure_usd)+" deployed");
+  $("m-wr").textContent = (p.win_rate_today==null?"—":p.win_rate_today.toFixed(1)+"%");
+  $("m-wr-sub").textContent =
+    `${p.win_rate_today==null?"—":p.win_rate_today.toFixed(1)}% today · ` +
+    `${p.win_rate_alltime==null?"—":p.win_rate_alltime.toFixed(1)}% all-time`;
 
-  // agents (fixed 6 slots)
-  const order = ["signal","arb","scalp","macro","sentiment_agent","onchain"];
+  // agents (fixed 6 slots, clickable → agent page)
   const byId = {}; (s.agents||[]).forEach(a => byId[a.id]=a);
-  $("agents").innerHTML = order.map(id => {
+  $("agents").innerHTML = AGENT_ORDER.map(id => {
     const a = byId[id] || {id, status:"OFFLINE", capital:0, daily_pnl:0, trades_today:0, win_rate:0};
     const off = (a.status==="OFFLINE");
-    return `<div class="card agent ${off?"offline":""}">
-      <div class="id">${esc(id.replace("_agent",""))}</div>
+    return `<div class="card agent clickable ${off?"offline":""}" role="button" tabindex="0"
+        data-agent="${esc(id)}" aria-label="Open ${esc(AGENT_NAME[id]||id)}">
+      <div class="id">${esc((AGENT_NAME[id]||id).replace(" Agent",""))}</div>
       <div><span class="st ${esc(a.status)}">${esc(a.status)}</span></div>
       <div class="dim">cap ${fmtUsd(a.capital)}</div>
       <div class="${cls(a.daily_pnl)}">${fmtUsd(a.daily_pnl)}</div>
-      <div class="dim">${a.trades_today||0} tr · ${(a.win_rate||0).toFixed(0)}% wr</div>
+      <div class="dim">${a.trades_today||0} tr · ${(a.win_rate||0).toFixed(1)}% wr</div>
     </div>`;
   }).join("");
+  document.querySelectorAll("#agents .agent").forEach(el => {
+    const go = () => { location.hash = "#/agent/" + el.dataset.agent; };
+    el.onclick = go;
+    el.onkeydown = (e) => { if(e.key==="Enter"||e.key===" "){ e.preventDefault(); go(); } };
+  });
 
   // regime
   const r = s.regime || {};
@@ -326,34 +430,13 @@ function updateUI(s){
     `<div>BTC 30m: <span class="${cls(se.btc_30m_delta)}">${se.btc_30m_delta==null?"—":fmtPct(se.btc_30m_delta)}</span></div>`;
 
   // signal feed
-  $("signals").innerHTML = `<table><thead><tr><th>t</th><th>pair</th><th>trk</th><th>score</th><th>action</th></tr></thead><tbody>` +
-    ((s.signals||[]).map(x =>
-      `<tr><td class="dim">${esc(x.ts)}</td><td>${esc(x.pair)}</td><td class="dim">${esc(x.track)}</td>
-       <td>${x.score}</td><td class="${x.action==="exec"?"pos":(x.action==="skip"?"warn":"dim")}">${esc(x.action)}</td></tr>`).join("")
-     || `<tr><td colspan="5" class="muted">no signals</td></tr>`) + `</tbody></table>`;
+  $("signals").innerHTML = signalFeedHtml(s.signals);
 
   // pending / approval
-  const pend = s.pending_signal;
-  if(pend){
-    $("pending").innerHTML =
-      `<div><b>${esc(pend.pair)}</b> ${esc(pend.direction)} <span class="dim">${esc(pend.track)} · score ${pend.score}</span></div>` +
-      `<div class="dim">entry ${pend.entry??"—"} · sl ${pend.sl??"—"} · tp ${pend.tp??"—"} · rr ${pend.rr??"—"}</div>` +
-      `<div class="dim" style="margin:4px 0">${esc((pend.claude_summary||"").slice(0,160))}</div>` +
-      `<button id="approveBtn" class="on">Approve</button> <button id="skipBtn">Skip</button>`;
-    $("approveBtn").onclick = () => postAction("/action/approve");
-    $("skipBtn").onclick = () => postAction("/action/skip", {reason:"web_skip"});
-  }else{
-    $("pending").innerHTML = `<span class="muted">no signal pending</span>`;
-  }
+  renderPending(s.pending_signal);
 
   // circuit breakers
   const cb = s.circuit_breakers || {};
-  function barRow(label, val, limit){
-    const pct = limit>0 ? Math.min(100, val/limit*100) : 0;
-    const col = pct>=80? "var(--neg)" : pct>=50? "var(--warn)" : "var(--pos)";
-    return `<div>${label} <span class="dim">${(+val).toFixed(2)} / ${(+limit).toFixed(2)}</span></div>
-      <div class="bar"><i style="width:${pct}%;background:${col}"></i></div>`;
-  }
   $("breakers").innerHTML =
     barRow("Daily loss %", cb.daily_loss_pct||0, cb.daily_loss_limit||0) +
     barRow("Consecutive losses", cb.consecutive_losses||0, cb.consecutive_limit||0) +
@@ -365,70 +448,262 @@ function updateUI(s){
   ).join("") || `<span class="muted">none</span>`;
 
   // positions
-  $("positions").innerHTML = `<table><thead><tr><th>agent</th><th>pair</th><th>dir</th><th>entry</th><th>cur</th><th>size</th><th>P&amp;L</th><th>age</th></tr></thead><tbody>` +
-    ((s.positions||[]).map(x =>
-      `<tr><td class="dim">${esc(x.agent)}</td><td>${esc(x.pair)}</td><td>${esc(x.direction)}</td>
-       <td>${x.entry}</td><td>${x.current}</td><td>${fmtUsd(x.size_usd)}</td>
-       <td class="${cls(x.pnl_usd)}">${fmtUsd(x.pnl_usd)} ${fmtPct(x.pnl_pct)}</td><td class="dim">${fmtAge(x.age_s)}</td></tr>`).join("")
-     || `<tr><td colspan="8" class="muted">no open positions</td></tr>`) + `</tbody></table>`;
+  $("positions").innerHTML = positionsHtml(s.positions);
 
-  // live arb feed (dashboard) — most recent trades incl. per-row fees
-  const af = s.arb_feed || [];
-  $("arbFeed").innerHTML = `<table><thead><tr><th>t</th><th>pair</th><th>route</th><th>gap%</th><th>net</th><th>fees</th></tr></thead><tbody>` +
-    (af.map(x =>
-      `<tr><td class="dim">${esc(x.ts)}</td><td>${esc(x.pair)}</td>
-       <td class="dim">${esc(x.buy_exchange)}→${esc(x.sell_exchange)}</td><td>${x.gap_pct}</td>
-       <td class="${cls(x.net_pnl)}">${fmtUsd(x.net_pnl)}</td><td class="dim">${fmtUsd(x.fees)}</td></tr>`).join("")
-     || `<tr><td colspan="6" class="muted">no arb trades</td></tr>`) + `</tbody></table>`;
+  // live arb feed (dashboard)
+  $("arbFeed").innerHTML = arbFeedHtml(s.arb_feed);
 
-  // live scalp feed (dashboard) — open positions on the scalp agent only
-  const scalp = (s.positions||[]).filter(x => x.agent === "scalp");
-  $("scalpFeed").innerHTML = `<table><thead><tr><th>pair</th><th>dir</th><th>entry</th><th>cur</th><th>P&amp;L</th><th>age</th></tr></thead><tbody>` +
-    (scalp.map(x =>
-      `<tr><td>${esc(x.pair)}</td><td>${esc(x.direction)}</td><td>${x.entry}</td><td>${x.current}</td>
-       <td class="${cls(x.pnl_usd)}">${fmtUsd(x.pnl_usd)} ${fmtPct(x.pnl_pct)}</td><td class="dim">${fmtAge(x.age_s)}</td></tr>`).join("")
-     || `<tr><td colspan="6" class="muted">no scalp positions</td></tr>`) + `</tbody></table>`;
-
-  // session P&L
+  // session P&L (clickable + local clocks)
   const sp = s.session_pnl || {};
-  $("sessions").innerHTML = ["LONDON","NEW_YORK","ASIA","OFF_HOURS"].map(k => {
+  $("sessions").innerHTML = SESSION_KEYS.map(k => {
     const d = sp[k] || {pnl:0,trades:0};
-    return `<div class="card session ${s.session===k?"active":""}">
+    const tz = SESSION_TZ[k];
+    return `<div class="card session clickable ${s.session===k?"active":""}" role="button" tabindex="0"
+        data-session="${k.toLowerCase()}" aria-label="Open ${k.replace("_"," ")} session">
       <h2>${k.replace("_"," ")}</h2>
       <div class="${cls(d.pnl)}">${fmtUsd(d.pnl)}</div>
-      <div class="dim">${d.trades} trades</div></div>`;
+      <div class="dim">${d.trades} trades</div>
+      <div class="clock" data-tz="${tz[0]}">${tz[1]} ${localTime(tz[0])}</div></div>`;
   }).join("");
+  document.querySelectorAll("#sessions .session").forEach(el => {
+    const go = () => { location.hash = "#/session/" + el.dataset.session; };
+    el.onclick = go;
+    el.onkeydown = (e) => { if(e.key==="Enter"||e.key===" "){ e.preventDefault(); go(); } };
+  });
 
-  // arb history
+  // arb history tab
   const ah = s.arb_history || [];
   $("a-n").textContent = ah.length;
   $("a-pnl").innerHTML = `<span class="${cls(ah.reduce((a,x)=>a+(x.net_pnl||0),0))}">${fmtUsd(ah.reduce((a,x)=>a+(x.net_pnl||0),0))}</span>`;
   $("a-fees").textContent = fmtUsd(ah.reduce((a,x)=>a+(x.fees||0),0));
   $("a-fill").textContent = ah.length? (ah.reduce((a,x)=>a+(x.fill_ms||0),0)/ah.length).toFixed(0)+"ms" : "—";
-  $("arbTable").innerHTML = `<table><thead><tr><th>t</th><th>pair</th><th>buy</th><th>sell</th><th>gap%</th><th>size</th><th>net</th><th>fees</th><th>fill</th><th>status</th></tr></thead><tbody>` +
-    (ah.map(x =>
+  $("arbTable").innerHTML = arbTableHtml(ah);
+
+  renderLog();
+
+  // keep the active agent/session page header + live panels current
+  if(CURRENT.view === "agent") renderAgentLive(CURRENT.agent);
+  if(CURRENT.view === "session") refreshSessionClock();
+}
+
+/* ---------- reusable HTML builders ---------- */
+function barRow(label, val, limit){
+  const pct = limit>0 ? Math.min(100, val/limit*100) : 0;
+  const col = pct>=80? "var(--neg)" : pct>=50? "var(--warn)" : "var(--pos)";
+  return `<div>${label} <span class="dim">${(+val).toFixed(2)} / ${(+limit).toFixed(2)}</span></div>
+    <div class="bar"><i style="width:${pct}%;background:${col}"></i></div>`;
+}
+function signalFeedHtml(rows){
+  return `<table><thead><tr><th>t</th><th>pair</th><th>trk</th><th>score</th><th>action</th></tr></thead><tbody>` +
+    ((rows||[]).map(x =>
+      `<tr><td class="dim">${esc(x.ts)}</td><td>${esc(x.pair)}</td><td class="dim">${esc(x.track)}</td>
+       <td>${x.score}</td><td class="${x.action==="exec"?"pos":(x.action==="skip"?"warn":"dim")}">${esc(x.action)}</td></tr>`).join("")
+     || `<tr><td colspan="5" class="muted">no signals</td></tr>`) + `</tbody></table>`;
+}
+function positionsHtml(rows){
+  return `<table><thead><tr><th>agent</th><th>pair</th><th>dir</th><th>entry</th><th>cur</th><th>size</th><th>P&amp;L</th><th>age</th></tr></thead><tbody>` +
+    ((rows||[]).map(x =>
+      `<tr><td class="dim">${esc(x.agent)}</td><td>${esc(x.pair)}</td><td>${esc(x.direction)}</td>
+       <td>${x.entry}</td><td>${x.current}</td><td>${fmtUsd(x.size_usd)}</td>
+       <td class="${cls(x.pnl_usd)}">${fmtUsd(x.pnl_usd)} ${fmtPct(x.pnl_pct)}</td><td class="dim">${fmtAge(x.age_s)}</td></tr>`).join("")
+     || `<tr><td colspan="8" class="muted">no open positions</td></tr>`) + `</tbody></table>`;
+}
+function arbFeedHtml(rows){
+  return `<table><thead><tr><th>t</th><th>pair</th><th>route</th><th>gap%</th><th>net</th><th>fees</th></tr></thead><tbody>` +
+    ((rows||[]).map(x =>
+      `<tr><td class="dim">${esc(x.ts)}</td><td>${esc(x.pair)}</td>
+       <td class="dim">${esc(x.buy_exchange)}→${esc(x.sell_exchange)}</td><td>${x.gap_pct}</td>
+       <td class="${cls(x.net_pnl)}">${fmtUsd(x.net_pnl)}</td><td class="dim">${fmtUsd(x.fees)}</td></tr>`).join("")
+     || `<tr><td colspan="6" class="muted">no arb trades</td></tr>`) + `</tbody></table>`;
+}
+function arbTableHtml(rows){
+  return `<table><thead><tr><th>t</th><th>pair</th><th>buy</th><th>sell</th><th>gap%</th><th>size</th><th>net</th><th>fees</th><th>fill</th><th>status</th></tr></thead><tbody>` +
+    ((rows||[]).map(x =>
       `<tr><td class="dim">${esc(x.ts)}</td><td>${esc(x.pair)}</td><td class="dim">${esc(x.buy_exchange)}</td>
        <td class="dim">${esc(x.sell_exchange)}</td><td>${x.gap_pct}</td><td>${fmtUsd(x.size_usd)}</td>
        <td class="${cls(x.net_pnl)}">${fmtUsd(x.net_pnl)}</td><td class="dim">${fmtUsd(x.fees)}</td><td class="dim">${x.fill_ms}ms</td><td class="dim">${esc(x.status)}</td></tr>`).join("")
      || `<tr><td colspan="10" class="muted">no arb trades</td></tr>`) + `</tbody></table>`;
-
-  // insights
-  $("topPairs").innerHTML = `<table><thead><tr><th>pair</th><th>P&amp;L</th><th>trades</th><th>wr</th></tr></thead><tbody>` +
-    ((s.top_pairs||[]).map(x =>
-      `<tr><td>${esc(x.pair)}</td><td class="${cls(x.pnl)}">${fmtUsd(x.pnl)}</td><td>${x.trades}</td><td>${x.win_rate}%</td></tr>`).join("")
-     || `<tr><td colspan="4" class="muted">no data</td></tr>`) + `</tbody></table>`;
-  $("topStrats").innerHTML = `<table><thead><tr><th>track</th><th>wr</th><th>trades</th><th>P&amp;L</th></tr></thead><tbody>` +
-    ((s.top_strategies||[]).map(x =>
-      `<tr><td>${esc(x.name)}</td><td>${x.win_rate}%</td><td>${x.trades}</td><td class="${cls(x.pnl)}">${fmtUsd(x.pnl)}</td></tr>`).join("")
-     || `<tr><td colspan="4" class="muted">no data</td></tr>`) + `</tbody></table>`;
-  $("insights").innerHTML = (s.insights||[]).map(x =>
-    `<div class="card" style="margin-bottom:6px"><div class="dim">${esc(x.ts)} · ${esc(x.trade_range)}</div>
-     <div>${esc(x.body)}</div></div>`).join("") || `<span class="muted">no postmortems yet</span>`;
-
-  renderLog();
+}
+function scalpFeedHtml(scalp){
+  scalp = scalp || {};
+  const live = scalp.live_trades || [];
+  const closed = scalp.closed_trades || [];
+  const liveRows = live.map(x =>
+    `<tr><td class="dim">${esc(x.exchange)}</td><td>${esc(x.symbol)}</td><td>${esc(x.direction)}</td>
+     <td>${x.entry_price}</td><td class="${cls(x.unrealised_bps)}">${fmtBps(x.unrealised_bps)}</td>
+     <td class="dim">${x.hold_sec}s</td></tr>`).join("")
+    || `<tr><td colspan="6" class="muted">no live scalp trades</td></tr>`;
+  const closedRows = closed.map(x => {
+    const w = x.outcome === "WIN";
+    const holdCls = (x.hold_sec >= SCALP_MAX_HOLD_SEC) ? "neg" : "dim";
+    return `<tr class="${w?"win":"loss"}"><td class="dim">${esc(x.closed_at)}</td><td>${esc(x.symbol)}</td>
+      <td>${esc(x.direction)}</td><td><span class="tag ${w?"win":"loss"}">${esc(x.outcome)}</span></td>
+      <td class="${cls(x.net_bps)}">${fmtBps(x.net_bps)}</td>
+      <td class="dim">${esc(x.exit_reason)}</td><td class="${holdCls}">${x.hold_sec}s</td></tr>`;
+  }).join("") || `<tr><td colspan="7" class="muted">no closed scalp trades yet</td></tr>`;
+  return `<div class="card" style="margin-bottom:10px"><h2>Live (${live.length})</h2>
+      <div class="scroll"><table><thead><tr><th>ex</th><th>sym</th><th>dir</th><th>entry</th><th>unreal</th><th>hold</th></tr></thead>
+      <tbody>${liveRows}</tbody></table></div></div>
+    <div class="card"><h2>History (last ${closed.length})</h2>
+      <div class="scroll" style="max-height:320px"><table><thead><tr><th>t</th><th>sym</th><th>dir</th><th>out</th><th>net</th><th>reason</th><th>hold</th></tr></thead>
+      <tbody>${closedRows}</tbody></table></div></div>`;
+}
+function renderPending(pend){
+  if(pend){
+    $("pending").innerHTML =
+      `<div><b>${esc(pend.pair)}</b> ${esc(pend.direction)} <span class="dim">${esc(pend.track)} · score ${pend.score}</span></div>` +
+      `<div class="dim">entry ${pend.entry??"—"} · sl ${pend.sl??"—"} · tp ${pend.tp??"—"} · rr ${pend.rr??"—"}</div>` +
+      `<div class="dim" style="margin:4px 0">${esc((pend.claude_summary||"").slice(0,160))}</div>` +
+      `<button id="approveBtn" class="on">Approve</button> <button id="skipBtn">Skip</button>`;
+    $("approveBtn").onclick = () => postAction("/action/approve");
+    $("skipBtn").onclick = () => postAction("/action/skip", {reason:"web_skip"});
+  }else{
+    $("pending").innerHTML = `<span class="muted">no signal pending</span>`;
+  }
 }
 
-/* log tab */
+/* ---------- agent page ---------- */
+function agentHeader(id){
+  const a = (STATE.agents||[]).find(x => x.id===id)
+    || {id, status:"OFFLINE", capital:0, daily_pnl:0, win_rate:0};
+  $("ag-name").textContent = AGENT_NAME[id] || id;
+  $("ag-status").textContent = a.status;
+  $("ag-status").className = "st " + a.status;
+  $("ag-cap").textContent = fmtUsd(a.capital);
+  $("ag-pnl").innerHTML = `<span class="${cls(a.daily_pnl)}">${fmtUsd(a.daily_pnl)}</span>`;
+  $("ag-wr").textContent = (a.win_rate==null?"—":a.win_rate.toFixed(1)+"%");
+}
+function renderAgentLive(id){
+  agentHeader(id);
+  let html = "";
+  if(id === "signal"){
+    html = `<div class="card"><h2>Signal Feed</h2><div class="scroll">${signalFeedHtml(STATE.signals)}</div></div>`;
+  }else if(id === "arb"){
+    html = `<div class="card"><h2>Live Arb Feed</h2><div class="scroll">${arbFeedHtml(STATE.arb_feed)}</div></div>`;
+  }else if(id === "scalp"){
+    html = scalpFeedHtml(STATE.scalp);
+  }else if(PLACEHOLDER_AGENTS.includes(id)){
+    html = `<div class="card"><div class="muted">Not yet built. This agent is registered as a
+      placeholder. See SCALPING_V3_ROADMAP.md and the project summary for status.</div></div>`;
+  }
+  $("ag-live").innerHTML = html;
+}
+function agentTradeLogHtml(id, trades){
+  trades = trades || [];
+  if(id === "arb"){
+    if(!trades.length) return `<span class="muted">no arb trades</span>`;
+    return arbTableHtml(trades);
+  }
+  if(id === "scalp"){
+    if(!trades.length) return `<span class="muted">no closed scalp trades</span>`;
+    return `<table><thead><tr><th>t</th><th>sym</th><th>dir</th><th>entry</th><th>exit</th>
+      <th>gross</th><th>net</th><th>fees</th><th>hold</th><th>reason</th><th>out</th></tr></thead><tbody>` +
+      trades.map(x => {
+        const w = x.outcome==="WIN";
+        return `<tr class="${w?"win":"loss"}"><td class="dim">${esc(x.closed_at||x.ts)}</td><td>${esc(x.symbol)}</td>
+          <td>${esc(x.direction)}</td><td>${x.entry_price}</td><td>${x.exit_price}</td>
+          <td>${fmtBps(x.gross_bps)}</td><td class="${cls(x.net_bps)}">${fmtBps(x.net_bps)}</td>
+          <td class="dim">${fmtBps(x.fees_bps)}</td><td class="dim">${x.hold_sec}s</td>
+          <td class="dim">${esc(x.exit_reason)}</td>
+          <td><span class="tag ${w?"win":"loss"}">${esc(x.outcome)}</span></td></tr>`;
+      }).join("") + `</tbody></table>`;
+  }
+  // signal (and any default)
+  if(!trades.length) return `<span class="muted">no closed trades</span>`;
+  return `<table><thead><tr><th>t</th><th>pair</th><th>track</th><th>dir</th><th>entry</th><th>exit</th>
+    <th>P&amp;L</th><th>out</th></tr></thead><tbody>` +
+    trades.map(x => {
+      const w = x.outcome==="WIN";
+      return `<tr class="${w?"win":"loss"}"><td class="dim">${esc(x.ts)}</td><td>${esc(x.pair)}</td>
+        <td class="dim">${esc(x.track)}</td><td>${esc(x.direction)}</td><td>${x.entry_price}</td>
+        <td>${x.exit_price==null?"—":x.exit_price}</td>
+        <td class="${cls(x.pnl_usd)}">${fmtUsd(x.pnl_usd)} ${fmtPct(x.pnl_pct)}</td>
+        <td><span class="tag ${w?"win":"loss"}">${esc(x.outcome)}</span></td></tr>`;
+    }).join("") + `</tbody></table>`;
+}
+function insightsHtml(insights){
+  insights = insights || [];
+  if(!insights.length) return `<span class="muted">no postmortems for this agent</span>`;
+  return insights.map(x =>
+    `<div class="card" style="margin-bottom:6px"><div class="dim">${esc(x.ts)} · ${esc(x.trade_range)}</div>
+     <div>${esc(x.body)}</div>
+     ${(x.tags&&x.tags.length)?`<div>${x.tags.map(t=>`<span class="chip">${esc(t)}</span>`).join("")}</div>`:""}</div>`).join("");
+}
+async function fetchAgentDetail(id){
+  try{
+    const r = await fetch("/api/agent/" + id);
+    if(!r.ok) return {trades:[], insights:[]};
+    return await r.json();
+  }catch(e){ return {trades:[], insights:[]}; }
+}
+async function openAgentPage(id){
+  renderAgentLive(id);
+  $("ag-trades").innerHTML = `<span class="muted">loading…</span>`;
+  $("ag-insights").innerHTML = `<span class="muted">loading…</span>`;
+  const load = async () => {
+    if(CURRENT.view !== "agent" || CURRENT.agent !== id) return;
+    const d = await fetchAgentDetail(id);
+    if(CURRENT.view !== "agent" || CURRENT.agent !== id) return;
+    $("ag-trades").innerHTML = agentTradeLogHtml(id, d.trades);
+    $("ag-insights").innerHTML = insightsHtml(d.insights);
+  };
+  await load();
+  // refresh detail every 5s while this page is the active view
+  detailTimer = setInterval(load, 5000);
+}
+
+/* ---------- session page ---------- */
+function refreshSessionClock(){
+  if(CURRENT.view !== "session") return;
+  const tz = SESSION_TZ[CURRENT.session] || ["UTC","UTC"];
+  $("se-clock").textContent = tz[1] + " " + localTime(tz[0]);
+}
+async function openSessionPage(session){
+  const tz = SESSION_TZ[session] || ["UTC","UTC"];
+  $("se-name").textContent = session.replace("_"," ");
+  refreshSessionClock();
+  $("se-pnl").textContent = "—";
+  $("se-count").textContent = "—";
+  $("se-trades").innerHTML = `<span class="muted">loading…</span>`;
+  const load = async () => {
+    if(CURRENT.view !== "session" || CURRENT.session !== session) return;
+    let d = {trades:[], total_pnl:0, trade_count:0};
+    try{
+      const r = await fetch("/api/session/" + session.toLowerCase());
+      if(r.ok) d = await r.json();
+    }catch(e){}
+    if(CURRENT.view !== "session" || CURRENT.session !== session) return;
+    $("se-pnl").innerHTML = `<span class="${cls(d.total_pnl)}">${fmtUsd(d.total_pnl)}</span>`;
+    $("se-count").textContent = (d.trade_count||0) + " trades";
+    const rows = d.trades || [];
+    $("se-trades").innerHTML = rows.length
+      ? `<table><thead><tr><th>t</th><th>agent</th><th>pair</th><th>dir</th><th>entry</th><th>exit</th>
+          <th>size</th><th>P&amp;L</th><th>W/L</th></tr></thead><tbody>` +
+        rows.map(x => {
+          const w = x.outcome==="WIN";
+          return `<tr class="${w?"win":"loss"}"><td class="dim">${esc(x.ts)}</td><td class="dim">${esc(x.agent)}</td>
+            <td>${esc(x.pair)}</td><td>${esc(x.direction)}</td><td>${x.entry_price}</td><td>${x.exit_price}</td>
+            <td>${fmtUsd(x.size_usd)}</td><td class="${cls(x.pnl_usd)}">${fmtUsd(x.pnl_usd)}</td>
+            <td><span class="tag ${w?"win":"loss"}">${esc(x.outcome)}</span></td></tr>`;
+        }).join("") + `</tbody></table>`
+      : `<span class="muted">No closed trades in this session today</span>`;
+  };
+  await load();
+  detailTimer = setInterval(load, 5000);
+}
+
+/* ---------- session local clocks (every 30s) ---------- */
+function updateSessionClocks(){
+  document.querySelectorAll("#sessions .clock").forEach(el => {
+    const tz = el.dataset.tz;
+    const label = el.textContent.split(" ")[0];
+    el.textContent = label + " " + localTime(tz);
+  });
+  refreshSessionClock();
+}
+setInterval(updateSessionClocks, 30000);
+
+/* ---------- log tab ---------- */
 document.querySelectorAll("#logFilters button").forEach(b => b.onclick = () => {
   document.querySelectorAll("#logFilters button").forEach(x => x.classList.remove("on"));
   b.classList.add("on"); logFilter = b.dataset.f; renderLog();
@@ -453,6 +728,7 @@ function connect(){
   };
   ws.onerror = () => { try{ ws.close(); }catch(e){} };
 }
+route();      // paint the initial view from the hash
 connect();
 </script>
 </body>

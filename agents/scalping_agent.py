@@ -780,6 +780,27 @@ class ScalpingAgent(BaseAgent):
             except Exception as e:
                 log.error("[ScalpingAgent] force exit %s: %s", pos_key, e)
 
+    def _win_rate_today(self) -> float:
+        """Win rate (0.0–1.0) for scalp trades closed today, computed directly
+        from scalp_observations (would_entry=1, exit_price>0; pnl_bps>0 = win).
+        Source of the agent-card + agent-page win rate — fixes the 0.0%-despite-
+        closed-trades bug. Never raises (get_stats must not)."""
+        try:
+            rows = db_queries.get_scalp_closed_today()
+        except Exception:
+            return 0.0
+        if not rows:
+            return 0.0
+        wins = sum(1 for r in rows if (r.get("pnl_bps") or 0) > 0)
+        return wins / len(rows)
+
+    def _win_rate_alltime(self) -> float:
+        """All-time scalp win rate over closed observations. Never raises."""
+        try:
+            return float(db_queries.get_scalp_activation_stats().get("win_rate", 0.0))
+        except Exception:
+            return 0.0
+
     async def get_stats(self) -> AgentStats:
         capital_deployed = sum(p.size_usd for p in self._positions.values())
         # Equity tracks net daily P&L against the fund (SCALP_CAPITAL): the
@@ -795,8 +816,8 @@ class ScalpingAgent(BaseAgent):
             daily_pnl_pct=daily_pnl_pct,
             total_pnl=float(self._stats["total_pnl"]),
             trades_today=int(self._stats["entries_today"]),
-            win_rate_today=0.0,
-            win_rate_alltime=0.0,
+            win_rate_today=self._win_rate_today(),
+            win_rate_alltime=self._win_rate_alltime(),
             consecutive_losses=int(self._consec_losses),
             last_trade_time=None,
             error=None,

@@ -10,8 +10,11 @@ special fixtures.
 from __future__ import annotations
 
 import asyncio
+import importlib
 import json
 import logging
+import time
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -24,7 +27,7 @@ from ui.web_server import WebServer, WebLogHandler
 _TOP_LEVEL_KEYS = (
     "ts", "session", "uptime_s", "mode", "paused", "approval_mode",
     "portfolio", "agents", "circuit_breakers", "regime", "sentiment",
-    "exchanges", "signals", "pending_signal", "positions", "arb_feed",
+    "exchanges", "signals", "pending_signal", "positions", "scalp", "arb_feed",
     "session_pnl", "log", "top_pairs", "top_strategies", "insights",
     "arb_history",
 )
@@ -69,7 +72,10 @@ async def test_snapshot_safe_when_coordinator_raises():
     await ws._refresh_coordinator()       # swallows the raise
     snap = ws._build_snapshot()           # still complete
     assert "portfolio" in snap
-    assert snap["portfolio"]["equity"] == 0.0
+    # Change 1 replaced "equity" with the persistent "bankroll" field; the
+    # snapshot must still be complete when the coordinator getter raised.
+    assert "bankroll" in snap["portfolio"]
+    assert "equity" not in snap["portfolio"]
 
 
 # ── WebSocket ───────────────────────────────────────────────────────────────
@@ -234,3 +240,390 @@ def test_web_log_handler_appends_to_buffer():
     titles = [e["title"] for e in snap["log"]]
     assert any(t.startswith("Signal executed") for t in titles)
     assert snap["log"][0]["type"] == "exec"
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Web UI refresh v1 — bankroll, daily fees, live exposure, scalp WR + feed,
+# agent pages, session pages.
+#
+# These seed a fresh SQLite per test and reload db + queries + ui.web_server
+# against it (same pattern as tests/test_queries.py) so the snapshot and the
+# REST endpoints read the seeded data. The 12 tests above keep running against
+# the real project DB unchanged — they're defined first and don't reload.
+# ════════════════════════════════════════════════════════════════════════════
+
+
+@pytest.fixture
+def web_temp(monkeypatch, tmp_path):
+    """(ui.web_server, database.db, database.queries) bound to a fresh temp DB."""
+    db_file = tmp_path / "test_web.db"
+    monkeypatch.setattr("config.settings.DB_PATH", db_file)
+
+    import database.db as ddb
+    import database.queries as dq
+    import ui.web_server as wsm
+    importlib.reload(ddb)
+    importlib.reload(dq)
+    importlib.reload(wsm)
+    ddb.init_db()
+    yield wsm, ddb, dq
+    # Repoint the reloaded modules back at the real DB for anything that follows.
+    monkeypatch.undo()
+    importlib.reload(ddb)
+    importlib.reload(dq)
+    importlib.reload(wsm)
+
+
+def _starting_capital_total():
+    return (settings.FUND_SIGNAL_CAPITAL + settings.FUND_ARB_CAPITAL
+            + settings.FUND_MEXC_SCALP_CAPITAL)
+
+
+def _seed_trade(db, *, strategy="default", signal_type="momentum", pnl_usd=1.0,
+                pnl_pct=1.0, fees_usd=0.0, size_usd=50.0, pair="BTC/USDT",
+                side="long", entry=100.0, exit=101.0, close_dt=None, open_only=False):
+    """Insert a Trade row directly. open_only=True leaves it open (no close)."""
+    import database.models as m
+    now = datetime.utcnow()
+    with db.get_session() as s:
+        t = m.Trade(
+            pair=pair, exchange="binance", side=side, signal_type=signal_type,
+            entry_price=entry, size_usd=size_usd, sim_mode=True, strategy=strategy,
+            timestamp_open=now,
+        )
+        if not open_only:
+            t.exit_price = exit
+            t.pnl_usd = pnl_usd
+            t.pnl_pct = pnl_pct
+            t.fees_usd = fees_usd
+            t.timestamp_close = close_dt or now
+        s.add(t)
+        s.flush()
+        return t.id
+
+
+def _seed_arb(db, *, gross=2.0, net=1.5, size_usd=25.0, ts=None, symbol="BTC/USDT"):
+    import database.models as m
+    with db.get_session() as s:
+        r = m.ArbTrade(
+            symbol=symbol, buy_exchange="bitget", sell_exchange="kraken",
+            buy_price=100.0, sell_price=101.0, size_usd=size_usd,
+            gross_pnl_usd=gross, net_pnl_usd=net, execution_ms=12.0,
+            status="executed", sim_mode=True, success=True,
+            timestamp=ts or datetime.utcnow(),
+        )
+        s.add(r)
+        s.flush()
+        return r.id
+
+
+def _seed_scalp(db, *, pnl_bps=5.0, rt_bps=0.0, pnl_usd=0.5, exit_price=101.0,
+                direction="LONG", created=None, ts=None, symbol="BTC/USDT",
+                exchange="mexc", would_entry=True, exit_reason="TP", hold_sec=30.0):
+    import database.models as m
+    created = created or datetime.utcnow()
+    ts = ts if ts is not None else time.time()
+    with db.get_session() as s:
+        o = m.ScalpObservationModel(
+            symbol=symbol, exchange=exchange, timestamp=ts, direction=direction,
+            would_entry=would_entry, entry_price=100.0, exit_price=exit_price,
+            exit_time=ts + hold_sec, exit_reason=exit_reason, hold_sec=hold_sec,
+            pnl_bps=pnl_bps, pnl_usd=pnl_usd, round_trip_cost_bps=rt_bps,
+            created_at=created,
+        )
+        s.add(o)
+        s.flush()
+        return o.id
+
+
+# ── Change 1 — bankroll ─────────────────────────────────────────────────────
+
+def test_snapshot_bankroll_equals_starting_plus_realised_pnl(web_temp):
+    wsm, db, q = web_temp
+    _seed_trade(db, pnl_usd=10.0)                                   # signal
+    _seed_trade(db, strategy="scalp", signal_type="scalp", pnl_usd=2.0)  # exec scalp
+    _seed_arb(db, gross=5.0, net=3.0)                              # arb net 3.0
+    ws = wsm.WebServer(coordinator=None, bot=None)
+    port = ws._build_snapshot()["portfolio"]
+    assert port["bankroll"] == pytest.approx(_starting_capital_total() + 15.0)
+    assert port["bankroll_alltime_pnl"] == pytest.approx(15.0)
+
+
+def test_snapshot_bankroll_does_not_reset_at_utc_midnight(web_temp):
+    wsm, db, q = web_temp
+    yesterday = datetime.utcnow() - timedelta(days=1)
+    _seed_trade(db, pnl_usd=4.0, close_dt=yesterday)
+    _seed_trade(db, pnl_usd=6.0)                                   # today
+    ws = wsm.WebServer(coordinator=None, bot=None)
+    snap = ws._build_snapshot()
+    # Bankroll spans all dates → crossing midnight keeps yesterday's profit.
+    assert snap["portfolio"]["bankroll"] == pytest.approx(_starting_capital_total() + 10.0)
+    # daily_pnl comes from the coordinator (none here) and is independent.
+    assert snap["portfolio"]["daily_pnl"] == 0.0
+
+
+def test_snapshot_omits_removed_equity_and_total_pnl_fields(web_temp):
+    wsm, db, q = web_temp
+    ws = wsm.WebServer(coordinator=None, bot=None)
+    port = ws._build_snapshot()["portfolio"]
+    for gone in ("equity", "total_pnl", "total_pnl_pct"):
+        assert gone not in port
+    for present in ("bankroll", "bankroll_alltime_pnl", "daily_fees", "exposure_usd"):
+        assert present in port
+
+
+# ── Change 2 — daily fees ───────────────────────────────────────────────────
+
+def test_daily_fees_aggregates_across_agents(web_temp):
+    wsm, db, q = web_temp
+    _seed_trade(db, fees_usd=0.50)                       # signal fee
+    _seed_arb(db, gross=2.0, net=1.4)                    # arb fee 0.60
+    _seed_scalp(db, rt_bps=10.0)                         # 10bps × $50 = $0.05
+    expected = 0.50 + 0.60 + (10.0 / 10000.0 * settings.SCALP_POSITION_SIZE_USD)
+    assert q.get_daily_fees() == pytest.approx(expected)
+
+
+# ── Change 3 — live exposure ────────────────────────────────────────────────
+
+def test_exposure_includes_scalp_positions(web_temp):
+    wsm, db, q = web_temp
+    # Executed scalp writes an open Trade row with strategy="scalp".
+    _seed_trade(db, strategy="scalp", signal_type="scalp", pair="OP/USDT",
+                size_usd=40.0, open_only=True)
+    ws = wsm.WebServer(coordinator=None, bot=None)
+    port = ws._build_snapshot()["portfolio"]
+    assert port["exposure_usd"] == pytest.approx(40.0)
+    assert port["exposure_pct"] > 0
+
+
+def test_exposure_recalculated_each_snapshot(web_temp):
+    wsm, db, q = web_temp
+    ws = wsm.WebServer(coordinator=None, bot=None)
+    assert ws._build_snapshot()["portfolio"]["exposure_usd"] == 0.0
+    _seed_trade(db, size_usd=70.0, open_only=True)
+    # No cache to reset — the next snapshot reflects the new open position.
+    assert ws._build_snapshot()["portfolio"]["exposure_usd"] == pytest.approx(70.0)
+
+
+# ── Change 4 — scalp win rate ───────────────────────────────────────────────
+
+def test_scalp_win_rate_zero_when_no_trades(monkeypatch):
+    import agents.scalping_agent as sa
+    monkeypatch.setattr(sa.db_queries, "get_scalp_closed_today", lambda: [])
+    assert sa.ScalpingAgent()._win_rate_today() == 0.0
+
+
+def test_scalp_win_rate_computed_from_pnl_bps_positive(monkeypatch):
+    import agents.scalping_agent as sa
+    rows = [{"pnl_bps": b} for b in (5, 3, -2, 4, -1, 2)]   # 4 wins of 6
+    monkeypatch.setattr(sa.db_queries, "get_scalp_closed_today", lambda: rows)
+    assert sa.ScalpingAgent()._win_rate_today() == pytest.approx(4 / 6)
+
+
+def test_scalp_win_rate_resets_at_utc_midnight(web_temp):
+    wsm, db, q = web_temp
+    today = datetime.utcnow()
+    yest = today - timedelta(days=1)
+    _seed_scalp(db, pnl_bps=5.0, created=yest)             # yesterday win
+    _seed_scalp(db, pnl_bps=4.0, created=today)            # today win
+    _seed_scalp(db, pnl_bps=-2.0, created=today)           # today loss
+    rows = q.get_scalp_closed_today()
+    assert len(rows) == 2                                  # yesterday excluded
+    wins = sum(1 for r in rows if r["pnl_bps"] > 0)
+    assert wins / len(rows) == pytest.approx(0.5)
+
+
+# ── Change 5 — scalp feed persistence ───────────────────────────────────────
+
+def test_scalp_closed_trades_persisted_in_snapshot(web_temp):
+    wsm, db, q = web_temp
+    _seed_scalp(db, pnl_bps=6.0, exit_reason="TP", symbol="OP/USDT")
+    ws = wsm.WebServer(coordinator=None, bot=None)
+    closed = ws._build_snapshot()["scalp"]["closed_trades"]
+    assert len(closed) == 1
+    assert closed[0]["symbol"] == "OP/USDT"
+    assert closed[0]["outcome"] == "WIN"
+
+
+def test_scalp_closed_trades_buffer_capped_at_setting(web_temp, monkeypatch):
+    wsm, db, q = web_temp
+    monkeypatch.setattr(wsm.settings, "WEB_UI_SCALP_FEED_HISTORY", 5)
+    base = time.time()
+    for i in range(10):
+        _seed_scalp(db, pnl_bps=float(i + 1), ts=base + i, symbol=f"P{i}/USDT")
+    ws = wsm.WebServer(coordinator=None, bot=None)
+    closed = ws._build_snapshot()["scalp"]["closed_trades"]
+    assert len(closed) == 5
+    assert closed[0]["symbol"] == "P9/USDT"                # newest first
+
+
+def test_scalp_live_trades_separate_from_closed(web_temp):
+    wsm, db, q = web_temp
+    _seed_scalp(db, pnl_bps=3.0, symbol="BTC/USDT")        # one closed
+    pos = SimpleNamespace(symbol="ENA/USDT", exchange="mexc", direction="LONG",
+                          entry_price=0.5, tp_price=0.51, sl_price=0.49,
+                          entry_time=time.time(), size_usd=50.0)
+    scalp_agent = SimpleNamespace(_positions={"k": pos})
+    coord = SimpleNamespace(
+        get_agent=lambda aid: scalp_agent if aid == "scalp" else None,
+        get_primary_bot=lambda: None,
+    )
+    ws = wsm.WebServer(coordinator=coord, bot=None)
+    scalp = ws._build_snapshot()["scalp"]
+    assert len(scalp["live_trades"]) == 1
+    assert scalp["live_trades"][0]["symbol"] == "ENA/USDT"
+    assert len(scalp["closed_trades"]) == 1
+    assert scalp["closed_trades"][0]["symbol"] == "BTC/USDT"
+
+
+# ── Change 7 — agent pages ──────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_api_agent_signal_returns_trades_and_insights(web_temp):
+    wsm, db, q = web_temp
+    import database.models as m
+    tid = _seed_trade(db, pnl_usd=3.0)
+    with db.get_session() as s:
+        s.get(m.Trade, tid).claude_postmortem = "good entry"
+    client = await _client(wsm.WebServer(coordinator=None, bot=None))
+    try:
+        r = await client.get("/api/agent/signal")
+        assert r.status == 200
+        d = await r.json()
+        assert len(d["trades"]) == 1
+        assert len(d["insights"]) == 1
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_api_agent_arb_returns_trades_and_insights(web_temp):
+    wsm, db, q = web_temp
+    _seed_arb(db)
+    client = await _client(wsm.WebServer(coordinator=None, bot=None))
+    try:
+        d = await (await client.get("/api/agent/arb")).json()
+        assert len(d["trades"]) == 1
+        assert d["insights"] == []                         # arb has no postmortems
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_api_agent_scalp_returns_trades_and_insights(web_temp):
+    wsm, db, q = web_temp
+    _seed_scalp(db, pnl_bps=7.0)
+    client = await _client(wsm.WebServer(coordinator=None, bot=None))
+    try:
+        d = await (await client.get("/api/agent/scalp")).json()
+        assert len(d["trades"]) == 1
+        assert d["trades"][0]["outcome"] == "WIN"
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_api_agent_macro_returns_empty_lists(web_temp):
+    wsm, db, q = web_temp
+    client = await _client(wsm.WebServer(coordinator=None, bot=None))
+    try:
+        for aid in ("macro", "sentiment_agent", "onchain"):
+            r = await client.get("/api/agent/" + aid)
+            assert r.status == 200
+            assert await r.json() == {"trades": [], "insights": []}
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_api_agent_unknown_returns_404(web_temp):
+    wsm, db, q = web_temp
+    client = await _client(wsm.WebServer(coordinator=None, bot=None))
+    try:
+        assert (await client.get("/api/agent/nope")).status == 404
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_api_agent_insights_filtered_by_agent_id(web_temp):
+    wsm, db, q = web_temp
+    import database.models as m
+    sig = _seed_trade(db, strategy="default", pnl_usd=1.0)
+    scl = _seed_trade(db, strategy="scalp", signal_type="scalp", pnl_usd=1.0)
+    with db.get_session() as s:
+        s.get(m.Trade, sig).claude_postmortem = "signal review"
+        s.get(m.Trade, scl).claude_postmortem = "scalp review"
+    client = await _client(wsm.WebServer(coordinator=None, bot=None))
+    try:
+        ds = await (await client.get("/api/agent/signal")).json()
+        dc = await (await client.get("/api/agent/scalp")).json()
+        assert [i["body"] for i in ds["insights"]] == ["signal review"]
+        assert [i["body"] for i in dc["insights"]] == ["scalp review"]
+    finally:
+        await client.close()
+
+
+# ── Change 8 — session pages ────────────────────────────────────────────────
+
+def _today_at(hour):
+    return datetime.utcnow().replace(hour=hour, minute=0, second=0, microsecond=0)
+
+
+@pytest.mark.asyncio
+async def test_api_session_returns_today_closed_trades_only(web_temp):
+    wsm, db, q = web_temp
+    _seed_trade(db, pnl_usd=2.0, close_dt=_today_at(8), pair="BTC/USDT")  # LONDON
+    client = await _client(wsm.WebServer(coordinator=None, bot=None))
+    try:
+        d = await (await client.get("/api/session/london")).json()
+        assert d["session"] == "LONDON"
+        assert d["trade_count"] == 1
+        assert d["trades"][0]["pair"] == "BTC/USDT"
+        assert d["total_pnl"] == pytest.approx(2.0)
+        assert "tz" in d and "local_time" in d
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_api_session_excludes_yesterdays_trades(web_temp):
+    wsm, db, q = web_temp
+    yest = (datetime.utcnow() - timedelta(days=1)).replace(
+        hour=8, minute=0, second=0, microsecond=0)
+    _seed_trade(db, pnl_usd=1.0, close_dt=yest)            # yesterday LONDON
+    _seed_trade(db, pnl_usd=2.0, close_dt=_today_at(8))    # today LONDON
+    client = await _client(wsm.WebServer(coordinator=None, bot=None))
+    try:
+        d = await (await client.get("/api/session/london")).json()
+        assert d["trade_count"] == 1
+        assert d["total_pnl"] == pytest.approx(2.0)
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_api_session_includes_all_agents(web_temp):
+    wsm, db, q = web_temp
+    london = _today_at(8)
+    _seed_trade(db, pnl_usd=1.0, close_dt=london)          # signal
+    _seed_arb(db, gross=1.0, net=0.8, ts=london)           # arb
+    _seed_scalp(db, pnl_bps=5.0, pnl_usd=0.5, created=london)  # scalp
+    client = await _client(wsm.WebServer(coordinator=None, bot=None))
+    try:
+        d = await (await client.get("/api/session/london")).json()
+        agents = {t["agent"] for t in d["trades"]}
+        assert {"signal", "arb", "scalp"}.issubset(agents)
+        assert d["trade_count"] == 3
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_api_session_unknown_returns_404(web_temp):
+    wsm, db, q = web_temp
+    client = await _client(wsm.WebServer(coordinator=None, bot=None))
+    try:
+        assert (await client.get("/api/session/atlantis")).status == 404
+    finally:
+        await client.close()

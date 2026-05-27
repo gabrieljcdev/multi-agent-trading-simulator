@@ -698,7 +698,7 @@ SCALP_STALE_MID_THRESHOLD_SEC = 60 # test: 30-180    (skip entry if a symbol's m
 SCALP_MAX_HOLD_SEC        = 180    # test: 60-300    (force exit after N seconds)
 SCALP_SCAN_INTERVAL_MS    = 100    # test: 50-500    (main loop interval ms)
 SCALP_MAX_CONCURRENT      = 2      # test: 1-3       (max open scalp positions)
-SCALP_POSITION_SIZE_USD   = 25.0   # test: 10-50     (per-trade size USD)
+SCALP_POSITION_SIZE_USD   = 50.0   # test: 10-50     (per-trade size USD)
 
 # Circuit breakers
 SCALP_DAILY_LOSS_HALT     = 25.0   # test: 2-10      (daily loss halt USD)
@@ -708,8 +708,8 @@ SCALP_CONSEC_LOSS_PAUSE   = 4      # test: 3-6       (consecutive loss pause cou
 # both of which thin out outside London/NY overlap. The main bot's
 # dead zone (02:00-06:00 UTC) is contained inside this window — these
 # are additive gates, not redundant.
-SCALP_SESSION_START_UTC   = 12     # test: 6-13      (v2: London/NY overlap start, raised 7→12)
-SCALP_SESSION_END_UTC     = 16     # test: 14-20     (v2: overlap end, lowered 17→16)
+SCALP_SESSION_START_UTC   = 0     # test: 6-13      (v2: London/NY overlap start, raised 7→12)
+SCALP_SESSION_END_UTC     = 24     # test: 14-20     (v2: overlap end, lowered 17→16)
 
 # News guard — when the sentiment aggregator's news_guard_active fires,
 # scalp setups stop being reliable (correlated cross-pair flows + spread
@@ -1035,6 +1035,10 @@ WEB_UI_HOST            = "localhost"   # test: "0.0.0.0" for LAN access
 WEB_UI_PORT            = 8765          # test: any open port
 WEB_UI_ENABLED         = False         # default off; enabled by --web-ui flag
 WEB_UI_PUSH_INTERVAL_S = 0.5           # test: 0.25-2.0  (WebSocket push rate, seconds)
+# Scalp feed history retention on the scalp agent page (Change 5). Closed
+# scalp trades persist in the snapshot's scalp.closed_trades up to this many
+# rows, newest first; the DB is the backing store so they survive restarts.
+WEB_UI_SCALP_FEED_HISTORY = 30         # test: 10, 20, 30, 50
 
 # ── Dashboard arb-opportunity panel colour ladder ───────────────────────────
 # Execution rate = executed / above_threshold. Green when we're catching

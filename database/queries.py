@@ -1379,6 +1379,288 @@ def get_arb_trades_all() -> list[dict]:
         return [_arb_trade_to_dict(r) for r in rows]
 
 
+# ── Web control panel v2 — bankroll, agent pages, session pages ─────────────
+# Faithful to prompts/build_web_ui_refresh_v1.md. Funds stay partitioned to
+# avoid double-counting: signal + arb are the real-money ledgers (Trade
+# non-scalp / ArbTrade); scalp's authoritative record is scalp_observations.
+# Executed scalp also writes Trade rows with strategy="scalp", so every query
+# below reads each fund from exactly one place.
+
+def get_alltime_realised_pnl() -> float:
+    """Sum of net P&L from all closed trades across all funds, all-time.
+    Signal + executed-scalp fills live in the Trade ledger (pnl_usd); arb in
+    ArbTrade (net_pnl_usd). Never date-scoped — this drives the persistent
+    bankroll, so crossing UTC midnight leaves it unchanged."""
+    total = 0.0
+    with get_session() as s:
+        for (pnl,) in (
+            s.query(Trade.pnl_usd).filter(Trade.pnl_usd.isnot(None)).all()
+        ):
+            total += float(pnl or 0.0)
+        for (pnl,) in (
+            s.query(ArbTrade.net_pnl_usd)
+            .filter(ArbTrade.net_pnl_usd.isnot(None)).all()
+        ):
+            total += float(pnl or 0.0)
+    return round(total, 2)
+
+
+def get_daily_fees() -> float:
+    """Total fees paid today (UTC) across funds, in USD. Signal fees from
+    Trade.fees_usd (closed today, non-scalp); arb fees as gross-net on today's
+    ArbTrade rows; scalp round-trip costs as round_trip_cost_bps converted to
+    USD over SCALP_POSITION_SIZE_USD on today's closed observations. Scalp is
+    excluded from the Trade sum so executed scalp isn't counted twice."""
+    from config import settings
+    today = datetime.utcnow().date()
+    total = 0.0
+    with get_session() as s:
+        for (f,) in (
+            s.query(Trade.fees_usd)
+            .filter(func.date(Trade.timestamp_close) == today,
+                    Trade.fees_usd.isnot(None),
+                    (Trade.strategy != "scalp") | (Trade.strategy.is_(None)))
+            .all()
+        ):
+            total += float(f or 0.0)
+        for gross, net in (
+            s.query(ArbTrade.gross_pnl_usd, ArbTrade.net_pnl_usd)
+            .filter(func.date(ArbTrade.timestamp) == today,
+                    ArbTrade.net_pnl_usd.isnot(None))
+            .all()
+        ):
+            total += float(gross or 0.0) - float(net or 0.0)
+        size = float(getattr(settings, "SCALP_POSITION_SIZE_USD", 0.0) or 0.0)
+        for (rt,) in (
+            s.query(ScalpObservationModel.round_trip_cost_bps)
+            .filter(ScalpObservationModel.would_entry == True,   # noqa: E712
+                    ScalpObservationModel.exit_price > 0,
+                    func.date(ScalpObservationModel.created_at) == today)
+            .all()
+        ):
+            total += float(rt or 0.0) / 10000.0 * size
+    return round(total, 2)
+
+
+def _scalp_obs_to_dict(r) -> dict:
+    """One closed scalp observation as a plain dict. pnl_bps is GROSS; net is
+    gross minus round_trip_cost_bps. Keeps the raw pnl_bps for win-rate checks
+    and exposes HH:MM:SS close time (exit_time, falling back to entry)."""
+    gross = float(r.pnl_bps or 0.0)
+    fee   = float(r.round_trip_cost_bps or 0.0)
+    exit_ts = r.exit_time if (r.exit_time or 0) > 0 else r.timestamp
+    try:
+        closed_at = (datetime.utcfromtimestamp(exit_ts).strftime("%H:%M:%S")
+                     if exit_ts else "—")
+    except Exception:
+        closed_at = "—"
+    return {
+        "symbol":      r.symbol,
+        "exchange":    r.exchange,
+        "direction":   r.direction or "—",
+        "entry_price": float(r.entry_price or 0.0),
+        "exit_price":  float(r.exit_price or 0.0),
+        "exit_reason": r.exit_reason or "—",
+        "gross_bps":   round(gross, 2),
+        "net_bps":     round(gross - fee, 2),
+        "fees_bps":    round(fee, 2),
+        "hold_sec":    int(r.hold_sec or 0),
+        "pnl_bps":     gross,                       # raw, for win-rate checks
+        "pnl_usd":     float(r.pnl_usd or 0.0),
+        "outcome":     "WIN" if gross > 0 else "LOSS",
+        "closed_at":   closed_at,
+        "ts":          closed_at,
+    }
+
+
+def get_scalp_closed_today() -> list[dict]:
+    """Today's (UTC) closed scalp observations (would_entry=1, exit_price>0).
+    Drives the scalp win-rate fix. created_at dates the row (≈ entry time),
+    matching get_scalp_realized_pnl(today=True)'s daily-reset semantics."""
+    today = datetime.utcnow().date()
+    with get_session() as s:
+        rows = (
+            s.query(ScalpObservationModel)
+            .filter(ScalpObservationModel.would_entry == True,   # noqa: E712
+                    ScalpObservationModel.exit_price > 0,
+                    func.date(ScalpObservationModel.created_at) == today)
+            .order_by(desc(ScalpObservationModel.timestamp))
+            .all()
+        )
+    return [_scalp_obs_to_dict(r) for r in rows]
+
+
+def get_scalp_trade_history(limit: int = 100) -> list[dict]:
+    """Closed scalp observations newest first — for the scalp agent page trade
+    log and the scalp feed's persisted closed-trades list."""
+    with get_session() as s:
+        rows = (
+            s.query(ScalpObservationModel)
+            .filter(ScalpObservationModel.would_entry == True,   # noqa: E712
+                    ScalpObservationModel.exit_price > 0)
+            .order_by(desc(ScalpObservationModel.timestamp))
+            .limit(limit)
+            .all()
+        )
+    return [_scalp_obs_to_dict(r) for r in rows]
+
+
+def _trade_to_history_dict(t) -> dict:
+    closed = t.timestamp_close
+    opened = t.timestamp_open
+    side = (t.side or "").upper()
+    pnl = float(t.pnl_usd or 0.0)
+    return {
+        "id":          t.id,
+        "ts":          (closed or opened).strftime("%H:%M:%S") if (closed or opened) else "—",
+        "pair":        t.pair,
+        "track":       t.signal_type or "—",
+        "direction":   side or "—",
+        "entry_price": float(t.entry_price or 0.0),
+        "exit_price":  float(t.exit_price) if t.exit_price is not None else None,
+        "stop_loss":   t.stop_loss,
+        "take_profit": t.take_profit,
+        "size_usd":    float(t.size_usd or 0.0),
+        "pnl_usd":     round(pnl, 2),
+        "pnl_pct":     round(float(t.pnl_pct or 0.0), 2),
+        "fees_usd":    round(float(t.fees_usd or 0.0), 2),
+        "exit_reason": t.exit_reason or "—",
+        "outcome":     "WIN" if pnl > 0 else "LOSS",
+    }
+
+
+def get_signal_trade_history(limit: int = 100) -> list[dict]:
+    """Closed signal-fund trades newest first (Trade ledger, scalp excluded).
+    Schema matches existing trades-table fields; for the signal agent page."""
+    with get_session() as s:
+        rows = (
+            s.query(Trade)
+            .filter(Trade.timestamp_close.isnot(None),
+                    (Trade.strategy != "scalp") | (Trade.strategy.is_(None)))
+            .order_by(desc(Trade.timestamp_close))
+            .limit(limit)
+            .all()
+        )
+        return [_trade_to_history_dict(t) for t in rows]
+
+
+def get_postmortems_by_agent(agent_id: str, n: int = 3) -> list[dict]:
+    """Last n Claude postmortems for an agent. Postmortems are stored on
+    Trade.claude_postmortem (there is no separate postmortems table), so we
+    filter by the trade's fund: 'signal' = non-scalp trades, 'scalp' = scalp
+    trades. Arb and the placeholder agents have none → empty list."""
+    if agent_id == "signal":
+        strat_filter = ((Trade.strategy != "scalp") | (Trade.strategy.is_(None)))
+    elif agent_id == "scalp":
+        strat_filter = (Trade.strategy == "scalp")
+    else:
+        return []
+    out: list[dict] = []
+    with get_session() as s:
+        rows = (
+            s.query(Trade)
+            .filter(Trade.claude_postmortem.isnot(None), strat_filter)
+            .order_by(desc(Trade.timestamp_close))
+            .limit(n)
+            .all()
+        )
+        for t in rows:
+            ts = t.timestamp_close or t.timestamp_open
+            out.append({
+                "ts":          ts.strftime("%H:%M") if ts else "—",
+                "trade_range": f"trade {t.id}",
+                "body":        t.claude_postmortem or "",
+                "tags":        [],
+                "agent_id":    agent_id,
+            })
+    return out
+
+
+def get_closed_trades_by_session(session: str, date: str = "today") -> list[dict]:
+    """Closed trades for the given UTC trading session today, across every
+    fund. Unions signal trades (Trade, non-scalp, by close time), arb fills
+    (ArbTrade, by execution time) and closed scalp observations
+    (scalp_observations, by created_at). Newest first. `date` is accepted for
+    forward-compat; only 'today' is implemented."""
+    session = (session or "").upper()
+    if session not in _SESSIONS:
+        return []
+    from config import settings
+    today = datetime.utcnow().date()
+    scalp_size = float(getattr(settings, "SCALP_POSITION_SIZE_USD", 0.0) or 0.0)
+    rows: list[dict] = []
+    with get_session() as s:
+        for t in (
+            s.query(Trade)
+            .filter(func.date(Trade.timestamp_close) == today,
+                    Trade.pnl_usd.isnot(None),
+                    (Trade.strategy != "scalp") | (Trade.strategy.is_(None)))
+            .all()
+        ):
+            ts = t.timestamp_close or t.timestamp_open
+            if not ts or _session_for_hour(ts.hour) != session:
+                continue
+            pnl = float(t.pnl_usd or 0.0)
+            rows.append({
+                "ts":          ts.strftime("%H:%M:%S"), "_sort": ts,
+                "agent":       "signal",
+                "pair":        t.pair,
+                "direction":   (t.side or "—").upper(),
+                "entry_price": float(t.entry_price or 0.0),
+                "exit_price":  float(t.exit_price or 0.0) if t.exit_price is not None else 0.0,
+                "size_usd":    float(t.size_usd or 0.0),
+                "pnl_usd":     round(pnl, 2),
+                "outcome":     "WIN" if pnl > 0 else "LOSS",
+            })
+        for r in (
+            s.query(ArbTrade)
+            .filter(func.date(ArbTrade.timestamp) == today,
+                    ArbTrade.net_pnl_usd.isnot(None))
+            .all()
+        ):
+            ts = r.timestamp
+            if not ts or _session_for_hour(ts.hour) != session:
+                continue
+            pnl = float(r.net_pnl_usd or 0.0)
+            rows.append({
+                "ts":          ts.strftime("%H:%M:%S"), "_sort": ts,
+                "agent":       "arb",
+                "pair":        r.symbol,
+                "direction":   "ARB",
+                "entry_price": float(r.buy_price or 0.0),
+                "exit_price":  float(r.sell_price or 0.0),
+                "size_usd":    float(r.size_usd or 0.0),
+                "pnl_usd":     round(pnl, 2),
+                "outcome":     "WIN" if pnl > 0 else "LOSS",
+            })
+        for o in (
+            s.query(ScalpObservationModel)
+            .filter(ScalpObservationModel.would_entry == True,   # noqa: E712
+                    ScalpObservationModel.exit_price > 0,
+                    func.date(ScalpObservationModel.created_at) == today)
+            .all()
+        ):
+            ts = o.created_at
+            if not ts or _session_for_hour(ts.hour) != session:
+                continue
+            pnl = float(o.pnl_usd or 0.0)
+            rows.append({
+                "ts":          ts.strftime("%H:%M:%S"), "_sort": ts,
+                "agent":       "scalp",
+                "pair":        o.symbol,
+                "direction":   o.direction or "—",
+                "entry_price": float(o.entry_price or 0.0),
+                "exit_price":  float(o.exit_price or 0.0),
+                "size_usd":    scalp_size,
+                "pnl_usd":     round(pnl, 2),
+                "outcome":     "WIN" if (o.pnl_bps or 0) > 0 else "LOSS",
+            })
+    rows.sort(key=lambda d: d["_sort"] or datetime.min, reverse=True)
+    for d in rows:
+        d.pop("_sort", None)
+    return rows
+
+
 # ── Scalp activation readiness (v1 + v2 observation→live gate) ──────────────
 
 def get_scalp_activation_stats() -> dict:
