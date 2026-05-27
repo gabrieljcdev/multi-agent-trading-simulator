@@ -296,6 +296,36 @@ async def test_entry_observation_logged_mexc(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_stale_feed_guard_skips_and_logs(monkeypatch):
+    """A mid frozen for >= SCALP_STALE_MID_THRESHOLD_SEC trips the stale-feed
+    guard: skip_reason='stale_feed', no position opened, and the observation is
+    flushed to the DB. (A never-seen symbol is given one cycle, not skipped.)"""
+    monkeypatch.setattr(settings, "SCALP_STALE_MID_THRESHOLD_SEC", 60)
+    agent = _agent_with_capital(0.0)
+
+    frozen_mid = 50_000.0
+    agent._get_mid_price = AsyncMock(return_value=frozen_mid)
+    key = agent._pos_key("BTC/USDT", "mexc")
+    # Agent state: mid last changed 90s ago and is unchanged now (> 60s).
+    agent._last_mid[key] = (frozen_mid, time.time() - 90)
+
+    saved = []
+    monkeypatch.setattr(
+        "agents.scalping_agent.db_queries.save_scalp_observations",
+        lambda batch: saved.extend(batch),
+    )
+
+    await agent._evaluate_entry("BTC/USDT", "mexc")
+    await agent._flush_observations()
+
+    assert key not in agent._positions                          # no position opened
+    obs = agent._observations[-1]
+    assert obs.skip_reason == "stale_feed"
+    assert obs.would_entry is False
+    assert any(o.skip_reason == "stale_feed" for o in saved)    # written to DB
+
+
+@pytest.mark.asyncio
 async def test_entry_blocked_unapproved_exchange():
     """Kraken not in STRATEGY_EXCHANGE_MAP['scalp'] → skip with reason."""
     agent = _agent_with_capital(0.0)
@@ -346,8 +376,9 @@ async def test_exit_ofi_exhausted():
 
 
 @pytest.mark.asyncio
-async def test_circuit_breaker_daily_loss():
+async def test_circuit_breaker_daily_loss(monkeypatch):
     """Real-capital loss past SCALP_DAILY_LOSS_HALT → agent halted."""
+    monkeypatch.setattr(settings, "SCALP_DAILY_LOSS_HALT", 5.0)   # pin: -$10 loss must exceed it
     agent = _agent_with_capital(50.0)
     agent._get_mid_price = AsyncMock(return_value=50_000.0)
 
@@ -448,10 +479,11 @@ async def test_exit_closes_sim_trade_and_tracks_net_equity(monkeypatch):
 # ─────────────────────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_daily_reset_clears_circuit_breaker():
+async def test_daily_reset_clears_circuit_breaker(monkeypatch):
     """UTC day rollover → daily_loss zeroes, consec_losses zeroes, the
     halt is lifted (provided it was a daily-loss halt)."""
     from datetime import timedelta
+    monkeypatch.setattr(settings, "SCALP_DAILY_LOSS_HALT", 5.0)   # pin: -$10 loss must exceed it
     agent = _agent_with_capital(50.0)
 
     # Force into the halted-by-daily-loss state.
@@ -493,6 +525,10 @@ async def test_session_gate_blocks_outside_window(monkeypatch):
             return _dt(2026, 5, 22, 3, 0, 0)
 
     monkeypatch.setattr(scalp_mod, "datetime", _FakeDT)
+    # Pin the window so the test is independent of the prod/debug value of
+    # SCALP_SESSION_* — 03:00 must fall outside [START, END).
+    monkeypatch.setattr(settings, "SCALP_SESSION_START_UTC", 12)
+    monkeypatch.setattr(settings, "SCALP_SESSION_END_UTC", 16)
 
     agent = _agent_with_capital(0.0)
     agent._get_mid_price  = AsyncMock(return_value=50_000.0)

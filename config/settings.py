@@ -84,29 +84,29 @@ SESSION_MIN_ACTIVE_PAIRS     = 2      # Need at least N viable pairs
 # ══════════════════════════════════════════════════════════════════════════════
 
 # Simulated per-venue cash ledger (sim mode). Spans every venue the funds
-# touch and sums to STARTING_CAPITAL ($1,000) so the fund allocations are
+# touch and sums to STARTING_CAPITAL ($1,100) so the fund allocations are
 # fully backed in sim. NOTE: this is a per-venue ledger, NOT a per-fund one
 # — funds share venues (MEXC backs the scalp fund and is also an arb venue).
 # Per-fund sizing lives with each agent (e.g. OrderRouter sizes the signal
 # agent off FUND_SIGNAL_CAPITAL, not this sum), so a bigger ledger never
 # lets one fund risk beyond its own allocation.
 EXCHANGE_BALANCES = {
-    "binance":  150.0,
-    "kraken":   200.0,   # signal + arb
-    "bybit":    200.0,   # signal + arb
-    "kucoin":    50.0,
+    "binance":    0.0,
+    "kraken":   100.0,   # signal + arb
+    "bybit":    100.0,   # signal + arb
+    "kucoin":     0.0,
     "bitget":   100.0,   # arb
     "bitstamp":  70.0,   # arb
     "gateio":    70.0,   # arb
     "bitfinex":  60.0,   # arb
-    "mexc":     100.0,   # MEXC-scalp fund; also shared as an arb venue
+    "mexc":     600.0,   # MEXC-scalp fund; also shared as an arb venue
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
 # EXCHANGES
 # ══════════════════════════════════════════════════════════════════════════════
 
-ENABLED_EXCHANGES  = ["binance", "kraken", "bybit", "kucoin"]
+ENABLED_EXCHANGES  = ["binance", "kraken", "bybit", "kucoin", "mexc"]
 MIN_LIQUIDITY_USD  = 50_000     # Minimum order book depth to trade a pair
 ORDER_BOOK_DEPTH   = 10         # Levels to stream per side for OFI
 ORDER_BOOK_STREAM_PAIRS    = 20    # test: 5-50   (top-N active pairs to stream books for)
@@ -545,9 +545,9 @@ PREDICTIVE_PENALTY_WEAK         = 15
 # circuit breakers are per-fund. MEXC is shared — the MEXC-scalp fund trades
 # it, and the main arb fund uses it as one venue — but the $100 MEXC-scalp
 # pool stays ring-fenced from the main portfolio.
-FUND_SIGNAL_CAPITAL     = 400.0   # signal agent — binance/bybit/kraken
-FUND_ARB_CAPITAL        = 500.0   # arb agent — kraken/bybit/bitget/mexc/... (MEXC folded in)
-FUND_MEXC_SCALP_CAPITAL = 100.0   # scalping, MEXC only (observation until SCALP_CAPITAL>0)
+FUND_SIGNAL_CAPITAL     = 0.0     # signal agent — binance/bybit/kraken
+FUND_ARB_CAPITAL        = 600.0   # arb agent — kraken/bybit/bitget/mexc/... (MEXC folded in)
+FUND_MEXC_SCALP_CAPITAL = 500.0   # scalping, MEXC only (observation until SCALP_CAPITAL>0)
 
 # Per-fund daily-loss halt: each fund halts independently at this % of its
 # OWN size. Enforced by Coordinator._check_fund_circuit_breakers, alongside
@@ -557,7 +557,7 @@ FUND_DAILY_LOSS_HALT_PCT = 10.0   # test: 5–20
 # Total starting equity for the portfolio — the sum of all funds. Drives
 # CircuitBreakerState baseline + falls back as initial value when the DB
 # has no prior portfolio_snapshot (see core/bot.py startup). Reference only.
-STARTING_CAPITAL     = 1000.0    # test: 200–10000   (= sum of FUND_* above)
+STARTING_CAPITAL     = 1100.0    # test: 200–10000   (= sum of FUND_* above)
 
 # Legacy aliases — existing code/tests read these names. Pointed at the
 # fund constants so there is a single source of truth for each pool.
@@ -592,7 +592,7 @@ STRATEGY_EXCHANGE_MAP = {
 # execution (SIM_MODE=False) is still a follow-up. Set AFTER DB confirms
 # edge (win_rate > 52%, avg_net_bps > 0); live also needs MEXC keys.
 
-SCALP_CAPITAL             = 100.0   # test: 0-100   ($0 = observation; >0 = sim execution)
+SCALP_CAPITAL             = 500.0   # test: 0-1000  ($0 = observation; >0 = sim execution)
 
 # Universe = the 96 of 102 candidate pairs that at least one MEXC key is
 # API-allowlisted to trade, discovered by probing each key's selfSymbols
@@ -694,13 +694,14 @@ SCALP_ZSCORE_WINDOW       = 80     # test: 40-150    (rolling z-score normalisat
 
 # Execution parameters
 SCALP_MAX_SPREAD_BPS      = 3.0    # test: 1.5-6.0   (max bid-ask spread bps)
+SCALP_STALE_MID_THRESHOLD_SEC = 60 # test: 30-180    (skip entry if a symbol's mid hasn't moved for >= N sec — frozen feed = stale OFI)
 SCALP_MAX_HOLD_SEC        = 180    # test: 60-300    (force exit after N seconds)
 SCALP_SCAN_INTERVAL_MS    = 100    # test: 50-500    (main loop interval ms)
-SCALP_MAX_CONCURRENT      = 1      # test: 1-3       (max open scalp positions)
+SCALP_MAX_CONCURRENT      = 2      # test: 1-3       (max open scalp positions)
 SCALP_POSITION_SIZE_USD   = 25.0   # test: 10-50     (per-trade size USD)
 
 # Circuit breakers
-SCALP_DAILY_LOSS_HALT     = 5.0    # test: 2-10      (daily loss halt USD)
+SCALP_DAILY_LOSS_HALT     = 25.0   # test: 2-10      (daily loss halt USD)
 SCALP_CONSEC_LOSS_PAUSE   = 4      # test: 3-6       (consecutive loss pause count)
 
 # Session window — scalp edge depends on tight spreads + active flow,

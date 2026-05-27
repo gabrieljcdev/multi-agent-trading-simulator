@@ -151,7 +151,8 @@ async def test_signal_get_stats_reads_ledger(monkeypatch):
     assert stats.daily_pnl == pytest.approx(12.0)
     assert stats.total_pnl == pytest.approx(30.0)
     cap = settings.SIGNAL_AGENT_CAPITAL
-    assert stats.daily_pnl_pct == pytest.approx(12.0 / cap * 100.0)
+    expected_pct = (12.0 / cap * 100.0) if cap else 0.0   # signal fund may be defunded to 0
+    assert stats.daily_pnl_pct == pytest.approx(expected_pct)
 
 
 @pytest.mark.asyncio

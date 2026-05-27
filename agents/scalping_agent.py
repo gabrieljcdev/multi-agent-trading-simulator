@@ -626,6 +626,11 @@ class ScalpingAgent(BaseAgent):
         # _ensure_book_subscription). Without that the engine never sees a
         # book and every entry silent-skips on stale OFI.
         self._book_subscribed = False
+        # Per-(symbol:exchange) last-seen mid and the time it last *changed* —
+        # backs the stale-feed entry guard. A mid that hasn't moved for
+        # SCALP_STALE_MID_THRESHOLD_SEC means the book feed has frozen and OFI
+        # is being computed on stale data.
+        self._last_mid: dict[str, tuple[float, float]] = {}
 
         # Per-agent circuit breakers (independent of the portfolio breaker).
         # _daily_loss accumulates only losses (drives the daily-loss halt);
@@ -1103,6 +1108,29 @@ class ScalpingAgent(BaseAgent):
             return
 
         ofi = self._ofi_engine.get(symbol, exchange)
+
+        # 1b. Stale-feed guard. A mid that hasn't moved for >= the threshold
+        # means the order-book feed has frozen, so the OFI z-score is computed
+        # on stale data — skip and LOG it (unlike the silent OFI-stale skip
+        # below). A symbol seen for the first time records its baseline and is
+        # given one cycle to populate (no skip). On a stale hit we re-arm the
+        # change-time so a persistently frozen feed logs once per threshold
+        # window rather than on every tick.
+        mid_now = await self._get_mid_price(symbol, exchange)
+        if mid_now and mid_now > 0:
+            mid_key = self._pos_key(symbol, exchange)
+            prev = self._last_mid.get(mid_key)
+            if prev is None:
+                self._last_mid[mid_key] = (mid_now, now)       # first scan — one cycle
+            elif mid_now != prev[0]:
+                self._last_mid[mid_key] = (mid_now, now)       # mid moved — feed is live
+            elif (now - prev[1]) >= settings.SCALP_STALE_MID_THRESHOLD_SEC:
+                self._last_mid[mid_key] = (mid_now, now)       # re-arm (debounce repeat logs)
+                self._log_skip(symbol, exchange, now, ofi=ofi,
+                               reason="stale_feed",
+                               rt_bps=0.0, min_wr=1.0,
+                               spread_bps=0.0, regime="?")
+                return
 
         # 2. OFI not stale and active — silent skip (no observation logged)
         if ofi["stale"] or ofi["z"] == 0.0:

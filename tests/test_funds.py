@@ -12,7 +12,7 @@ def test_fund_constants_present_and_positive():
     for name in ("FUND_SIGNAL_CAPITAL", "FUND_ARB_CAPITAL",
                  "FUND_MEXC_SCALP_CAPITAL", "FUND_DAILY_LOSS_HALT_PCT"):
         assert hasattr(settings, name), f"missing {name}"
-        assert getattr(settings, name) > 0
+        assert getattr(settings, name) >= 0   # a fund may be defunded to 0 (e.g. signal)
 
 
 def test_mexc_arb_fund_constant_removed():
@@ -23,7 +23,7 @@ def test_mexc_arb_fund_constant_removed():
 def test_starting_capital_is_sum_of_funds():
     total = (settings.FUND_SIGNAL_CAPITAL + settings.FUND_ARB_CAPITAL
              + settings.FUND_MEXC_SCALP_CAPITAL)
-    assert total == 1000.0
+    assert total == 1100.0
     assert settings.STARTING_CAPITAL == total
 
 
@@ -64,9 +64,11 @@ def test_scalp_fund_size_decoupled_from_trading_budget():
 
 def test_sim_balance_ledger_sums_to_starting_capital_and_includes_mexc():
     """In sim, the per-venue ledger fully backs the funds: it spans every
-    venue the funds touch and sums to STARTING_CAPITAL ($1,000)."""
+    venue the funds touch and sums to STARTING_CAPITAL ($1,100)."""
     assert sum(settings.EXCHANGE_BALANCES.values()) == settings.STARTING_CAPITAL
-    assert settings.EXCHANGE_BALANCES["mexc"] == settings.FUND_MEXC_SCALP_CAPITAL
+    # MEXC is shared (scalp fund + an arb venue), so its ledger backs at least
+    # the scalp fund.
+    assert settings.EXCHANGE_BALANCES["mexc"] >= settings.FUND_MEXC_SCALP_CAPITAL
 
 
 def test_order_router_sizes_off_signal_fund_not_total():
