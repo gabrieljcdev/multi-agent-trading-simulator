@@ -53,9 +53,11 @@
   /* agent grid */
   .agents{display:grid;grid-template-columns:repeat(6,1fr);gap:10px;margin-bottom:10px}
   .agent.offline{opacity:.4}
+  .agent.observation{opacity:.7}
   .agent.clickable{cursor:pointer}
   .agent.clickable:hover{border-color:var(--tx1)}
   .agent.clickable:focus{outline:2px solid var(--tx1);outline-offset:1px}
+  .agent.active-card{outline:2px solid var(--tx0);outline-offset:1px;background:var(--bg2)}
   .agent .id{font-weight:bold;text-transform:capitalize}
   .st{font-size:11px;padding:1px 6px;border-radius:3px;background:var(--bg2)}
   .st.RUNNING{color:var(--pos)} .st.HALTED,.st.ERROR{color:var(--neg)} .st.PAUSED{color:var(--warn)}
@@ -146,54 +148,64 @@
           <div class="v" id="m-wr">—</div><div class="sub" id="m-wr-sub">—</div></div>
       </div>
 
+      <!-- Agent grid — always visible. Clicking a card sets activeAgentId
+           and replaces #dashboard-content with #agent-detail-content. -->
       <div class="agents" id="agents"></div>
 
-      <div class="grid2" style="margin-bottom:10px">
-        <div class="card"><h2>Regime</h2><div id="regime"></div></div>
-        <div class="card"><h2>Sentiment</h2><div id="sentiment"></div></div>
-      </div>
+      <!-- Dashboard view content — visible only when activeAgentId == null.
+           Web UI v3 truncates the dashboard at Session P&L (relocated to
+           sit directly below Open Positions); Live Arb Feed and the four
+           v2 panels moved into per-agent detail pages below. -->
+      <div id="dashboard-content">
+        <div class="grid2" style="margin-bottom:10px">
+          <div class="card"><h2>Regime</h2><div id="regime"></div></div>
+          <div class="card"><h2>Sentiment</h2><div id="sentiment"></div></div>
+        </div>
 
-      <div class="grid3" style="margin-bottom:10px">
-        <div class="card"><h2>Signal Feed</h2><div class="scroll" id="signals"></div></div>
-        <div class="card">
-          <h2>Approval</h2>
-          <div id="pending"></div>
-          <div style="margin-top:8px">
-            <span class="dim">mode:</span>
-            <button class="modeBtn" data-mode="per_trade">per_trade</button>
-            <button class="modeBtn" data-mode="window">window</button>
-            <button class="modeBtn" data-mode="autonomous">autonomous</button>
+        <div class="grid3" style="margin-bottom:10px">
+          <div class="card"><h2>Signal Feed</h2><div class="scroll" id="signals"></div></div>
+          <div class="card">
+            <h2>Approval</h2>
+            <div id="pending"></div>
+            <div style="margin-top:8px">
+              <span class="dim">mode:</span>
+              <button class="modeBtn" data-mode="per_trade">per_trade</button>
+              <button class="modeBtn" data-mode="window">window</button>
+              <button class="modeBtn" data-mode="autonomous">autonomous</button>
+            </div>
+            <div style="margin-top:6px"><button id="windowBtn">Approve 60m window</button></div>
           </div>
-          <div style="margin-top:6px"><button id="windowBtn">Approve 60m window</button></div>
+        </div>
+
+        <div class="grid2" style="margin-bottom:10px">
+          <div class="card"><h2>Circuit Breakers</h2><div id="breakers"></div></div>
+          <div class="card"><h2>Exchanges</h2><div id="exchanges"></div></div>
+        </div>
+
+        <div class="card" style="margin-bottom:10px">
+          <h2>Open Positions</h2><div class="scroll" id="positions"></div>
+        </div>
+
+        <div class="card">
+          <h2>Session P&amp;L</h2><div class="sessions" id="sessions"></div>
         </div>
       </div>
 
-      <div class="grid2" style="margin-bottom:10px">
-        <div class="card"><h2>Circuit Breakers</h2><div id="breakers"></div></div>
-        <div class="card"><h2>Exchanges</h2><div id="exchanges"></div></div>
-      </div>
-
-      <div class="card" style="margin-bottom:10px">
-        <h2>Open Positions</h2><div class="scroll" id="positions"></div>
-      </div>
-
-      <div class="card" style="margin-bottom:10px">
-        <h2>Live Arb Feed</h2><div class="scroll" id="arbFeed"></div>
-      </div>
-
-      <!-- Web UI v2 dedicated agent panels — replace the v1 generic-card
-           render for arb / xchain / funding_arb / balance. -->
-      <div class="card" style="margin-bottom:10px"><h2>Arb Fund</h2>
-        <div id="arbFundPanel"></div></div>
-      <div class="card" style="margin-bottom:10px"><h2>Cross-Chain Arb</h2>
-        <div id="xchainPanel"></div></div>
-      <div class="card" style="margin-bottom:10px"><h2>Funding Rate Arb</h2>
-        <div id="fundingPanel"></div></div>
-      <div class="card" style="margin-bottom:10px"><h2>Balance Agent</h2>
-        <div id="balancePanel"></div></div>
-
-      <div class="card">
-        <h2>Session P&amp;L</h2><div class="sessions" id="sessions"></div>
+      <!-- Per-agent detail page — visible only when activeAgentId != null.
+           The header strip lives in plain HTML so the ← Dashboard button is
+           clickable even if the body render below throws. The body itself
+           is rendered via safeRender into #ad-body. -->
+      <div id="agent-detail-content" hidden>
+        <div class="pagehead" style="margin-bottom:10px">
+          <button id="backToDashboardBtn">← Dashboard</button>
+          <span id="ad-name" class="pagetitle">—</span>
+          <span id="ad-status" class="st">—</span>
+          <span class="dim">cap</span><span id="ad-cap">—</span>
+          <span class="dim">daily</span><span id="ad-pnl">—</span>
+          <span id="ad-trades" class="dim">—</span>
+          <span class="dim">WR</span><span id="ad-wr">—</span>
+        </div>
+        <div id="ad-body"></div>
       </div>
     </div>
 
@@ -261,14 +273,21 @@ const $ = (id) => document.getElementById(id);
 let STATE = {};
 let logFilter = "ALL";
 
-// Web UI v2 — generic agent grid renders only the agents that DON'T own
-// a dedicated panel. signal + scalp keep the generic card; arb, xchain,
-// funding_arb, and balance each get their own panel below.
-const AGENT_ORDER = ["signal","scalp"];
+// Web UI v3 — every registered agent renders in the grid. The v2 filter
+// that hid arb/xchain/funding_arb/balance is gone now that each gets its
+// own detail page (rather than an inline dashboard panel).
+const AGENT_ORDER = ["signal","arb","scalp","xchain","funding_arb","balance"];
 const AGENT_NAME = {
   signal:"Signal Agent", arb:"Arb Agent", scalp:"Scalp Agent",
   xchain:"Cross-Chain Agent", funding_arb:"Funding-Rate Arb", balance:"Balance Agent",
 };
+// Set of agent_ids that observe-but-don't-trade — renders the card at
+// 70% opacity (per v2 OBS convention) so the grid still reads scannable.
+const OBSERVATION_AGENTS = new Set(["xchain","funding_arb"]);
+// Web UI v3 — null means "show the dashboard"; any agent_id means "show
+// that agent's detail page in place of the dashboard content". Lives in
+// JS memory only; survives WebSocket reconnects but resets on refresh.
+let activeAgentId = null;
 const SESSION_KEYS = ["LONDON","NEW_YORK","ASIA","OFF_HOURS"];
 const SESSION_TZ = {
   LONDON:["Europe/London","LON"], NEW_YORK:["America/New_York","NYC"],
@@ -332,6 +351,13 @@ function wireKill(btn){
   };
 }
 wireKill($("killBtn")); wireKill($("killBtn2"));
+
+/* ← Dashboard — bound once, outside safeRender, so the operator can always
+   escape even if the detail-page body render throws. */
+$("backToDashboardBtn").onclick = () => {
+  activeAgentId = null;
+  if(STATE && STATE.ts) updateUI(STATE);   // repaint immediately
+};
 
 /* Rebalance — Web UI v2 three-action arm → confirm → cancel flow.
    The buttons live INSIDE balancePanelHtml; this module-level state
@@ -456,13 +482,22 @@ function updateUI(s){
     `${p.win_rate_today==null?"—":p.win_rate_today.toFixed(1)}% today · ` +
     `${p.win_rate_alltime==null?"—":p.win_rate_alltime.toFixed(1)}% all-time`;
 
-  // agents (fixed 6 slots, clickable → agent page)
+  // agents — all six in a uniform grid; click sets activeAgentId.
   const byId = {}; (s.agents||[]).forEach(a => byId[a.id]=a);
   $("agents").innerHTML = AGENT_ORDER.map(id => {
     const a = byId[id] || {id, status:"OFFLINE", capital:0, daily_pnl:0, trades_today:0, win_rate:0};
-    const off = (a.status==="OFFLINE");
-    return `<div class="card agent clickable ${off?"offline":""}" role="button" tabindex="0"
-        data-agent="${esc(id)}" aria-label="Open ${esc(AGENT_NAME[id]||id)}">
+    const off    = (a.status==="OFFLINE");
+    const obs    = OBSERVATION_AGENTS.has(id);
+    const active = (activeAgentId === id);
+    const klass  = [
+      "card","agent","clickable",
+      off    ? "offline"     : "",
+      obs    ? "observation" : "",
+      active ? "active-card" : "",
+    ].filter(Boolean).join(" ");
+    return `<div class="${klass}" role="button" tabindex="0"
+        data-agent="${esc(id)}" aria-label="Open ${esc(AGENT_NAME[id]||id)}"
+        aria-pressed="${active}">
       <div class="id">${esc((AGENT_NAME[id]||id).replace(" Agent",""))}</div>
       <div><span class="st ${esc(a.status)}">${esc(a.status)}</span></div>
       <div class="dim">cap ${fmtUsd(a.capital)}</div>
@@ -471,7 +506,10 @@ function updateUI(s){
     </div>`;
   }).join("");
   document.querySelectorAll("#agents .agent").forEach(el => {
-    const go = () => { location.hash = "#/agent/" + el.dataset.agent; };
+    const go = () => {
+      activeAgentId = el.dataset.agent;
+      updateUI(STATE);                       // re-render against the cached snapshot
+    };
     el.onclick = go;
     el.onkeydown = (e) => { if(e.key==="Enter"||e.key===" "){ e.preventDefault(); go(); } };
   });
@@ -510,20 +548,22 @@ function updateUI(s){
     `<div><span class="dot ${esc(x.status)}"></span>${esc(x.name)} <span class="dim">${esc(x.status)}</span></div>`
   ).join("") || `<span class="muted">none</span>`;
 
-  // positions
+  // positions (dashboard view only)
   $("positions").innerHTML = positionsHtml(s.positions);
 
-  // live arb feed (dashboard)
-  $("arbFeed").innerHTML = arbFeedHtml(s.arb_feed);
-
-  // Web UI v2 — dedicated agent panels. Each render fn wraps its own
-  // try/catch so a single broken panel can't take the whole UI down.
-  safeRender("arbFundPanel", () => arbFundPanelHtml(s.arb, s.arb_feed, s.arb_history));
-  safeRender("xchainPanel",  () => xchainPanelHtml(s.xchain));
-  safeRender("fundingPanel", () => fundingPanelHtml(s.funding));
-  safeRender("balancePanel", () => balancePanelHtml(s.balance));
-  // Each panel completes its own render → release the per-panel click lock
-  // once we've received a snapshot reflecting the new server state.
+  // Web UI v3 — toggle between dashboard content and per-agent detail page.
+  // The agent grid above stays visible in both states; only the area below
+  // it swaps. The v2 inline panels (arb / xchain / funding / balance) and
+  // the standalone Live Arb Feed moved into the per-agent detail pages.
+  const onDetail = (activeAgentId != null);
+  $("dashboard-content").hidden    = onDetail;
+  $("agent-detail-content").hidden = !onDetail;
+  if(onDetail){
+    renderAgentDetail(s, activeAgentId);
+  }
+  // Release the rebalance per-panel click lock once a fresh snapshot
+  // reflecting the new server state has landed. The Balance detail page
+  // re-renders its arm/confirm/cancel buttons against the new state.
   rebalanceClickLock = false;
 
   // session P&L (clickable + local clocks)
@@ -982,7 +1022,100 @@ function balancePanelHtml(b){
     `<h2 class="dim" style="margin-top:8px">Rebalance</h2>${controlHtml}${errBanner}`;
 }
 
-/* ---------- agent page ---------- */
+/* ---------- Web UI v3 — per-agent detail pages ----------
+   The dispatcher updates the header strip (always — outside safeRender so
+   ← Dashboard never gets stranded) and then renders the agent-specific
+   body via safeRender into #ad-body. The v2 panel render functions above
+   (arbFundPanelHtml / xchainPanelHtml / fundingPanelHtml / balancePanelHtml)
+   are reused verbatim — they produce the same HTML they always have, just
+   inside a detail page now instead of an inline dashboard panel. */
+
+function positionsFor(positions, agentId){
+  // _snap_positions tags every row with `agent` (defaults to "signal" when
+  // the trade's strategy is unset), so a stable filter works without a
+  // server-side change.
+  return (positions||[]).filter(p => (p.agent||"signal") === agentId);
+}
+
+function setDetailHeader(agent, agentId){
+  const status = agent.status || "OFFLINE";
+  $("ad-name").textContent = AGENT_NAME[agentId] || agentId;
+  $("ad-status").textContent = status;
+  $("ad-status").className = "st " + status;
+  $("ad-cap").textContent = fmtUsd(agent.capital);
+  $("ad-pnl").innerHTML =
+    `<span class="${cls(agent.daily_pnl)}">${fmtUsd(agent.daily_pnl)}</span>`;
+  $("ad-trades").textContent = "· " + (agent.trades_today||0) + " tr";
+  $("ad-wr").textContent = (agent.win_rate||0).toFixed(1) + "%";
+}
+
+function renderAgentDetail(state, id){
+  const agent = (state.agents||[]).find(a => a.id === id)
+    || {id, status:"OFFLINE", capital:0, daily_pnl:0, trades_today:0, win_rate:0};
+  setDetailHeader(agent, id);
+  safeRender("ad-body", () => {
+    switch(id){
+      case "signal":      return signalDetailHtml(state);
+      case "arb":         return arbDetailHtml(state);
+      case "scalp":       return scalpDetailHtml(state);
+      case "xchain":      return xchainDetailHtml(state);
+      case "funding_arb": return fundingDetailHtml(state);
+      case "balance":     return balanceDetailHtml(state);
+      default:            return `<span class="muted">unknown agent: ${esc(id)}</span>`;
+    }
+  });
+}
+
+function signalDetailHtml(state){
+  const myPos = positionsFor(state.positions, "signal");
+  return `<div class="card" style="margin-bottom:10px">
+      <h2>Open Positions</h2><div class="scroll">${positionsHtml(myPos)}</div></div>
+    <div class="card" style="margin-bottom:10px">
+      <h2>Recent Signal Feed</h2><div class="scroll">${signalFeedHtml(state.signals)}</div></div>
+    <div class="card">
+      <h2>Self-Review Insights</h2>${insightsHtml(state.insights)}</div>`;
+}
+
+function arbDetailHtml(state){
+  // arbFundPanelHtml renders exchanges, gap distribution, recent fills, and
+  // today's-performance summary — that's the entire spec for this page.
+  return `<div class="card">` +
+    arbFundPanelHtml(state.arb, state.arb_feed, state.arb_history) +
+    `</div>`;
+}
+
+function scalpDetailHtml(state){
+  const myPos = positionsFor(state.positions, "scalp");
+  // OFI strip + today's perf are not on the snapshot yet (engine surface
+  // pending). Render placeholders; flagged as follow-up in WEB_UI.md.
+  return `<div class="card" style="margin-bottom:10px">
+      <h2>OFI Strip</h2>
+      <span class="muted">per-pair OFI not surfaced — pending engine work</span></div>
+    <div class="card" style="margin-bottom:10px">
+      <h2>Open Positions (Scalp)</h2><div class="scroll">${positionsHtml(myPos)}</div></div>
+    ${scalpFeedHtml(state.scalp)}
+    <div class="card" style="margin-top:10px">
+      <h2>Today</h2>
+      <span class="muted">evaluated / would-enter / closed counters not surfaced — pending engine work</span></div>`;
+}
+
+function xchainDetailHtml(state){
+  return `<div class="card">${xchainPanelHtml(state.xchain)}</div>`;
+}
+
+function fundingDetailHtml(state){
+  return `<div class="card">${fundingPanelHtml(state.funding)}</div>`;
+}
+
+function balanceDetailHtml(state){
+  // The arm / confirm / cancel buttons + their wireup live inside
+  // balancePanelHtml itself (unchanged from v2); they're now on this page
+  // rather than the dashboard.
+  return `<div class="card">${balancePanelHtml(state.balance)}</div>`;
+}
+
+/* ---------- legacy hash-routed agent page (kept for backwards-compat;
+   reachable via #/agent/<id> in the URL bar but no card links here) ---------- */
 function agentHeader(id){
   const a = (STATE.agents||[]).find(x => x.id===id)
     || {id, status:"OFFLINE", capital:0, daily_pnl:0, win_rate:0};

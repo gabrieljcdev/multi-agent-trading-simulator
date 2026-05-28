@@ -131,11 +131,88 @@ open (in-memory only; expires at `REBALANCE_ARM_TIMEOUT_S` after arm).
 
 ---
 
+## Navigation model (v3)
+
+The Web UI v3 build (this section) replaces the v2 inline-panel layout
+with a click-through pattern: the dashboard view stays compact and each
+agent gets its own detail page reached by clicking that agent's card.
+
+**Top-level tabs** (unchanged from v2): `Dashboard`, `Arb History`, `Log`.
+These are global; their behaviour does not depend on which agent — if any
+— is selected.
+
+**Dashboard tab — two states** driven by a single JS variable
+`activeAgentId` (default `null`):
+
+- `activeAgentId == null` → the **dashboard view** renders below the
+  agent grid: metrics row, regime + sentiment, signal feed + approval,
+  circuit breakers + exchanges, **Open Positions**, **Session P&L**.
+  Nothing else — the v2 inline panels and the standalone Live Arb Feed
+  are gone from this view.
+- `activeAgentId == "<agent_id>"` → the **agent detail page** for that
+  agent replaces the dashboard view content below the grid. The agent
+  grid itself stays visible above so the operator can switch agents
+  directly without going back to the dashboard first.
+
+The variable is in JS memory only — no hash routing, no localStorage —
+so a browser refresh resets to the dashboard view. The variable does
+**survive WebSocket reconnects**: drop and reconnect the WS, you stay on
+whichever detail page you were viewing.
+
+**← Dashboard** button on every detail page sets `activeAgentId = null`
+and re-renders. Bound once at startup, outside any `safeRender`
+boundary, so it remains clickable even if the current detail page's
+body render throws.
+
+Agent grid: all six registered agents (`signal`, `arb`, `scalp`,
+`xchain`, `funding_arb`, `balance`) render uniform compact cards in this
+fixed order, regardless of whether they own a detail page. The active
+card is marked with the same outline style as an active session card
+(`outline:2px solid var(--tx0)`). Observation-mode agents
+(`xchain`, `funding_arb`) render at 70% opacity per the v2 OBS
+convention.
+
+## Per-agent detail pages
+
+Each detail page starts with a uniform header strip:
+
+```
+[← Dashboard]  [display_name]  [STATUS]  cap $… · daily P&L · N tr · WR%
+```
+
+Below the header, the body is rendered via `safeRender("ad-body", …)`
+so a single broken detail page never escapes the operator into a dead
+UI. The render function dispatched per agent_id:
+
+| Agent | Body |
+|---|---|
+| `signal`      | open positions filtered to `agent=="signal"`; recent signal feed; self-review insights |
+| `arb`         | full `arbFundPanelHtml(arb, arb_feed, arb_history)` — exchanges table, gap distribution, recent fills, today's performance |
+| `scalp`       | OFI strip (placeholder — pending engine surface); open scalp positions (filtered `agent=="scalp"`); live + closed scalp feed (`scalpFeedHtml`); today's perf (placeholder) |
+| `xchain`      | full `xchainPanelHtml(xchain)` |
+| `funding_arb` | full `fundingPanelHtml(funding)` |
+| `balance`     | full `balancePanelHtml(balance)` — includes the arm/confirm/cancel control block, which now lives on this detail page rather than on the dashboard |
+
+The four `*PanelHtml` functions (`arbFundPanelHtml`, `xchainPanelHtml`,
+`fundingPanelHtml`, `balancePanelHtml`) are unchanged from v2 — they
+produce the same HTML they always have. They moved from inline panels
+on the dashboard into the corresponding agent's detail page.
+
+**Per-agent open positions** filter from `snapshot.positions[]` via the
+existing `agent` field (`_snap_positions` already tags every row with
+the owning agent_id; `signal` is the default when `strategy` is unset).
+
+**Follow-up engine work** (placeholders rendered today, no server-side
+work in this build):
+- `scalp` detail page — OFI strip + today's evaluated/would-enter/closed counters; needs a `snapshot.scalp.ofi` + `snapshot.scalp.today` surface from `ScalpingAgent`.
+- `arb` detail page — `arb.exchanges`, `arb.gap_distribution.bucket_counts`, `arb.threshold.rationale` are stubbed at the server (`_snap_arb_v2`) until the arb engine exposes per-exchange health + gap distribution. Same caveat as v2.
+- `xchain` detail page — `xchain.chains[]` and `xchain.best_pair.would_entry` similarly stubbed, pending engine work.
+
 ## Panel pattern
 
 Every dashboard section is a `sec-label` + `card` div pair, rendered by
-a function called from `updateUI(state)`. The four dedicated v2 panels
-follow the same conventions:
+a function called from `updateUI(state)`. The detail-page render
+functions follow the same conventions:
 
 - Each render function is wrapped in a per-panel `try`/`catch` via
   `safeRender(elId, build)`. A single broken render shows a one-line
@@ -149,10 +226,6 @@ follow the same conventions:
   an `OBS` tag (`obsHeader(text, isObs)` helper).
 - All buttons disable on click and re-enable when the next snapshot
   reflects the new server state — never optimistically update local UI.
-
-The generic agent grid renders only `signal` and `scalp`; `arb`,
-`xchain`, `funding_arb`, and `balance` have dedicated panels and are
-filtered out of the grid.
 
 ---
 
@@ -301,26 +374,34 @@ the Arm / Confirm / Cancel buttons with a tooltip; on the server side
 ## Adding a new agent
 
 Per `PLUGIN_PATTERN.md`, appending an instance to `REGISTERED_AGENTS`
-in `agents/__init__.py` is the only gate for the **generic agent
-grid**. The coordinator picks the new agent up automatically, the
-snapshot's `agents[]` array carries its stats, and the HTML renders a
-default card with status / capital / daily P&L / trades / win rate.
+in `agents/__init__.py` is the only gate for the **agent grid card**.
+The coordinator picks the new agent up automatically, the snapshot's
+`agents[]` array carries its stats, and the HTML renders a default
+card with status / capital / daily P&L / trades / win rate. The card
+is automatically clickable but opens a default detail page that just
+says "no detail page yet".
 
-To give an agent a **dedicated panel** (like arb / xchain / funding /
-balance):
+To give an agent a **dedicated detail page** (like arb / xchain /
+funding / balance):
 
 1. Add a `_snap_<id>()` helper in `ui/web_server.py:WebServer` that
-   reads from the agent (defensively) and returns a dict.
-2. Add the helper's output as a new top-level snapshot key in
-   `_build_snapshot()`.
-3. Add a render function in `ui/web_dashboard.html` and call it from
-   `updateUI(state)` via `safeRender(...)`. Add the panel's `<div>`
-   to the main dashboard grid.
-4. Filter the new agent_id out of `AGENT_ORDER` so it doesn't
-   double-render in the generic grid.
+   reads from the agent (defensively) and returns a dict, and surface
+   it as a new top-level snapshot key in `_build_snapshot()`.
+2. Add the new agent_id to `AGENT_ORDER` in `ui/web_dashboard.html`
+   (the grid renders in this order — all registered agents must
+   appear).
+3. Add a `<id>DetailHtml(state)` render function in
+   `ui/web_dashboard.html` that returns the body HTML for that page.
+4. Dispatch to it from `renderAgentDetail(state, id)` — the switch
+   statement at the top of the v3 detail-page block.
+
+Steps 3 and 4 replace what was step 3 of the v2 instructions ("add a
+panel `<div>` to the main dashboard grid + a `safeRender` call from
+`updateUI`"). The dashboard grid layout is fixed in v3 — extending the
+UI means adding a detail page, not a new dashboard panel.
 
 The terminal dashboard (`ui/dashboard.py`) is independent — adding a
-new panel there is a separate edit. The two interfaces share data
+new agent there is a separate edit. The two interfaces share data
 sources (the same agent / engine / DB layer) but render their UIs
 separately so they can evolve independently.
 

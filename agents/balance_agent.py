@@ -184,38 +184,20 @@ class BalanceAgent(BaseAgent):
             pass
 
     async def get_stats(self) -> AgentStats:
-        # Equity is the sum of all managed pools + realised. Pull
-        # defensively — get_stats must NEVER raise.
-        try:
-            signal_p = float(getattr(settings, "FUND_SIGNAL_CAPITAL", 0.0))
-            arb_p    = float(getattr(settings, "FUND_ARB_CAPITAL", 0.0))
-            scalp_p  = float(getattr(settings, "FUND_MEXC_SCALP_CAPITAL", 0.0))
-            total_pool = signal_p + arb_p + scalp_p
-        except Exception:
-            total_pool = 0.0
-        try:
-            realised = (
-                db_queries.get_arb_realized_pnl()
-                + db_queries.get_trade_realized_pnl(exclude_strategy="scalp")
-                + db_queries.get_scalp_realized_pnl()
-            )
-            realised_today = (
-                db_queries.get_arb_realized_pnl(today=True)
-                + db_queries.get_trade_realized_pnl(exclude_strategy="scalp", today=True)
-                + db_queries.get_scalp_realized_pnl(today=True)
-            )
-        except Exception:
-            realised = 0.0
-            realised_today = 0.0
-        equity = total_pool + realised
+        # The balance agent does not trade — it only moves capital between
+        # funds/venues. Its daily_pnl and total_pnl are 0 by definition;
+        # reporting the pool-wide realised P&L here would double-count the
+        # signal/arb/scalp figures already surfaced on each of those cards.
+        # trades_today / consecutive_losses repurposed to count transfers
+        # dispatched / transfers failed (which IS this agent's own work).
         return AgentStats(
             agent_id=self.agent_id,
             status=PAUSED if self._paused else (RUNNING if self._running else OFFLINE),
             capital_allocated=self.capital_allocation,
             capital_deployed=0.0,
-            daily_pnl=float(realised_today),
+            daily_pnl=0.0,
             daily_pnl_pct=0.0,
-            total_pnl=float(realised),
+            total_pnl=0.0,
             trades_today=int(self._transfers_today),
             win_rate_today=0.0,
             win_rate_alltime=0.0,
