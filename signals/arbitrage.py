@@ -31,8 +31,13 @@ class ArbScanner:
         return signals
 
     def _evaluate_gap(self, pair, ex_buy, ex_sell, prices, sentiment_scores):
-        price_buy  = prices.get(ex_buy)
-        price_sell = prices.get(ex_sell)
+        # Some exchanges hand ccxt back price fields as strings; coerce defensively
+        # like core.market_data.get_spread_bps does. None → skip silently.
+        try:
+            price_buy  = float(prices.get(ex_buy))
+            price_sell = float(prices.get(ex_sell))
+        except (TypeError, ValueError):
+            return None
         if not price_buy or not price_sell or price_buy <= 0:
             return None
         gap_pct = (price_sell - price_buy) / price_buy * 100
