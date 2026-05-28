@@ -7,8 +7,6 @@ engine can ring-fence the MEXC counterparty cap). Exchanges may be shared
 (MEXC backs both scalp and mexc-arb and is also a general arb venue);
 capital never is. These guard the wiring so the funds can't silently drift.
 """
-import pytest
-
 from config import settings
 
 
@@ -77,16 +75,6 @@ def test_scalp_fund_size_decoupled_from_trading_budget():
     assert scalp._capital == settings.SCALP_CAPITAL
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "EXCHANGE_BALANCES still sums to 1100 (prior soak baseline); "
-        "ring-fenced re-allocation to back STARTING_CAPITAL=5000 across "
-        "signal/arb/mexc venues is a separate edit outside the 5k-fund "
-        "settings reset. See settings.py:EXCHANGE_BALANCES inline FLAG. "
-        "Remove this xfail once the venue ledger is updated."
-    ),
-)
 def test_sim_balance_ledger_sums_to_starting_capital_and_includes_mexc():
     """In sim, the per-venue ledger fully backs the funds: it spans every
     venue the funds touch and sums to STARTING_CAPITAL."""
@@ -94,6 +82,18 @@ def test_sim_balance_ledger_sums_to_starting_capital_and_includes_mexc():
     # MEXC is shared (scalp fund + mexc-arb fund + general arb venue), so its
     # ledger backs at least the MEXC-scalp pool.
     assert settings.EXCHANGE_BALANCES["mexc"] >= settings.FUND_MEXC_SCALP_CAPITAL
+
+
+def test_sim_balance_ledger_ring_fence_coverage_per_fund():
+    """Each fund's venue subset (per STRATEGY_EXCHANGE_MAP) must have at
+    least the fund's allocation in venue backing. MEXC carries both
+    mexc-scalp and mexc-arb so it must back their sum."""
+    bal = settings.EXCHANGE_BALANCES
+    signal_venues = ("binance", "bybit", "kraken")
+    arb_venues = ("kraken", "bybit", "bitget", "bitstamp", "gateio", "bitfinex")
+    assert sum(bal[v] for v in signal_venues) >= settings.FUND_SIGNAL_CAPITAL
+    assert sum(bal[v] for v in arb_venues) >= settings.FUND_ARB_CAPITAL
+    assert bal["mexc"] >= settings.FUND_MEXC_SCALP_CAPITAL + settings.FUND_MEXC_ARB_CAPITAL
 
 
 def test_order_router_sizes_off_signal_fund_not_total():

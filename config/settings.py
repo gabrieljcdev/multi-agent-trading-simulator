@@ -84,30 +84,31 @@ SESSION_MIN_ACTIVE_PAIRS     = 2      # Need at least N viable pairs
 # ══════════════════════════════════════════════════════════════════════════════
 
 # Simulated per-venue cash ledger (sim mode). Spans every venue the funds
-# touch. NOTE: this is a per-venue ledger, NOT a per-fund one — funds share
-# venues (MEXC backs the scalp + mexc-arb funds and is also a general arb
-# venue). Per-fund sizing lives with each agent (e.g. OrderRouter sizes the
-# signal agent off FUND_SIGNAL_CAPITAL, not this sum), so a bigger ledger
-# never lets one fund risk beyond its own allocation.
+# touch and sums to STARTING_CAPITAL (5000) so the fund allocations are
+# fully backed in sim. NOTE: this is a per-venue ledger, NOT a per-fund one
+# — funds share venues (MEXC backs scalp + mexc-arb; kraken/bybit back
+# signal + arb). Per-fund sizing lives with each agent (e.g. OrderRouter
+# sizes the signal agent off FUND_SIGNAL_CAPITAL, not this sum), so a
+# bigger ledger never lets one fund risk beyond its own allocation.
 #
-# FLAG (5k-soak reset): the dict below still sums to 1100 from the prior
-# soak baseline, but STARTING_CAPITAL is now 5000 (sum(FUND_*) 4600 + 400
-# reserve). The `sum(EXCHANGE_BALANCES) == STARTING_CAPITAL` invariant
-# enforced by tests/test_funds.py::
-# test_sim_balance_ledger_sums_to_starting_capital_and_includes_mexc is
-# therefore broken on disk — re-allocating the ledger to back the new
-# fund layout (signal venues, arb venues, MEXC for both MEXC pools) is
-# a separate edit, out of scope for the 5k-fund settings reset.
+# Ring-fence coverage (each fund's venue subset ≥ its allocation):
+#   signal venues  binance+kraken+bybit              = 2600  ≥ 1600
+#   arb venues     kraken+bybit+bitget+bitstamp+
+#                  gateio+bitfinex                   = 3400  ≥ 2000
+#   mexc-scalp     mexc                              = 1000  ≥  500
+#   mexc-arb       mexc                              = 1000  ≥  500
+# The 400 reserve is co-located on kraken + bybit (the regulated shared
+# venues), 200 each.
 EXCHANGE_BALANCES = {
-    "binance":    0.0,
-    "kraken":   100.0,   # signal + arb
-    "bybit":    100.0,   # signal + arb
-    "kucoin":     0.0,
-    "bitget":   100.0,   # arb
-    "bitstamp":  70.0,   # arb
-    "gateio":    70.0,   # arb
-    "bitfinex":  60.0,   # arb
-    "mexc":     600.0,   # MEXC-scalp fund; also shared as an arb venue
+    "binance":   600.0,   # signal-only
+    "kraken":   1000.0,   # signal + arb (shared) + 200 reserve
+    "bybit":    1000.0,   # signal + arb (shared) + 200 reserve
+    "kucoin":      0.0,   # unused
+    "bitget":    400.0,   # arb
+    "bitstamp":  350.0,   # arb
+    "gateio":    350.0,   # arb
+    "bitfinex":  300.0,   # arb
+    "mexc":     1000.0,   # mexc-scalp 500 + mexc-arb 500 (counterparty-capped)
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
