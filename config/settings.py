@@ -947,13 +947,30 @@ XCHAIN_SYMBOLS                 = ["WETH-USDC"]                  # test: keep sin
 XCHAIN_CHAINS                  = ["arbitrum", "base", "optimism"]
 # Per-chain venue + pool. fee_bps is also pulled from the pool at runtime
 # (the math never trusts this number) — the value here is the documented
-# tier so a misconfigured pool address fails loudly. pool_address is "<FILL>"
-# until the operator pins it; connectors treat that as "RPC unavailable"
-# and stay OFFLINE rather than read the wrong pool.
+# tier so a misconfigured pool address fails loudly. Each pool address
+# was verified by querying the canonical DEX factory contract on-chain
+# (Uniswap V3 PoolFactory / Aerodrome PoolFactory / Velodrome V2
+# PoolFactory) for (WETH, USDC native Circle, volatile/0.05%). Re-derive
+# with `factory.getPool(WETH, USDC, …)` if you ever need to confirm.
 XCHAIN_VENUES = {
-    "arbitrum": {"venue": "uniswap_v3", "pool_address": "<FILL>", "fee_bps": 5.0},
-    "base":     {"venue": "aerodrome",  "pool_address": "<FILL>", "fee_bps": 5.0},
-    "optimism": {"venue": "velodrome",  "pool_address": "<FILL>", "fee_bps": 5.0},
+    # Uniswap V3 0.05% — USDC (native Circle 0xaf88…) / WETH (0x82aF…).
+    # Deepest WETH-USDC pool on Arbitrum (~$75M TVL, $150M+ daily vol).
+    "arbitrum": {"venue": "uniswap_v3",
+                 "pool_address": "0xC6962004f452bE9203591991D15f6b388e09E8D0",
+                 "fee_bps":      5.0},
+    # Aerodrome V1 vAMM (Solidly-volatile x*y=k) — WETH (0x4200…) / USDC
+    # native Circle (0x8335…) on Base. NOT the Slipstream CL100 pool —
+    # the connector inherits from _solidly_volatile so it expects the
+    # constant-product vAMM, not concentrated liquidity. Default fee 30 bps.
+    "base":     {"venue": "aerodrome",
+                 "pool_address": "0xcDAC0d6c6C59727a65F871236188350531885C43",
+                 "fee_bps":      30.0},
+    # Velodrome V2 vAMM (Solidly-volatile x*y=k) — USDC native Circle
+    # (0x0b2C…) / WETH (0x4200…) on Optimism. V2, not V1 (V1 is sunset).
+    # Default fee 30 bps.
+    "optimism": {"venue": "velodrome",
+                 "pool_address": "0xF4F2657AE744354bAcA871E56775e5083F7276Ab",
+                 "fee_bps":      30.0},
 }
 # RPC URL env vars (read via os.getenv from keys.env). Public endpoints have
 # unbounded latency — production MUST use the operator's own nodes.

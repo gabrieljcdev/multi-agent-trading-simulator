@@ -19,6 +19,16 @@ from pathlib import Path
 # Ensure project root is on path
 sys.path.insert(0, str(Path(__file__).parent))
 
+# Load keys.env BEFORE importing anything that gates on env vars at module
+# load time (notably the agent registry — CrossChainArbAgent.is_available()
+# checks ARBITRUM_RPC_URL / BASE_RPC_URL / OPTIMISM_RPC_URL when the
+# coordinator inspects REGISTERED_AGENTS at startup). Other modules also
+# call load_dotenv lazily, but lazy is too late for the coordinator's
+# initial availability sweep — by then the agent has already been logged
+# as "unavailable" and skipped.
+from dotenv import load_dotenv as _load_dotenv     # noqa: E402
+_load_dotenv(Path(__file__).parent / "config" / "keys.env")
+
 from config import settings
 from database.db import init_db
 from database.queries import log_circuit_breaker

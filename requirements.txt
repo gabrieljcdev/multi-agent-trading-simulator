@@ -23,6 +23,10 @@ torch==2.2.1          # Required for transformers
 # Anthropic
 anthropic==0.21.3
 
+# Cross-chain arb — Web3 reads on Arbitrum / Base / Optimism. Lazy-imported
+# by execution/chains/*; agent stays OFFLINE when web3 isn't installed.
+web3==7.16.0
+
 # Terminal UI
 rich==13.7.1
 
