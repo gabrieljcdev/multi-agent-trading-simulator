@@ -541,6 +541,47 @@ class FundingArbTrade(Base):
     )
 
 
+class XChainObservation(Base):
+    """One row per cross-CHAIN arb evaluation by execution/crosschain_engine.py.
+
+    Logged whether or not the engine would have entered — would_entry tells
+    them apart and skip_reason carries the gate that blocked. Mirrors the
+    arb_trades / scalp_observations style: full cost breakdown so the edge
+    can be validated retrospectively (mean_net_edge, gas-blocked %, etc).
+
+    pnl columns intentionally absent — this is OBSERVATION MODE; positions
+    are never opened so there is no realised P&L to record here. Live mode
+    (XCHAIN_LIVE_ENABLED + XCHAIN_CAPITAL>0) is a separate later build.
+
+    TODO: new table — fresh init_db creates it; existing databases need
+    an Alembic migration.
+    """
+    __tablename__ = "xchain_observations"
+
+    id                = Column(Integer, primary_key=True)
+    timestamp         = Column(DateTime, default=datetime.utcnow, index=True)
+    symbol            = Column(String(20), nullable=False, index=True)
+    buy_chain         = Column(String(20), nullable=False)
+    sell_chain        = Column(String(20), nullable=False)
+    buy_venue         = Column(String(30))
+    sell_venue        = Column(String(30))
+    notional_usd      = Column(Float)
+    spread_bps        = Column(Float)
+    rt_fee_bps        = Column(Float)
+    gas_bps           = Column(Float)
+    slip_bps          = Column(Float)
+    bridge_bps        = Column(Float, default=0.0)
+    net_edge_bps      = Column(Float)
+    gas_breakeven_usd = Column(Float)
+    would_entry       = Column(Boolean, default=False, index=True)
+    skip_reason       = Column(String(160))
+    observation_only  = Column(Boolean, default=True)
+
+    __table_args__ = (
+        Index("ix_xchain_obs_lookup", "symbol", "timestamp"),
+    )
+
+
 class PortfolioSnapshot(Base):
     """Aggregated cross-agent state captured every PORTFOLIO_MONITOR_INTERVAL_SEC.
 

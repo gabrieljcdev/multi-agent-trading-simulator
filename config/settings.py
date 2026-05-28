@@ -796,6 +796,59 @@ SCALP_MIN_AVG_NET_BPS_FOR_LIVE_V2  = 0.5    # was 0
 SCALP_MAX_HOLD_EXIT_PCT_V2         = 0.25   # was 0.30
 SCALP_MIN_DIRECTIONAL_ACC_1M_V2    = 0.57   # was 0.55
 
+# ══════════════════════════════════════════════════════════════════════════════
+# CROSS-CHAIN ARB AGENT (agents/crosschain_agent.py + execution/crosschain_engine.py)
+# ══════════════════════════════════════════════════════════════════════════════
+# NON-ATOMIC, inventory-pre-positioned arb over the same asset priced
+# differently across L2s (Arbitrum / Base / Optimism for WETH-USDC). Distinct
+# from the cross-EXCHANGE arb in execution/arb_engine.py — do not confuse them.
+#
+# Ships in OBSERVATION MODE: XCHAIN_CAPITAL=0 logs every evaluation to the
+# xchain_observations table with the full cost breakdown, but never signs a
+# tx. XCHAIN_LIVE_ENABLED is a hard gate kept False until the observation log
+# confirms persistent positive net-edge (Gogol et al. 2024: L2 opps persist
+# 10–20 blocks); flipping it on without supplying web3 signing is still a
+# no-op — submit_swap raises NotImplementedError.
+#
+# Rationale: Öz et al. 2025 (arXiv:2501.17335) shows inventory arbs settle in
+# ~9s vs ~242s for bridged, winning 66.96% of the time. We pre-position, never
+# bridge mid-trade (XCHAIN_INVENTORY_DRIFT_PCT triggers the BalanceAgent to
+# CCTP/canonical-bridge during idle windows).
+XCHAIN_LIVE_ENABLED            = False  # test: False         (hard gate; keep False)
+XCHAIN_CAPITAL                 = 0.0    # test: 0, 100, 250   (0 = observation mode)
+XCHAIN_MIN_NET_EDGE_BPS        = 15.0   # test: 8, 12, 15, 20, 30
+XCHAIN_GAS_BUDGET_BPS          = 5.0    # test: 3, 5, 8       (gas-as-%-of-notional cap)
+XCHAIN_SLIPPAGE_TOLERANCE_BPS  = 10.0   # test: 5, 10, 20     (per-leg price impact tolerance)
+XCHAIN_MAX_POSITION_USD        = 50.0   # test: 25, 50, 100, 250
+XCHAIN_INVENTORY_DRIFT_PCT     = 0.20   # test: 0.10, 0.20, 0.30  (theta; rebalance trigger)
+XCHAIN_SCAN_INTERVAL_MS        = 2000   # test: 1000, 2000, 5000
+XCHAIN_DAILY_LOSS_HALT_USD     = 10.0   # test: 5, 10, 20
+XCHAIN_CONSECUTIVE_LOSS_HALT   = 5      # test: 3, 5
+XCHAIN_MAX_CONCURRENT          = 1      # test: 1, 2          (per-symbol scan concurrency cap)
+# Pool block staleness cap. An L2 opportunity that hasn't refreshed within this
+# many blocks is treated as not actionable (we cannot land a tx faster than
+# the data is going stale).
+XCHAIN_MAX_BLOCK_STALENESS     = 5      # test: 2, 5, 10
+XCHAIN_SYMBOLS                 = ["WETH-USDC"]                  # test: keep single pair first
+XCHAIN_CHAINS                  = ["arbitrum", "base", "optimism"]
+# Per-chain venue + pool. fee_bps is also pulled from the pool at runtime
+# (the math never trusts this number) — the value here is the documented
+# tier so a misconfigured pool address fails loudly. pool_address is "<FILL>"
+# until the operator pins it; connectors treat that as "RPC unavailable"
+# and stay OFFLINE rather than read the wrong pool.
+XCHAIN_VENUES = {
+    "arbitrum": {"venue": "uniswap_v3", "pool_address": "<FILL>", "fee_bps": 5.0},
+    "base":     {"venue": "aerodrome",  "pool_address": "<FILL>", "fee_bps": 5.0},
+    "optimism": {"venue": "velodrome",  "pool_address": "<FILL>", "fee_bps": 5.0},
+}
+# RPC URL env vars (read via os.getenv from keys.env). Public endpoints have
+# unbounded latency — production MUST use the operator's own nodes.
+XCHAIN_RPC_ENV_VARS = {
+    "arbitrum": "ARBITRUM_RPC_URL",
+    "base":     "BASE_RPC_URL",
+    "optimism": "OPTIMISM_RPC_URL",
+}
+
 # Portfolio-level circuit breakers — sit on TOP of per-agent breakers.
 # Per-agent CBs (in settings.CIRCUIT_BREAKERS) fire first; these catch
 # the case where every agent drifts just under its own limit but together

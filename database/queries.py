@@ -16,6 +16,7 @@ from .models import (
     DataLog,
     MacroLog, CalendarEvent,
     ScalpObservationModel,
+    XChainObservation,
 )
 
 
@@ -1736,3 +1737,166 @@ def get_scalp_activation_readiness_v2() -> dict:
         max_hold=settings.SCALP_MAX_HOLD_EXIT_PCT_V2,
         min_dir=settings.SCALP_MIN_DIRECTIONAL_ACC_1M_V2,
     )
+
+
+# ── Cross-chain arb (observation logs) ──────────────────────
+
+def insert_xchain_observation(
+    *,
+    symbol:            str,
+    buy_chain:         str,
+    sell_chain:        str,
+    buy_venue:         str,
+    sell_venue:        str,
+    notional_usd:      float,
+    spread_bps:        float,
+    rt_fee_bps:        float,
+    gas_bps:           float,
+    slip_bps:          float,
+    bridge_bps:        float,
+    net_edge_bps:      float,
+    gas_breakeven_usd: float,
+    would_entry:       bool,
+    skip_reason:       str = "",
+    observation_only:  bool = True,
+) -> int:
+    """Persist one cross-chain arb evaluation and return its new row id.
+
+    Mirrors log_arb_trade in shape: one row per evaluation, would_entry
+    distinguishes the candidates that cleared every gate from the skips.
+    Synchronous on purpose — matches every other query helper; the engine
+    can call this from asyncio.to_thread if it wants.
+    """
+    with get_session() as s:
+        row = XChainObservation(
+            symbol=symbol,
+            buy_chain=buy_chain,
+            sell_chain=sell_chain,
+            buy_venue=buy_venue,
+            sell_venue=sell_venue,
+            notional_usd=notional_usd,
+            spread_bps=spread_bps,
+            rt_fee_bps=rt_fee_bps,
+            gas_bps=gas_bps,
+            slip_bps=slip_bps,
+            bridge_bps=bridge_bps,
+            net_edge_bps=net_edge_bps,
+            gas_breakeven_usd=gas_breakeven_usd,
+            would_entry=would_entry,
+            skip_reason=skip_reason,
+            observation_only=observation_only,
+        )
+        s.add(row)
+        s.flush()
+        return row.id
+
+
+def get_xchain_summary(days: int = 7) -> dict:
+    """Aggregate metrics across the last `days` of cross-chain observations.
+
+    Keys: n_obs, n_would_entry, mean_net_edge_bps, median_net_edge_bps,
+    best_pair (str like "arbitrum→base"), pct_blocked_by_gas,
+    pct_blocked_by_min_edge. Returns zeros when the table is empty so
+    callers don't carry the empty-case dance.
+    """
+    since = datetime.utcnow() - timedelta(days=days)
+    out = {
+        "n_obs":                   0,
+        "n_would_entry":           0,
+        "mean_net_edge_bps":       0.0,
+        "median_net_edge_bps":     0.0,
+        "best_pair":               None,
+        "pct_blocked_by_gas":      0.0,
+        "pct_blocked_by_min_edge": 0.0,
+    }
+    with get_session() as s:
+        rows = (
+            s.query(XChainObservation)
+            .filter(XChainObservation.timestamp >= since)
+            .all()
+        )
+    if not rows:
+        return out
+
+    out["n_obs"] = len(rows)
+    entries = [r for r in rows if r.would_entry]
+    out["n_would_entry"] = len(entries)
+
+    edges = [r.net_edge_bps for r in rows if r.net_edge_bps is not None]
+    if edges:
+        out["mean_net_edge_bps"] = sum(edges) / len(edges)
+        srt = sorted(edges)
+        mid = len(srt) // 2
+        out["median_net_edge_bps"] = (
+            srt[mid] if len(srt) % 2 == 1 else (srt[mid - 1] + srt[mid]) / 2
+        )
+
+    # best_pair: directional buy→sell with the highest mean net edge,
+    # computed only over rows that cleared the would_entry gate so the
+    # pair ranking reflects realised opportunity not raw signal.
+    from collections import defaultdict
+    pair_acc: dict[str, list[float]] = defaultdict(list)
+    for r in entries:
+        if r.net_edge_bps is None:
+            continue
+        pair_acc[f"{r.buy_chain}→{r.sell_chain}"].append(r.net_edge_bps)
+    if pair_acc:
+        out["best_pair"] = max(
+            pair_acc.items(), key=lambda kv: sum(kv[1]) / len(kv[1]),
+        )[0]
+
+    # Skip-reason breakdown — the two failure modes the operator most needs
+    # to see. Anything with "gas" in the reason is gas-blocked; anything
+    # mentioning the min-edge gate is min-edge-blocked.
+    n = len(rows)
+    gas_blocked = sum(
+        1 for r in rows
+        if r.skip_reason and "gas" in r.skip_reason.lower()
+    )
+    edge_blocked = sum(
+        1 for r in rows
+        if r.skip_reason and "min_edge" in r.skip_reason.lower()
+    )
+    out["pct_blocked_by_gas"]      = gas_blocked  / n * 100.0
+    out["pct_blocked_by_min_edge"] = edge_blocked / n * 100.0
+    return out
+
+
+def get_xchain_observations(
+    symbol: Optional[str] = None,
+    would_entry_only: bool = False,
+    limit: int = 500,
+) -> list:
+    """Newest-first XChainObservation rows as plain dicts. Used by the
+    crosschain agent's inventory-target weighting + the dashboard."""
+    with get_session() as s:
+        q = s.query(XChainObservation)
+        if symbol:
+            q = q.filter(XChainObservation.symbol == symbol)
+        if would_entry_only:
+            q = q.filter(XChainObservation.would_entry.is_(True))
+        rows = (
+            q.order_by(desc(XChainObservation.timestamp))
+            .limit(limit)
+            .all()
+        )
+    return [
+        {
+            "id": r.id, "timestamp": r.timestamp,
+            "symbol": r.symbol,
+            "buy_chain": r.buy_chain, "sell_chain": r.sell_chain,
+            "buy_venue": r.buy_venue, "sell_venue": r.sell_venue,
+            "notional_usd": r.notional_usd,
+            "spread_bps": r.spread_bps,
+            "rt_fee_bps": r.rt_fee_bps,
+            "gas_bps": r.gas_bps,
+            "slip_bps": r.slip_bps,
+            "bridge_bps": r.bridge_bps,
+            "net_edge_bps": r.net_edge_bps,
+            "gas_breakeven_usd": r.gas_breakeven_usd,
+            "would_entry": r.would_entry,
+            "skip_reason": r.skip_reason,
+            "observation_only": r.observation_only,
+        }
+        for r in rows
+    ]

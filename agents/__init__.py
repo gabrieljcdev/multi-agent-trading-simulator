@@ -357,12 +357,14 @@ class OnChainAgentPlaceholder(PlaceholderAgent):
 # ─────────────────────────────────────────────────────────────────────────
 
 from agents.scalping_agent import ScalpingAgent
+from agents.crosschain_agent import CrossChainArbAgent
 
 
 REGISTERED_AGENTS: list[BaseAgent] = [
     SignalAgentWrapper(),
     ArbAgentWrapper(),
     ScalpingAgent(),
+    CrossChainArbAgent(),
     MacroAgentPlaceholder(),
     SentimentAgentPlaceholder(),
     OnChainAgentPlaceholder(),
@@ -377,6 +379,7 @@ __all__ = [
     "SignalAgentWrapper",
     "ArbAgentWrapper",
     "ScalpingAgent",
+    "CrossChainArbAgent",
     "MacroAgentPlaceholder",
     "SentimentAgentPlaceholder",
     "OnChainAgentPlaceholder",
