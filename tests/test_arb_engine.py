@@ -654,3 +654,97 @@ def test_funding_arb_circuit_breaker_zero_alloc_noop(monkeypatch):
     engine = FundingRateArbEngine(sim_mode=True)
     engine._daily_pnl_usd = -1_000_000.0
     assert engine._cb_triggered() is False  # never halts on % rule with 0 alloc
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# FundingRateArbEngine — de-island wiring (capital allocation + breaker)
+# ─────────────────────────────────────────────────────────────────────────
+
+def test_funding_arb_initial_allocation_from_fund_constant(monkeypatch):
+    """Fresh engine reads its starting allocation from FUND_ARB_CAPITAL —
+    mirrors ArbEngine.__init__'s wiring so BalanceAgent compounding can
+    raise it from a known baseline."""
+    monkeypatch.setattr(settings, "FUND_ARB_CAPITAL", 750.0)
+    engine = FundingRateArbEngine(sim_mode=True)
+    assert engine._capital_allocation == 750.0
+
+
+def test_funding_arb_set_capital_allocation_changes_field():
+    """The engine-only set_capital_allocation setter writes
+    _capital_allocation directly — FundingRateArbEngine has no agent
+    wrapper in REGISTERED_AGENTS, so the setter is exposed on the engine."""
+    engine = FundingRateArbEngine(sim_mode=True)
+    engine.set_capital_allocation(1234.0)
+    assert engine._capital_allocation == 1234.0
+    # Non-numeric is ignored (logger.debug, no raise).
+    engine.set_capital_allocation("not-a-number")  # type: ignore[arg-type]
+    assert engine._capital_allocation == 1234.0
+    # Negative clamps to 0 — never let the breaker reason about a negative
+    # denominator.
+    engine.set_capital_allocation(-50.0)
+    assert engine._capital_allocation == 0.0
+
+
+def test_funding_arb_breaker_scales_with_live_allocation(monkeypatch):
+    """Doubling the live allocation doubles the tolerated USD loss.
+
+    The breaker reads _capital_allocation (set by the setter), NOT the
+    settings constant — so a runtime allocation change takes effect on
+    the very next tick.
+    """
+    monkeypatch.setattr(settings, "FUND_ARB_CAPITAL", 500.0)
+    engine = FundingRateArbEngine(sim_mode=True)
+
+    pct = settings.ARB_FUNDING_DAILY_LOSS_HALT_PCT / 100.0
+    halt_at_500 = pct * 500.0
+    # At allocation $500, a $halt_at_500 + 1¢ loss trips.
+    engine._daily_pnl_usd = -(halt_at_500 + 0.01)
+    assert engine._cb_triggered() is True
+
+    # Double the allocation via the setter — the same loss is no longer
+    # at the halt threshold; the % rule scales with allocation.
+    engine.set_capital_allocation(1000.0)
+    halt_at_1000 = pct * 1000.0
+    assert engine._cb_triggered() is False, (
+        f"daily_pnl={engine._daily_pnl_usd} should be inside the $1000-alloc band "
+        f"(halt at -${halt_at_1000:.2f})"
+    )
+    # Push the loss to the new halt to confirm the breaker still trips.
+    engine._daily_pnl_usd = -(halt_at_1000 + 0.01)
+    assert engine._cb_triggered() is True
+
+
+def test_funding_arb_breaker_zero_allocation_no_divide_by_zero():
+    """A 0-allocation engine never halts on the % rule and never raises
+    a ZeroDivisionError. Mirrors the existing ArbEngine zero-alloc guard."""
+    engine = FundingRateArbEngine(sim_mode=True)
+    engine.set_capital_allocation(0.0)
+    engine._daily_pnl_usd = -1_000_000.0
+    # No raise, no halt on % rule.
+    assert engine._cb_triggered() is False
+
+
+def test_funding_arb_fund_claim_visible_to_balance_agent(monkeypatch):
+    """FundingRateArbEngine lives inside the 'arb' fund. The BalanceAgent
+    sees its capital through the same InventoryState.effective_balance
+    lookup the rest of the arb fund uses — no separate claim is registered
+    for the funding engine (it's a sub-engine of the arb fund), so an arb
+    claim flips effective_balance for both ArbEngine and FundingRateArbEngine.
+    """
+    from agents.balance.inventory_state import inventory_state
+    inventory_state.reset()
+
+    monkeypatch.setattr(settings, "EXCHANGE_BALANCES", {"bybit": 1000.0})
+    # Apply an arb-fund claim on bybit — what BalanceAgent does after a
+    # policy.compute_targets cycle.
+    inventory_state.apply_allocation("arb", "bybit", "USDT", 400.0)
+
+    # Now effective_balance for the arb fund (which this engine is part of)
+    # reflects the registered claim.
+    assert inventory_state.effective_balance("arb", "bybit", "USDT") == 400.0
+    # And the engine itself can carry that allocation on its own field too.
+    engine = FundingRateArbEngine(sim_mode=True)
+    engine.set_capital_allocation(400.0)
+    assert engine._capital_allocation == 400.0
+
+    inventory_state.reset()

@@ -331,6 +331,110 @@ def test_circuit_breaker_not_triggered_at_baseline():
 
 
 # ─────────────────────────────────────────────────────────────────────────
+# De-island wiring — set_capital_allocation + breaker reads live field
+# ─────────────────────────────────────────────────────────────────────────
+
+def test_xchain_initial_allocation_from_settings(monkeypatch):
+    """Engine initialises _capital_allocation from XCHAIN_CAPITAL so the
+    breaker has a starting denominator that matches the configured pool."""
+    monkeypatch.setattr(settings, "XCHAIN_CAPITAL", 250.0)
+    engine = CrossChainArbEngine(connectors=[
+        _StubConnector("arbitrum", _state("arbitrum")),
+        _StubConnector("base",     _state("base")),
+    ])
+    assert engine._capital_allocation == 250.0
+
+
+def test_xchain_set_capital_allocation_changes_field():
+    """The setter writes the live field so the breaker picks up runtime
+    changes immediately — no engine restart required."""
+    engine = CrossChainArbEngine(connectors=[
+        _StubConnector("arbitrum", _state("arbitrum")),
+        _StubConnector("base",     _state("base")),
+    ])
+    engine.set_capital_allocation(800.0)
+    assert engine._capital_allocation == 800.0
+    # Non-numeric → no raise, value unchanged.
+    engine.set_capital_allocation("nope")  # type: ignore[arg-type]
+    assert engine._capital_allocation == 800.0
+    # Negative clamps to 0.
+    engine.set_capital_allocation(-1.0)
+    assert engine._capital_allocation == 0.0
+
+
+def test_xchain_breaker_reads_live_allocation(monkeypatch):
+    """Setting allocation via the setter flips the breaker math without
+    needing to re-monkeypatch settings.XCHAIN_CAPITAL. Doubling the live
+    alloc doubles the tolerated USD loss."""
+    monkeypatch.setattr(settings, "XCHAIN_CAPITAL", 0.0)
+    engine = CrossChainArbEngine(connectors=[
+        _StubConnector("arbitrum", _state("arbitrum")),
+        _StubConnector("base",     _state("base")),
+    ])
+    # Start in observation mode → % rule is a no-op even for a massive loss.
+    engine.cb.daily_pnl_usd = -1_000_000.0
+    assert engine._cb_triggered() is False
+
+    # Raise allocation at runtime → % rule re-engages on the next call.
+    engine.set_capital_allocation(500.0)
+    halt_at_500 = (settings.XCHAIN_DAILY_LOSS_HALT_PCT / 100.0) * 500.0
+    engine.cb.daily_pnl_usd = -(halt_at_500 + 0.01)
+    assert engine._cb_triggered() is True
+    assert "daily_loss" in engine.cb.halt_reason
+
+
+def test_xchain_does_not_register_cex_fund_claim(monkeypatch):
+    """CrossChainArbEngine capital is on-chain inventory across L2s — NOT
+    a CEX fund. Setting its allocation must NOT add an InventoryState
+    claim under any CEX fund id (signal/arb/mexc_scalp); otherwise the
+    BalanceAgent's CEX rebalance loop would double-count xchain capital.
+    """
+    from agents.balance.inventory_state import inventory_state
+    inventory_state.reset()
+
+    monkeypatch.setattr(settings, "XCHAIN_CAPITAL", 0.0)
+    engine = CrossChainArbEngine(connectors=[
+        _StubConnector("arbitrum", _state("arbitrum")),
+        _StubConnector("base",     _state("base")),
+    ])
+    engine.set_capital_allocation(500.0)
+
+    # No claim should have appeared for any CEX fund — the engine writes
+    # to its own _capital_allocation field only, never to InventoryState.
+    snapshot = inventory_state.get_snapshot()
+    assert snapshot["claims_by_fund"] == {}, (
+        "set_capital_allocation must not write CEX fund claims; xchain "
+        "rebalancing belongs to the cross-chain rail seam"
+    )
+    # And the engine's own field still carries the alloc.
+    assert engine._capital_allocation == 500.0
+
+    inventory_state.reset()
+
+
+def test_xchain_observation_behaviour_unchanged_under_zero_alloc(monkeypatch):
+    """With 0 allocation the engine still evaluates and persists observation
+    rows — observation mode is unchanged by the new wiring."""
+    monkeypatch.setattr(settings, "XCHAIN_CAPITAL", 0.0)
+    buy  = _state("arbitrum", spot=3000.0)
+    sell = _state("base",     spot=3050.0)
+    engine = CrossChainArbEngine(connectors=[
+        _StubConnector("arbitrum", buy),
+        _StubConnector("base",     sell),
+    ])
+    assert engine._capital_allocation == 0.0
+
+    inserted: list[dict] = []
+    fake_insert = MagicMock(side_effect=lambda **kw: inserted.append(kw) or len(inserted))
+    with patch("execution.crosschain_engine.db_queries.insert_xchain_observation",
+               fake_insert):
+        _run(engine._evaluate_symbol("WETH-USDC"))
+    # One observation written, flagged observation_only=True.
+    assert len(inserted) == 1
+    assert inserted[0]["observation_only"] is True
+
+
+# ─────────────────────────────────────────────────────────────────────────
 # (F) every evaluation writes exactly one xchain_observations row
 # ─────────────────────────────────────────────────────────────────────────
 

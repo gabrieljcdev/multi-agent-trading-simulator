@@ -853,6 +853,19 @@ class FundingRateArbEngine:
         self._consecutive_losses: int              = 0
         self._last_trade_time:    Optional[datetime] = None
 
+        # Live deployable capital — mirrors ArbEngine._capital_allocation
+        # (the BalanceAgent-set field that compounding pushes through). This
+        # engine lives inside the ARB fund (config/settings.py:259 — "passive
+        # rate reader inside the arb fund"), so its starting value is the arb
+        # fund constant. There is no FundingRateArb owning-agent wrapper in
+        # REGISTERED_AGENTS today; set_capital_allocation is exposed on the
+        # engine itself so future wiring (or a manual operator hook) can
+        # raise the leash as realised profit accumulates, and _cb_triggered
+        # reads this live field rather than the frozen constant.
+        self._capital_allocation: float = float(
+            getattr(settings, "FUND_ARB_CAPITAL", 0.0) or 0.0
+        )
+
     # ── Public API ──────────────────────────────────────────────────────
 
     async def start(self) -> None:
@@ -911,7 +924,24 @@ class FundingRateArbEngine:
             "total_trades":       self._total_trades,
             "consecutive_losses": self._consecutive_losses,
             "last_trade_time":    self._last_trade_time.isoformat() if self._last_trade_time else None,
+            "capital_allocation": self._capital_allocation,
         }
+
+    def set_capital_allocation(self, amount: float) -> None:
+        """Update the engine's deployable allocation. Engine-only setter —
+        FundingRateArbEngine has no agent wrapper in REGISTERED_AGENTS today
+        (instantiated only in tests), so unlike ArbAgentWrapper there is no
+        agent.set_capital_allocation propagation path. Callers (the future
+        wrapper, or an operator hook) write here directly. The %-based daily
+        loss breaker reads this field on every scan, so a raise here loosens
+        the leash without restarting the engine."""
+        try:
+            self._capital_allocation = max(0.0, float(amount))
+        except (TypeError, ValueError):
+            logger.debug(
+                "FundingRateArbEngine: set_capital_allocation ignored "
+                "non-numeric %r", amount,
+            )
 
     # ── Data layer ──────────────────────────────────────────────────────
 
@@ -966,10 +996,14 @@ class FundingRateArbEngine:
     # ── Circuit breakers ────────────────────────────────────────────────
 
     def _cb_triggered(self) -> bool:
-        # FundingRateArbEngine lives inside the arb fund — there's no
-        # per-engine allocation, so we measure the daily-loss halt against
-        # the arb fund constant. 0-allocation (test fixture, etc.) → no-op.
-        alloc = float(getattr(settings, "FUND_ARB_CAPITAL", 0.0) or 0.0)
+        # %-based daily-loss halt — scales with the engine's LIVE allocation
+        # so a compounding arb fund doesn't silently tighten its leash on
+        # the funding-rate sub-engine. Mirrors ArbEngine._cb_triggered's
+        # shape exactly: 0-alloc → no-op on this rule (never divide by zero,
+        # never halt a zero-capital engine on the % rule). The starting
+        # value is FUND_ARB_CAPITAL (set in __init__), and set_capital_allocation
+        # makes it live-mutable for future BalanceAgent wiring.
+        alloc = float(self._capital_allocation or 0.0)
         if alloc > 0:
             halt_usd = (float(settings.ARB_FUNDING_DAILY_LOSS_HALT_PCT) / 100.0) * alloc
             if self._daily_pnl_usd <= -halt_usd:

@@ -282,6 +282,21 @@ class CrossChainArbEngine:
         self._would_entries_today: int = 0
         self._last_scan_time:     Optional[datetime] = None
 
+        # Live deployable capital — initialised from XCHAIN_CAPITAL so a
+        # fresh launch sizes off the configured pool, and made settable via
+        # set_capital_allocation so the % daily-loss breaker reads a LIVE
+        # value rather than a frozen constant. NOTE: unlike ArbEngine, this
+        # is NOT a CEX fund — it represents on-chain inventory across L2s.
+        # No InventoryState CEX fund claim is registered for it; the
+        # CEX rebalance loop never sees this capital. Compounding /
+        # rebalancing of cross-chain inventory belongs to the future
+        # CrossChainTransferRail, which will consume get_inventory_targets()
+        # (see agents/crosschain_agent.py:get_inventory_targets) — that is
+        # the seam where xchain rebalancing will land.
+        self._capital_allocation: float = float(
+            getattr(settings, "XCHAIN_CAPITAL", 0.0) or 0.0
+        )
+
     # ── Public API ──────────────────────────────────────────────────────
 
     async def start(self) -> None:
@@ -303,7 +318,7 @@ class CrossChainArbEngine:
             "CrossChainArbEngine: %d connectors ready (%s) — %s mode",
             len(self.connectors),
             ", ".join(c.connector_id for c in self.connectors),
-            "OBSERVATION" if settings.XCHAIN_CAPITAL == 0 else "EXECUTION-PENDING",
+            "OBSERVATION" if self._capital_allocation == 0 else "EXECUTION-PENDING",
         )
         self._scan_task  = asyncio.create_task(self._scan_loop())
         self._reset_task = asyncio.create_task(self._daily_reset_loop())
@@ -326,7 +341,7 @@ class CrossChainArbEngine:
         try:
             db_queries.log_circuit_breaker(
                 reason="xchain_kill",
-                detail=(f"observation_mode={settings.XCHAIN_CAPITAL == 0}, "
+                detail=(f"observation_mode={self._capital_allocation == 0}, "
                         f"daily_pnl=${self.cb.daily_pnl_usd:.2f}"),
             )
         except Exception:
@@ -349,7 +364,26 @@ class CrossChainArbEngine:
             "last_scan_time": (
                 self._last_scan_time.isoformat() if self._last_scan_time else None
             ),
+            "capital_allocation":  self._capital_allocation,
         }
+
+    def set_capital_allocation(self, amount: float) -> None:
+        """Update the engine's live deployable allocation.
+
+        Cross-chain capital is on-chain inventory — this setter intentionally
+        does NOT register a CEX fund claim in InventoryState (the BalanceAgent's
+        CEX rebalance loop would double-count it). It only updates the breaker's
+        denominator and the observation-mode label. xchain rebalancing /
+        compounding belongs to the future CrossChainTransferRail (which will
+        consume agents.crosschain_agent.CrossChainArbAgent.get_inventory_targets).
+        """
+        try:
+            self._capital_allocation = max(0.0, float(amount))
+        except (TypeError, ValueError):
+            logger.debug(
+                "CrossChainArbEngine: set_capital_allocation ignored "
+                "non-numeric %r", amount,
+            )
 
     # ── Scan loop ───────────────────────────────────────────────────────
 
@@ -565,8 +599,10 @@ class CrossChainArbEngine:
         """Write one xchain_observations row. Never let a DB hiccup take
         down the scan loop — mirrors arb_engine._log_to_db discipline.
 
-        observation_only is True whenever XCHAIN_CAPITAL is 0 (the live
-        build will pass False when an actual position is opened).
+        observation_only is True whenever the engine's live capital allocation
+        is 0 (the live build will pass False when an actual position is opened).
+        Reads _capital_allocation rather than the frozen settings constant so a
+        runtime allocation change flips the persisted flag accurately.
         """
         try:
             db_queries.insert_xchain_observation(
@@ -585,7 +621,7 @@ class CrossChainArbEngine:
                 gas_breakeven_usd=e.gas_breakeven_usd,
                 would_entry=e.would_entry,
                 skip_reason=e.skip_reason,
-                observation_only=(settings.XCHAIN_CAPITAL == 0),
+                observation_only=(self._capital_allocation == 0),
             )
         except Exception as exc:
             logger.debug("insert_xchain_observation: %s", exc)
@@ -595,10 +631,11 @@ class CrossChainArbEngine:
     def _cb_triggered(self) -> bool:
         if self.cb.halted:
             return True
-        # %-based: scale the daily-loss halt to XCHAIN_CAPITAL so a
-        # compounding fund doesn't tighten its leash silently. Observation
-        # mode (XCHAIN_CAPITAL=0) → halt is a no-op on this rule.
-        alloc = float(getattr(settings, "XCHAIN_CAPITAL", 0.0) or 0.0)
+        # %-based: scale the daily-loss halt to the LIVE allocation so a
+        # runtime change (set_capital_allocation) takes effect immediately,
+        # and a compounding fund doesn't tighten its leash silently.
+        # Observation mode (alloc=0) → halt is a no-op on this rule.
+        alloc = float(self._capital_allocation or 0.0)
         if alloc > 0:
             halt_usd = (float(settings.XCHAIN_DAILY_LOSS_HALT_PCT) / 100.0) * alloc
             if self.cb.daily_pnl_usd <= -halt_usd:
