@@ -84,12 +84,20 @@ SESSION_MIN_ACTIVE_PAIRS     = 2      # Need at least N viable pairs
 # ══════════════════════════════════════════════════════════════════════════════
 
 # Simulated per-venue cash ledger (sim mode). Spans every venue the funds
-# touch and sums to STARTING_CAPITAL ($1,100) so the fund allocations are
-# fully backed in sim. NOTE: this is a per-venue ledger, NOT a per-fund one
-# — funds share venues (MEXC backs the scalp fund and is also an arb venue).
-# Per-fund sizing lives with each agent (e.g. OrderRouter sizes the signal
-# agent off FUND_SIGNAL_CAPITAL, not this sum), so a bigger ledger never
-# lets one fund risk beyond its own allocation.
+# touch. NOTE: this is a per-venue ledger, NOT a per-fund one — funds share
+# venues (MEXC backs the scalp + mexc-arb funds and is also a general arb
+# venue). Per-fund sizing lives with each agent (e.g. OrderRouter sizes the
+# signal agent off FUND_SIGNAL_CAPITAL, not this sum), so a bigger ledger
+# never lets one fund risk beyond its own allocation.
+#
+# FLAG (5k-soak reset): the dict below still sums to 1100 from the prior
+# soak baseline, but STARTING_CAPITAL is now 5000 (sum(FUND_*) 4600 + 400
+# reserve). The `sum(EXCHANGE_BALANCES) == STARTING_CAPITAL` invariant
+# enforced by tests/test_funds.py::
+# test_sim_balance_ledger_sums_to_starting_capital_and_includes_mexc is
+# therefore broken on disk — re-allocating the ledger to back the new
+# fund layout (signal venues, arb venues, MEXC for both MEXC pools) is
+# a separate edit, out of scope for the 5k-fund settings reset.
 EXCHANGE_BALANCES = {
     "binance":    0.0,
     "kraken":   100.0,   # signal + arb
@@ -224,7 +232,7 @@ ARB_MIN_LIQUIDITY_MULT   = 2.0
 
 # Dedicated arb engine
 ARB_SCAN_INTERVAL_MS      = 500       # test: 250–2000
-ARB_BASE_POSITION_USD     = 25.0      # test: 10.0–50.0  (base for gap-proportional sizing)
+ARB_BASE_POSITION_USD     = 60.0      # test: 10.0–80.0  (base for gap-proportional sizing; ~3% of FUND_ARB_CAPITAL=2000)
 ARB_SIZE_MULTIPLIER_CAP   = 4.0       # test: 2.0–6.0    (max gap/threshold scale-up)
 ARB_MIN_LIQUIDITY_USD     = 500.0     # test: 250–2000   (sum of top 3 book levels)
 ARB_MAX_CONCURRENT        = 3         # test: 1–5
@@ -568,25 +576,30 @@ PREDICTIVE_PENALTY_WEAK         = 15
 # ══════════════════════════════════════════════════════════════════════════════
 
 # ── Ring-fenced fund architecture ───────────────────────────────────────
-# Three funds, each an independent capital pool mapped 1:1 to an agent.
+# Ring-fenced funds, each an independent capital pool mapped 1:1 to an agent.
 # Exchanges may be SHARED across funds, but capital is NEVER shared: a loss
 # in one fund cannot draw from another, profits stay in their own fund, and
-# circuit breakers are per-fund. MEXC is shared — the MEXC-scalp fund trades
-# it, and the main arb fund uses it as one venue — but the $100 MEXC-scalp
-# pool stays ring-fenced from the main portfolio.
-FUND_SIGNAL_CAPITAL     = 0.0     # signal agent — binance/bybit/kraken
-FUND_ARB_CAPITAL        = 600.0   # arb agent — kraken/bybit/bitget/mexc/... (MEXC folded in)
-FUND_MEXC_SCALP_CAPITAL = 500.0   # scalping, MEXC only (observation until SCALP_CAPITAL>0)
+# circuit breakers are per-fund. MEXC is shared between MEXC-scalp and MEXC-arb
+# (un-mitigated counterparty risk → both pools stay capped per
+# build_balance_agent.md). XCHAIN + FUNDING stay observation-only this soak.
+FUND_SIGNAL_CAPITAL     = 1600.0  # test: 0–3000  signal agent — binance/bybit/kraken
+FUND_ARB_CAPITAL        = 2000.0  # test: 0–4000  cross-exchange arb — kraken/bybit/bitget/bitstamp/gateio/bitfinex
+FUND_MEXC_SCALP_CAPITAL = 500.0   # test: 0–1000  scalping, MEXC only (observation until SCALP_CAPITAL>0)
+FUND_MEXC_ARB_CAPITAL   = 500.0   # test: 0–1000  MEXC-only arb (counterparty-capped; un-wired until soak data justifies a dedicated agent)
+FUND_XCHAIN_CAPITAL     = 0.0     # test: 0       observation-only this soak — see XCHAIN_CAPITAL (line ~932)
+FUND_FUNDING_CAPITAL    = 0.0     # test: 0       observation-only this soak — see FUNDING_CAPITAL_USD (line ~264)
 
 # Per-fund daily-loss halt: each fund halts independently at this % of its
 # OWN size. Enforced by Coordinator._check_fund_circuit_breakers, alongside
 # the portfolio CB.
 FUND_DAILY_LOSS_HALT_PCT = 10.0   # test: 5–20
 
-# Total starting equity for the portfolio — the sum of all funds. Drives
-# CircuitBreakerState baseline + falls back as initial value when the DB
-# has no prior portfolio_snapshot (see core/bot.py startup). Reference only.
-STARTING_CAPITAL     = 1100.0    # test: 200–10000   (= sum of FUND_* above)
+# Total starting equity for the portfolio — sum of all FUND_* + uncommitted
+# reserve. Drives CircuitBreakerState baseline + falls back as initial value
+# when the DB has no prior portfolio_snapshot (see core/bot.py startup).
+# Reserve = STARTING_CAPITAL - sum(FUND_*) = 400 (8%) held out of deployed
+# pool; COMPOUND_RESERVE_PCT logic will absorb this once BalanceAgent ships.
+STARTING_CAPITAL     = 5000.0    # test: 200–10000   (sum(FUND_*) = 4600; +400 reserve)
 
 # Legacy aliases — existing code/tests read these names. Pointed at the
 # fund constants so there is a single source of truth for each pool.
@@ -812,7 +825,7 @@ SCALP_STALE_MID_THRESHOLD_SEC = 60 # test: 30-180    (skip entry if a symbol's m
 SCALP_MAX_HOLD_SEC        = 180    # test: 60-300    (force exit after N seconds)
 SCALP_SCAN_INTERVAL_MS    = 100    # test: 50-500    (main loop interval ms)
 SCALP_MAX_CONCURRENT      = 2      # test: 1-3       (max open scalp positions)
-SCALP_POSITION_SIZE_USD   = 50.0   # test: 10-50     (per-trade size USD)
+SCALP_POSITION_SIZE_USD   = 20.0   # test: 10-50     (per-trade size USD; ~3% of FUND_MEXC_SCALP_CAPITAL=500 baseline)
 
 # Circuit breakers
 SCALP_DAILY_LOSS_HALT_PCT = 3.0    # test: 1-5       (% of scalp fund allocation; was abs USD)
