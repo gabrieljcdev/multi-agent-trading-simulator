@@ -181,12 +181,16 @@
         <h2>Live Arb Feed</h2><div class="scroll" id="arbFeed"></div>
       </div>
 
-      <div class="card" style="margin-bottom:10px">
-        <h2>Balance Agent
-          <button id="rebalanceArmBtn" style="float:right;font-size:11px">Rebalance…</button>
-        </h2>
-        <div id="balancePanel"></div>
-      </div>
+      <!-- Web UI v2 dedicated agent panels — replace the v1 generic-card
+           render for arb / xchain / funding_arb / balance. -->
+      <div class="card" style="margin-bottom:10px"><h2>Arb Fund</h2>
+        <div id="arbFundPanel"></div></div>
+      <div class="card" style="margin-bottom:10px"><h2>Cross-Chain Arb</h2>
+        <div id="xchainPanel"></div></div>
+      <div class="card" style="margin-bottom:10px"><h2>Funding Rate Arb</h2>
+        <div id="fundingPanel"></div></div>
+      <div class="card" style="margin-bottom:10px"><h2>Balance Agent</h2>
+        <div id="balancePanel"></div></div>
 
       <div class="card">
         <h2>Session P&amp;L</h2><div class="sessions" id="sessions"></div>
@@ -257,12 +261,14 @@ const $ = (id) => document.getElementById(id);
 let STATE = {};
 let logFilter = "ALL";
 
-const AGENT_ORDER = ["signal","arb","scalp","macro","sentiment_agent","onchain"];
+// Web UI v2 — generic agent grid renders only the agents that DON'T own
+// a dedicated panel. signal + scalp keep the generic card; arb, xchain,
+// funding_arb, and balance each get their own panel below.
+const AGENT_ORDER = ["signal","scalp"];
 const AGENT_NAME = {
   signal:"Signal Agent", arb:"Arb Agent", scalp:"Scalp Agent",
-  macro:"Macro Agent", sentiment_agent:"Sentiment Agent", onchain:"On-Chain Agent",
+  xchain:"Cross-Chain Agent", funding_arb:"Funding-Rate Arb", balance:"Balance Agent",
 };
-const PLACEHOLDER_AGENTS = ["macro","sentiment_agent","onchain"];
 const SESSION_KEYS = ["LONDON","NEW_YORK","ASIA","OFF_HOURS"];
 const SESSION_TZ = {
   LONDON:["Europe/London","LON"], NEW_YORK:["America/New_York","NYC"],
@@ -327,52 +333,55 @@ function wireKill(btn){
 }
 wireKill($("killBtn")); wireKill($("killBtn2"));
 
-/* Rebalance — two-step arm → confirm mirroring /action/kill UX.
-   First click POSTs {action:"arm"}, receives a token + ring-fence notice
-   and a 3s window. Second click within the window POSTs
-   {action:"confirm", token}. Outside the window the button auto-resets. */
-let rebalanceArmTimer = null;
-let rebalanceToken = null;
-(function wireRebalance(){
-  const btn = $("rebalanceArmBtn");
-  if(!btn) return;
-  btn.onclick = async () => {
-    if(btn.classList.contains("armed") && rebalanceToken){
-      clearTimeout(rebalanceArmTimer);
-      btn.classList.remove("armed");
-      btn.textContent = btn.dataset.label || "Rebalance…";
-      const tok = rebalanceToken; rebalanceToken = null;
-      try{
-        await fetch("/action/rebalance", {
-          method:"POST", headers:{"Content-Type":"application/json"},
-          body: JSON.stringify({action:"confirm", token:tok})
-        });
-      }catch(e){}
-    }else{
-      btn.dataset.label = btn.textContent;
-      try{
-        const r = await fetch("/action/rebalance", {
-          method:"POST", headers:{"Content-Type":"application/json"},
-          body: JSON.stringify({action:"arm"})
-        });
-        const d = await r.json();
-        if(!d.ok){ btn.textContent = "Error"; return; }
-        rebalanceToken = d.token;
-        const rf = d.ring_fence || {};
-        const warn = rf.mexc_warning ? " ⚠ " + rf.mexc_warning : "";
-        btn.classList.add("armed");
-        btn.textContent = "Confirm?" + warn;
-        rebalanceArmTimer = setTimeout(() => {
-          btn.classList.remove("armed");
-          btn.textContent = btn.dataset.label;
-          rebalanceToken = null;
-        }, 3000);
-      }catch(e){
-        btn.textContent = "Error";
-      }
-    }
-  };
-})();
+/* Rebalance — Web UI v2 three-action arm → confirm → cancel flow.
+   The buttons live INSIDE balancePanelHtml; this module-level state
+   tracks the most recent error so the panel can render it under the
+   button block on the next push without losing it. */
+let rebalanceLastError = null;          // set on POST {action:"confirm"} → {ok:false}
+let rebalanceClickLock = false;         // disables Arm/Confirm/Cancel until next push
+
+async function rebalancePost(action, token){
+  const body = token ? {action, confirm_token: token} : {action};
+  try{
+    const r = await fetch("/action/rebalance", {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify(body),
+    });
+    return await r.json();
+  }catch(e){
+    return {ok:false, error:String(e)};
+  }
+}
+
+async function rebalanceArm(){
+  if(rebalanceClickLock) return;
+  rebalanceClickLock = true;
+  rebalanceLastError = null;
+  const d = await rebalancePost("arm");
+  if(!d.ok){
+    rebalanceLastError = d.error || "arm_failed";
+  }
+  // Lock releases on the next snapshot push (renderBalance reads
+  // pending_plan.confirm_token to determine button state).
+}
+
+async function rebalanceConfirm(token){
+  if(rebalanceClickLock || !token) return;
+  rebalanceClickLock = true;
+  const d = await rebalancePost("confirm", token);
+  if(!d.ok){
+    rebalanceLastError = d.error || "confirm_failed";
+  }else{
+    rebalanceLastError = null;
+  }
+}
+
+async function rebalanceCancel(token){
+  if(rebalanceClickLock) return;
+  rebalanceClickLock = true;
+  rebalanceLastError = null;
+  await rebalancePost("cancel", token || "");
+}
 
 /* ---------- helpers ---------- */
 const fmtUsd = (v) => (v==null? "—" : (v<0?"-$":"$") + Math.abs(v).toFixed(2));
@@ -507,8 +516,15 @@ function updateUI(s){
   // live arb feed (dashboard)
   $("arbFeed").innerHTML = arbFeedHtml(s.arb_feed);
 
-  // balance panel
-  $("balancePanel").innerHTML = balancePanelHtml(s.balance);
+  // Web UI v2 — dedicated agent panels. Each render fn wraps its own
+  // try/catch so a single broken panel can't take the whole UI down.
+  safeRender("arbFundPanel", () => arbFundPanelHtml(s.arb, s.arb_feed, s.arb_history));
+  safeRender("xchainPanel",  () => xchainPanelHtml(s.xchain));
+  safeRender("fundingPanel", () => fundingPanelHtml(s.funding));
+  safeRender("balancePanel", () => balancePanelHtml(s.balance));
+  // Each panel completes its own render → release the per-panel click lock
+  // once we've received a snapshot reflecting the new server state.
+  rebalanceClickLock = false;
 
   // session P&L (clickable + local clocks)
   const sp = s.session_pnl || {};
@@ -619,49 +635,351 @@ function renderPending(pend){
   }
 }
 
-/* ---------- balance panel ---------- */
+/* ---------- Web UI v2 panel render helpers ---------- */
+function safeRender(elId, build){
+  const el = $(elId);
+  if(!el) return;
+  try{ el.innerHTML = build(); }
+  catch(e){
+    console.error("render", elId, e);
+    el.innerHTML = `<span class="muted">render error — see console</span>`;
+  }
+}
+function obsHeader(text, isObs){
+  const style = isObs ? ` style="opacity:.7"` : ``;
+  const badge = isObs ? ` <span class="tag warn">OBS</span>` : ``;
+  return `<div${style}>${text}${badge}</div>`;
+}
+function statRow(pairs){
+  // pairs: [[label, value], ...]; renders as a horizontal stat strip.
+  return `<div class="dim" style="margin-top:6px">` +
+    pairs.map(([k, v]) => `<b>${esc(k)}</b> ${v}`).join(" · ") + `</div>`;
+}
+
+/* ---------- arb fund panel ---------- */
+function arbFundPanelHtml(arb, arbFeed, arbHistory){
+  arb = arb || {};
+  const sem = arb.semaphore || {active:0, capacity:0};
+  const th  = arb.threshold || {};
+  const header = `<div><b>ARB FUND</b> · ` +
+    `min gap ${(th.min_net_gap_bps||0).toFixed(1)} bps ` +
+    `<span class="dim">(${esc(th.rationale||"—")})</span> · ` +
+    `${sem.active}/${sem.capacity} active</div>`;
+
+  const ex = arb.exchanges || [];
+  const exHtml = ex.length
+    ? `<table><thead><tr><th>venue</th><th>fee bps</th><th>up?</th><th>lat ms</th>` +
+      `<th>last book</th><th>errs 5m</th></tr></thead><tbody>` +
+      ex.map(x => {
+        const bad = !x.available || (x.errors_5m||0) >= 5;
+        return `<tr${bad?' style="color:var(--neg)"':''}>` +
+          `<td>${esc(x.id)}</td><td>${(x.fee_bps||0).toFixed(1)}</td>` +
+          `<td>${x.available?"✓":"✗"}</td><td>${x.latency_ms||0}</td>` +
+          `<td class="dim">${esc(x.last_book_ts||"—")}</td>` +
+          `<td>${x.errors_5m||0}</td></tr>`;
+      }).join("") + `</tbody></table>`
+    : `<span class="muted">Per-exchange health not surfaced — pending engine work</span>`;
+
+  const gd = arb.gap_distribution || {bucket_edges_bps:[], bucket_counts:[]};
+  const total = (gd.bucket_counts||[]).reduce((a,b)=>a+b, 0);
+  const histHtml = total > 0
+    ? gd.bucket_edges_bps.map((edge, i) => {
+        const c = gd.bucket_counts[i]||0;
+        const pct = c/total*100;
+        const next = gd.bucket_edges_bps[i+1];
+        const label = next!=null ? `${edge}-${next}` : `${edge}+`;
+        return `<div><span class="dim">${label} bps</span> ` +
+          `<div class="bar"><i style="width:${pct}%;background:var(--tx1)"></i></div></div>`;
+      }).join("")
+    : `<span class="muted">no fills yet today</span>`;
+  const histStats = `<div class="dim">median ${(gd.median_bps||0).toFixed(1)} bps · ` +
+    `p90 ${(gd.p90_bps||0).toFixed(1)} bps</div>`;
+
+  // Recent fills — reuse the existing arbFeedHtml so styles stay aligned.
+  const fillsRows = (arbFeed||[]).slice(0,10);
+  const fillsHtml = fillsRows.length
+    ? arbFeedHtml(fillsRows)
+    : `<span class="muted">no recent arb fills</span>`;
+
+  // Today summary from arb_history (existing aggregate).
+  const ah = arbHistory||[];
+  const netPnl = ah.reduce((a,x)=>a+(x.net_pnl||0),0);
+  const winRate = ah.length ? (ah.filter(x => (x.net_pnl||0) > 0).length / ah.length * 100) : 0;
+  const summary = statRow([
+    ["opportunities", ah.length],
+    ["win rate",      `${winRate.toFixed(1)}%`],
+    ["net P&L",       `<span class="${cls(netPnl)}">${fmtUsd(netPnl)}</span>`],
+  ]);
+
+  return header +
+    `<div style="margin-top:6px">${exHtml}</div>` +
+    `<h2 class="dim" style="margin-top:8px">Gap distribution (today)</h2>` +
+    histHtml + histStats +
+    `<h2 class="dim" style="margin-top:8px">Recent fills</h2>` + fillsHtml +
+    summary;
+}
+
+/* ---------- cross-chain arb panel ---------- */
+function xchainPanelHtml(x){
+  x = x || {};
+  const isObs = (x.status === "OBSERVATION");
+  const bp = x.best_pair || {};
+  const edgeText = bp.net_edge_bps != null
+    ? `<span class="${cls(bp.net_edge_bps)}">${fmtBps(bp.net_edge_bps)}</span> ` +
+      `${esc(bp.buy_chain||"—")}→${esc(bp.sell_chain||"—")}`
+    : `<span class="muted">no edge yet</span>`;
+  const header = obsHeader(
+    `<b>XCHAIN</b> · ${esc(x.status||"OFFLINE")} · $${(x.capital_usd||0).toFixed(0)} · best edge: ${edgeText}`,
+    isObs,
+  );
+
+  const chains = x.chains||[];
+  const chainsHtml = chains.length
+    ? `<table><thead><tr><th>chain</th><th>venue</th><th>symbol</th><th>spot</th>` +
+      `<th>depth $1%</th><th>fee bps</th><th>block</th><th>s ago</th></tr></thead><tbody>` +
+      chains.map(c => {
+        const stale = (c.last_update_s_ago||0) > 30;
+        const style = stale ? ` style="opacity:.5"` : ``;
+        const sAgoCls = stale ? "neg" : "dim";
+        return `<tr${style}><td>${esc(c.id)}</td><td>${esc(c.venue)}</td>` +
+          `<td>${esc(c.symbol)}</td><td>${(c.spot_price||0).toFixed(2)}</td>` +
+          `<td>${fmtUsd(c.depth_usd_1pct)}</td><td>${(c.fee_bps||0).toFixed(1)}</td>` +
+          `<td class="dim">${c.block_number||"—"}</td>` +
+          `<td class="${sAgoCls}">${c.last_update_s_ago||0}s</td></tr>`;
+      }).join("") + `</tbody></table>`
+    : `<span class="muted">Per-chain live state not surfaced — pending engine work</span>`;
+
+  const tgts = x.inventory_targets||[];
+  const tgtsHtml = tgts.length
+    ? `<table><thead><tr><th>chain</th><th>asset</th><th>current</th><th>target</th>` +
+      `<th>drift %</th><th>rebal?</th></tr></thead><tbody>` +
+      tgts.map(t => {
+        const needs = !!t.needs_rebalance;
+        const style = needs ? ` style="background:rgba(232,168,48,.10)"` : ``;
+        return `<tr${style}><td>${esc(t.chain)}</td><td>${esc(t.asset||"USDT")}</td>` +
+          `<td>${fmtUsd(t.current_usd)}</td><td>${fmtUsd(t.target_usd)}</td>` +
+          `<td class="${cls(t.drift_pct)}">${fmtPct(t.drift_pct)}</td>` +
+          `<td>${needs?'<span class="tag warn">yes</span>':'<span class="dim">no</span>'}</td></tr>`;
+      }).join("") + `</tbody></table>`
+    : `<span class="muted">no inventory targets</span>`;
+
+  const ts = x.today_summary||{};
+  const summary = statRow([
+    ["obs",         ts.n_observations||0],
+    ["would-enter", ts.n_would_entry||0],
+    ["mean edge",   `${(ts.mean_net_edge_bps||0).toFixed(1)} bps`],
+    ["median",      `${(ts.median_net_edge_bps||0).toFixed(1)} bps`],
+    ["gas-blocked", `${(ts.pct_blocked_by_gas||0).toFixed(0)}%`],
+    ["edge-blocked",`${(ts.pct_blocked_by_min_edge||0).toFixed(0)}%`],
+  ]);
+
+  return header +
+    `<div style="margin-top:6px">${chainsHtml}</div>` +
+    `<h2 class="dim" style="margin-top:8px">Inventory targets</h2>` + tgtsHtml +
+    summary;
+}
+
+/* ---------- funding-rate arb panel ---------- */
+const STABLECOIN_BENCH_APR_FALLBACK = 5.0;
+const FUNDING_DELTA_FALLBACK_USD = 5.0;
+
+function fundingPanelHtml(f){
+  f = f || {};
+  const isObs = (f.status === "OBSERVATION");
+  const ts = f.today_summary || {};
+  const bApr = ts.blended_apr_pct || 0;
+  const bench = STABLECOIN_BENCH_APR_FALLBACK;
+  const aprCls = bApr >= bench ? "pos" : "dim";
+  const header = obsHeader(
+    `<b>FUNDING</b> · ${esc(f.status||"OFFLINE")} · $${(f.capital_usd||0).toFixed(0)} · ` +
+    `venue: ${esc(f.venue||"—")} · blended APR ` +
+    `<span class="${aprCls}">${bApr.toFixed(2)}%</span> · ` +
+    `utilisation ${(ts.utilisation_pct||0).toFixed(0)}%`,
+    isObs,
+  );
+
+  const syms = f.symbols||[];
+  const symsHtml = syms.length
+    ? `<table><thead><tr><th>symbol</th><th>spot</th><th>perp</th><th>basis bps</th>` +
+      `<th>rate</th><th>APR %</th><th>next</th><th>gate?</th></tr></thead><tbody>` +
+      syms.map(s => {
+        const stale = (s.last_update_s_ago||0) > 30;
+        const tint = s.above_gate ? ' style="background:rgba(142,204,84,.10)"' :
+                     stale ? ' style="opacity:.5"' : '';
+        const errTip = s.error ? ` title="${esc(s.error)}"` : '';
+        return `<tr${tint}${errTip}>` +
+          `<td>${esc(s.symbol)}</td><td>${(s.spot_price||0).toFixed(2)}</td>` +
+          `<td>${(s.perp_price||0).toFixed(2)}</td>` +
+          `<td>${(s.basis_bps||0).toFixed(1)}</td>` +
+          `<td class="dim">${(s.funding_rate||0).toFixed(5)}</td>` +
+          `<td>${(s.funding_apr_pct||0).toFixed(2)}</td>` +
+          `<td class="dim">${esc(s.next_funding_ts||"—")} (${s.s_until_next||0}s)</td>` +
+          `<td>${s.above_gate?"✓":"✗"}</td></tr>`;
+      }).join("") + `</tbody></table>`
+    : `<span class="muted">Per-symbol live state not surfaced — pending engine work</span>`;
+
+  const pos = f.positions||[];
+  const posHtml = pos.length
+    ? `<table><thead><tr><th>symbol</th><th>spot qty</th><th>perp qty</th>` +
+      `<th>delta $</th><th>entry</th><th>funding $</th><th>APR %</th><th>next check</th></tr></thead><tbody>` +
+      pos.map(p => {
+        const dTol = FUNDING_DELTA_FALLBACK_USD;
+        const drift = Math.abs(p.delta_usd||0) > dTol;
+        const dCls = drift ? "warn" : "dim";
+        return `<tr><td>${esc(p.symbol)}</td>` +
+          `<td>${(p.spot_qty||0).toFixed(4)}</td>` +
+          `<td>${(p.perp_qty||0).toFixed(4)}</td>` +
+          `<td class="${dCls}">${fmtUsd(p.delta_usd)}</td>` +
+          `<td class="dim">${esc(p.entry_ts||"—")}</td>` +
+          `<td>${fmtUsd(p.funding_collected_usd)}</td>` +
+          `<td>${(p.realised_apr_pct||0).toFixed(2)}</td>` +
+          `<td class="dim">${esc(p.next_exit_check||"—")}</td></tr>`;
+      }).join("") + `</tbody></table>`
+    : `<span class="muted">No open positions</span>`;
+
+  const summary = statRow([
+    ["obs",            ts.n_observations||0],
+    ["would-enter",    ts.n_would_enter||0],
+    ["utilisation",    `${(ts.utilisation_pct||0).toFixed(1)}%`],
+    ["mean APR",       `${(ts.mean_projected_apr_pct||0).toFixed(2)}%`],
+    ["median APR",     `${(ts.median_projected_apr_pct||0).toFixed(2)}%`],
+    ["blended APR",    `${(ts.blended_apr_pct||0).toFixed(2)}%`],
+  ]);
+
+  // Skip-reasons mini-bar.
+  const sr = ts.skip_reasons || {below_gate:0, basis_unfavourable:0, depth_thin:0, other:0};
+  const srTotal = sr.below_gate + sr.basis_unfavourable + sr.depth_thin + sr.other;
+  const reasonRow = srTotal > 0
+    ? `<div style="margin-top:4px">` +
+      [["gate",sr.below_gate,"var(--warn)"],["basis",sr.basis_unfavourable,"var(--neg)"],
+       ["depth",sr.depth_thin,"var(--tx2)"],["other",sr.other,"var(--tx1)"]]
+       .map(([lbl, n, col]) => {
+         const pct = n/srTotal*100;
+         return `<div><span class="dim">${lbl}</span> ` +
+           `<div class="bar"><i style="width:${pct}%;background:${col}"></i></div></div>`;
+       }).join("") +
+      `</div>`
+    : ``;
+
+  return header +
+    `<div style="margin-top:6px">${symsHtml}</div>` +
+    `<h2 class="dim" style="margin-top:8px">Open positions</h2>` + posHtml +
+    summary + reasonRow;
+}
+
+/* ---------- balance agent panel ---------- */
 function balancePanelHtml(b){
   if(!b) return `<span class="muted">balance agent not started</span>`;
-  const allocs = b.allocations || {};
-  const allocKeys = Object.keys(allocs).sort();
-  const allocsHtml = allocKeys.length
-    ? `<table><thead><tr><th>fund:venue</th><th>target USD</th></tr></thead><tbody>` +
-      allocKeys.map(k => `<tr><td>${esc(k)}</td><td>${fmtUsd(allocs[k])}</td></tr>`).join("") +
-      `</tbody></table>`
-    : `<span class="muted">no allocations recorded</span>`;
-  const inflight = b.in_transit || [];
-  const inflightHtml = inflight.length
-    ? `<table><thead><tr><th>from</th><th>to</th><th>$</th><th>state</th><th>age</th></tr></thead><tbody>` +
-      inflight.map(t => `<tr><td>${esc(t.from_fund)}@${esc(t.from_exchange||"—")}</td>` +
-        `<td>${esc(t.to_fund)}@${esc(t.to_exchange||"—")}</td>` +
-        `<td>${fmtUsd(t.amount_usd)}</td><td>${esc(t.state)}</td>` +
-        `<td>${fmtAge(t.age_sec)}</td></tr>`).join("") +
-      `</tbody></table>`
-    : `<span class="muted">no transfers in flight</span>`;
-  const paused = b.paused_routes || [];
-  const pausedHtml = paused.length
-    ? paused.map(p => `<span class="chip err">${esc(p.buy_exchange)}→${esc(p.sell_exchange)}: ${esc(p.reason)}</span>`).join(" ")
-    : `<span class="muted">no routes paused</span>`;
-  const eff = b.fund_efficiency || {};
-  const effHtml = Object.keys(eff).length
-    ? `<table><thead><tr><th>fund</th><th>deployed</th><th>ret %</th><th>starved</th></tr></thead><tbody>` +
-      Object.entries(eff).map(([f, v]) => `<tr><td>${esc(f)}</td><td>${fmtUsd(v.deployed_usd)}</td>` +
-        `<td class="${cls(v.return_pct)}">${fmtPct(v.return_pct)}</td>` +
-        `<td>${v.starved?'<span class="chip warn">yes</span>':'<span class="dim">no</span>'}</td></tr>`).join("") +
-      `</tbody></table>`
-    : `<span class="muted">no efficiency data yet</span>`;
-  return `
-    <div class="grid2">
-      <div><h2 class="dim">Allocations</h2>${allocsHtml}</div>
-      <div><h2 class="dim">In-Transit</h2>${inflightHtml}</div>
-    </div>
-    <div style="margin-top:6px">
-      <h2 class="dim">Today</h2>
-      <span class="dim">transfers ${b.transfers_today||0} · fees ${fmtUsd(b.fees_today_usd||0)}</span>
-    </div>
-    <div style="margin-top:6px"><h2 class="dim">Paused Routes</h2>${pausedHtml}</div>
-    <div style="margin-top:6px"><h2 class="dim">Fund Efficiency</h2>${effHtml}</div>
-  `;
+  const pool = b.pool || {};
+  const tdy  = b.today || {};
+  const killTag = b.kill_blocked ? ` <span class="tag loss">KILL-BLOCKED</span>` : ``;
+  const header = `<div><b>BALANCE</b> · ${esc(b.status||"OFFLINE")} · ` +
+    `pool ${fmtUsd(pool.pool_usd)} · reserve ${fmtUsd(pool.reserve_usd)} · ` +
+    `${tdy.transfers_count||0}/${(tdy.transfers_count||0)+(tdy.transfers_remaining||0)} transfers · ` +
+    `${fmtUsd(tdy.transfers_fees_usd||0)} fees${killTag}</div>`;
+
+  // Funds table.
+  const funds = b.funds||[];
+  const fundsHtml = funds.length
+    ? `<table><thead><tr><th>fund</th><th>alloc</th><th>target</th><th>drift</th>` +
+      `<th>deployed</th><th>24h %</th><th>7d %</th><th>starv 24h</th></tr></thead><tbody>` +
+      funds.map(f => {
+        const driftStyle = Math.abs(f.drift_pct||0) > 5 ? ' style="color:var(--neg)"' : '';
+        const starvStyle = (f.starvation_events_24h||0) > 0 ? ' style="color:var(--warn)"' : '';
+        const r24 = f.return_24h_pct;
+        const r7  = f.return_7d_pct;
+        return `<tr><td>${esc(f.id)}</td>` +
+          `<td>${fmtUsd(f.allocation_usd)}</td><td>${fmtUsd(f.target_usd)}</td>` +
+          `<td${driftStyle}>${fmtPct(f.drift_pct)}</td>` +
+          `<td>${fmtUsd(f.deployed_usd)}</td>` +
+          `<td class="${cls(r24)}">${r24==null?'—':fmtPct(r24)}</td>` +
+          `<td class="${cls(r7)}">${r7==null?'—':fmtPct(r7)}</td>` +
+          `<td${starvStyle}>${f.starvation_events_24h||0}</td></tr>`;
+      }).join("") + `</tbody></table>`
+    : `<span class="muted">no fund data yet</span>`;
+
+  // Nodes table — collapsible <details>.
+  const nodes = b.nodes||[];
+  const nodesHtml = nodes.length
+    ? `<details><summary class="dim">Nodes (${nodes.length})</summary>` +
+      `<table><thead><tr><th>fund</th><th>venue</th><th>asset</th><th>effective</th>` +
+      `<th>floor</th><th>band lo</th><th>band hi</th><th>in band</th></tr></thead><tbody>` +
+      nodes.map(n => {
+        const belowFloor = (n.effective_usd||0) < (n.floor_usd||0);
+        const oob = !n.in_band;
+        const style = belowFloor ? ' style="background:rgba(163,45,45,.10)"' :
+                      oob        ? ' style="background:rgba(232,168,48,.10)"' : '';
+        return `<tr${style}><td>${esc(n.fund)}</td><td>${esc(n.exchange)}</td>` +
+          `<td>${esc(n.asset)}</td><td>${fmtUsd(n.effective_usd)}</td>` +
+          `<td>${fmtUsd(n.floor_usd)}</td>` +
+          `<td>${fmtUsd(n.band_lower_usd)}</td><td>${fmtUsd(n.band_upper_usd)}</td>` +
+          `<td>${n.in_band?"✓":"✗"}</td></tr>`;
+      }).join("") + `</tbody></table></details>`
+    : `<span class="muted">no nodes registered</span>`;
+
+  // In-transit + halted-pairs mini-tables side by side.
+  const intr = b.in_transit||[];
+  const intrHtml = intr.length
+    ? intr.map(t => `<div><b>${esc(t.from_fund)}→${esc(t.to_fund)}</b> ` +
+        `<span class="dim">(${esc(t.from_exchange||"—")}→${esc(t.to_exchange||"—")})</span> · ` +
+        `${esc(t.asset)} · ${fmtUsd(t.amount_usd)} · ${esc(t.state)}</div>`).join("")
+    : `<span class="muted">no in-transit transfers</span>`;
+  const halted = b.halted_pairs||[];
+  const haltedHtml = halted.length
+    ? halted.map(h => `<div><b>${esc(h.pair)}</b> ${esc(h.side)} · ` +
+        `<span class="dim">${esc(h.reason)}</span></div>`).join("")
+    : `<span class="muted">no halted pairs</span>`;
+
+  // Rebalance control — three states.
+  const pp = b.pending_plan || {transfers:[], confirm_token:null};
+  const transfers = pp.transfers || [];
+  let controlHtml;
+  const kbTip = b.kill_blocked
+    ? ' title="Kill switch active — rebalancing blocked"' : '';
+  const lockAttr = (b.kill_blocked || rebalanceClickLock) ? " disabled" : "";
+  if(!transfers.length){
+    controlHtml = `<button${kbTip} disabled>No transfers proposed</button>`;
+  }else if(!pp.confirm_token){
+    controlHtml = `<button id="armRebalanceBtn" class="armed"${kbTip}${lockAttr}>` +
+      `Arm Rebalance (${transfers.length} transfer${transfers.length===1?"":"s"})</button>`;
+  }else{
+    const rows = transfers.map(t => {
+      const w = t.ring_fence_warning
+        ? `<div class="neg" style="font-size:11px;margin-left:12px">⚠ ${esc(t.ring_fence_warning)}</div>`
+        : ``;
+      return `<div><b>${esc(t.from_fund)}→${esc(t.to_fund)}</b> ` +
+        `<span class="dim">(${esc(t.from_exchange)}→${esc(t.to_exchange)})</span> · ` +
+        `${fmtUsd(t.amount_usd)} ${esc(t.asset)} · fee ${fmtUsd(t.est_fee_usd)} · ` +
+        `eta ${t.est_time_s||0}s</div>${w}`;
+    }).join("");
+    controlHtml = `<div style="margin-bottom:6px">${rows}</div>` +
+      `<button id="confirmRebalanceBtn" class="kill"${kbTip}${lockAttr}>` +
+      `Confirm Rebalance</button> ` +
+      `<button id="cancelRebalanceBtn"${kbTip}${lockAttr}>Cancel</button>`;
+  }
+  const errBanner = rebalanceLastError
+    ? `<div class="neg" style="margin-top:4px">${esc(rebalanceLastError)}</div>`
+    : ``;
+
+  // Post-render wireup — schedule once the panel is in the DOM. We
+  // requestAnimationFrame so the IDs are queryable.
+  requestAnimationFrame(() => {
+    const arm = $("armRebalanceBtn");
+    if(arm) arm.onclick = rebalanceArm;
+    const conf = $("confirmRebalanceBtn");
+    if(conf) conf.onclick = () => rebalanceConfirm(pp.confirm_token);
+    const canc = $("cancelRebalanceBtn");
+    if(canc) canc.onclick = () => rebalanceCancel(pp.confirm_token);
+  });
+
+  return header +
+    `<h2 class="dim" style="margin-top:8px">Funds</h2>` + fundsHtml +
+    `<div style="margin-top:6px">${nodesHtml}</div>` +
+    `<div class="grid2" style="margin-top:8px">` +
+      `<div><h2 class="dim">In-Transit</h2>${intrHtml}</div>` +
+      `<div><h2 class="dim">Halted Pairs</h2>${haltedHtml}</div>` +
+    `</div>` +
+    `<h2 class="dim" style="margin-top:8px">Rebalance</h2>${controlHtml}${errBanner}`;
 }
 
 /* ---------- agent page ---------- */
@@ -684,10 +1002,10 @@ function renderAgentLive(id){
     html = `<div class="card"><h2>Live Arb Feed</h2><div class="scroll">${arbFeedHtml(STATE.arb_feed)}</div></div>`;
   }else if(id === "scalp"){
     html = scalpFeedHtml(STATE.scalp);
-  }else if(PLACEHOLDER_AGENTS.includes(id)){
-    html = `<div class="card"><div class="muted">Not yet built. This agent is registered as a
-      placeholder. See SCALPING_V3_ROADMAP.md and the project summary for status.</div></div>`;
   }
+  // Web UI v2 — xchain / funding_arb / balance get their own panels on
+  // the main dashboard; the agent-detail page only renders trade logs +
+  // insights below (no live panel needed). Placeholder agents removed.
   $("ag-live").innerHTML = html;
 }
 function agentTradeLogHtml(id, trades){

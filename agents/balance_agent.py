@@ -43,6 +43,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections import deque
 from datetime import datetime, date
 from typing import Optional
 
@@ -113,6 +114,19 @@ class BalanceAgent(BaseAgent):
         self._transfers_failed_today: int = 0
         self._fees_today_usd: float = 0.0
         self._last_plan_at: Optional[float] = None
+
+        # Web UI v2 — buffer the most recent computed state so the web layer
+        # can surface a "pending proposal" the operator confirms before the
+        # planner dispatches anything. Each is repopulated at the end of
+        # _scan_once(); cold-start values are empty/zero. The plan deque
+        # is capped at 1 — only the freshest plan is offered for confirm.
+        self._last_plan_transfers: deque = deque(maxlen=1)
+        self._last_plan_proposed_at: float = 0.0
+        self._last_plan_proposal_id: int = 0
+        # Keyed by (fund, exchange, asset) for both maps.
+        self._last_computed_targets: dict[tuple, InventoryTarget] = {}
+        self._last_computed_bands:   dict[tuple, tuple[float, float]] = {}
+        self._last_computed_at: float = 0.0
 
     # ── BaseAgent contract ──────────────────────────────────────────────
 
@@ -255,6 +269,193 @@ class BalanceAgent(BaseAgent):
             "default_delay_s": float(getattr(settings, "SIM_TRANSFER_DELAY_S", 600)),
         }
 
+    # ── Web UI v2 pending-proposal surface ──────────────────────────────
+
+    def get_pending_proposal(self) -> dict:
+        """Snapshot helper. Returns the most recently buffered plan in a
+        plain-dict shape the web layer surfaces under
+        snapshot.balance.pending_plan. Empty when no plan has been
+        buffered or when the agent is kill-blocked. Never raises.
+
+        Per-transfer ring_fence_warning is non-null when the move is
+        cross-venue AND live; the same MEXC caveat from
+        _ring_fence_notice is appended for MEXC source/destination.
+        """
+        try:
+            if self._paused or not self._last_plan_transfers:
+                return {"proposed_at": None, "proposal_id": 0, "transfers": []}
+            buffered = self._last_plan_transfers[-1]
+            if not buffered:
+                return {"proposed_at": None, "proposal_id": 0, "transfers": []}
+            live = bool(getattr(settings, "REBALANCE_LIVE_ENABLED", False))
+            fee_default = float(getattr(settings, "SIM_WITHDRAWAL_FEE_USD", 1.0))
+            delay_default = int(getattr(settings, "SIM_TRANSFER_DELAY_S", 600))
+
+            def _warning(t: Transfer) -> Optional[str]:
+                cross_venue = t.from_exchange != t.to_exchange
+                if not cross_venue:
+                    return None
+                if not live:
+                    # Sim moves don't carry the OES risk; flag the cross-venue
+                    # nature so the panel still highlights it visually.
+                    return "sim transfer — cross-venue, no live counterparty risk"
+                if t.from_exchange == "mexc" or t.to_exchange == "mexc":
+                    return "MEXC leg — un-mitigated counterparty risk (no OES)"
+                return "live cross-venue transfer"
+
+            transfers = [
+                {
+                    "from_fund":          t.from_fund,
+                    "to_fund":            t.to_fund,
+                    "from_exchange":      t.from_exchange,
+                    "to_exchange":        t.to_exchange,
+                    "asset":              t.asset,
+                    "amount_usd":         float(t.amount_usd or 0.0),
+                    "est_fee_usd":        float(t.cost_usd or fee_default),
+                    "est_time_s":         delay_default,
+                    "ring_fence_warning": _warning(t),
+                }
+                for t in buffered
+            ]
+            proposed_at = None
+            if self._last_plan_proposed_at:
+                proposed_at = datetime.utcfromtimestamp(
+                    self._last_plan_proposed_at,
+                ).strftime("%H:%M:%S")
+            return {
+                "proposed_at":  proposed_at,
+                "proposal_id":  int(self._last_plan_proposal_id),
+                "transfers":    transfers,
+            }
+        except Exception as e:
+            logger.debug("BalanceAgent.get_pending_proposal: %s", e)
+            return {"proposed_at": None, "proposal_id": 0, "transfers": []}
+
+    async def execute_proposal(self, confirm_token: str) -> dict:
+        """Web UI v2 confirm path. Validates the token, re-plans against
+        the current ledger view, refuses if the plan has diverged from
+        the buffered one, then dispatches the buffered transfers.
+        Returns {"ok": True, "transfer_ids": [...]} on success, or
+        {"ok": False, "error": "<reason>"} on any rejection. NEVER
+        raises — the web handler treats a raise as a bug.
+
+        Reasons:
+          kill_blocked              — agent is paused (kill switch)
+          token_invalid             — no arm, or token mismatch
+          token_expired             — arm window elapsed
+          live_rebalance_disabled   — SIM_MODE False and REBALANCE_LIVE_ENABLED False
+          no_pending_plan           — buffer empty
+          plan_changed              — re-plan diverged from buffer
+          replan_failed:<err>       — policy/planner crashed during re-plan
+          all_blocked_by_safety     — every transfer failed the safety_clear filter
+        """
+        try:
+            if self._paused:
+                return {"ok": False, "error": "kill_blocked"}
+            if not self._arm_token or confirm_token != self._arm_token:
+                self._arm_token = None
+                return {"ok": False, "error": "token_invalid"}
+            if time.time() > self._arm_expires_at:
+                self._arm_token = None
+                return {"ok": False, "error": "token_expired"}
+            if (not settings.SIM_MODE and
+                    not bool(getattr(settings, "REBALANCE_LIVE_ENABLED", False))):
+                self._arm_token = None
+                return {"ok": False, "error": "live_rebalance_disabled"}
+            if not self._last_plan_transfers or not self._last_plan_transfers[-1]:
+                self._arm_token = None
+                return {"ok": False, "error": "no_pending_plan"}
+            buffered = list(self._last_plan_transfers[-1])
+
+            # Token consumed regardless of dispatch outcome — fail-closed.
+            self._arm_token = None
+
+            # Re-plan-on-confirm: rerun the policy + planner against the
+            # current ledger. If anything substantial moved, refuse and
+            # re-buffer the fresher plan for the next arm.
+            try:
+                equity = self._compound_realised_into_funds()
+                policy = self._pick_policy()
+                if policy is None:
+                    return {"ok": False, "error": "no_policy_available"}
+                fresh_targets = policy.compute_targets(inventory_state, equity)
+                constraints = PlannerConstraints(
+                    daily_limit=int(getattr(settings, "REBALANCE_DAILY_LIMIT", 3)),
+                    daily_used=self._daily_rebalances,
+                    in_flight=self._count_in_flight(),
+                )
+                fresh_transfers = (
+                    self._planner.plan(
+                        inv=inventory_state, targets=fresh_targets,
+                        cost_matrix=self._cost_matrix(),
+                        constraints=constraints,
+                    ) if fresh_targets else []
+                )
+            except Exception as e:
+                logger.error("execute_proposal replan: %s", e, exc_info=True)
+                return {"ok": False, "error": f"replan_failed:{e}"}
+
+            if not self._plans_substantially_equal(buffered, fresh_transfers):
+                self._last_plan_transfers.append(list(fresh_transfers))
+                self._last_plan_proposed_at = time.time()
+                self._last_plan_proposal_id += 1
+                return {"ok": False, "error": "plan_changed"}
+
+            # Safety rails (same as scan path) before dispatch.
+            cleared = [t for t in buffered if self._safety_clear(t)]
+            if not cleared:
+                return {"ok": False, "error": "all_blocked_by_safety"}
+
+            results = await asyncio.gather(
+                *(self._dispatch(t) for t in cleared),
+                return_exceptions=True,
+            )
+            transfer_ids: list[int] = []
+            for r in results:
+                if isinstance(r, Exception):
+                    logger.debug("execute_proposal dispatch exc: %s", r)
+                    continue
+                if r is not None:
+                    try:
+                        transfer_ids.append(int(r))
+                    except (TypeError, ValueError):
+                        continue
+            # Clear the buffer so a stale plan can't be re-executed.
+            self._last_plan_transfers.clear()
+            return {"ok": True, "transfer_ids": transfer_ids}
+        except Exception as e:
+            logger.error("BalanceAgent.execute_proposal: %s", e, exc_info=True)
+            return {"ok": False, "error": f"unexpected:{e}"}
+
+    @staticmethod
+    def _plans_substantially_equal(
+        old: list, new: list, tol: float = 0.10,
+    ) -> bool:
+        """Two plans are 'substantially the same' iff:
+            - same set of (from_fund, to_fund, from_exchange, to_exchange, asset)
+              tuples, and
+            - each shared row's amount_usd differs by ≤ tol fraction
+              (default 10%).
+        An empty buffered plan paired with an empty fresh plan counts as
+        equal; an empty fresh plan against a non-empty buffer is a change
+        (the world moved enough that no transfer is now warranted).
+        """
+        def key(t):
+            return (t.from_fund, t.to_fund, t.from_exchange,
+                    t.to_exchange, t.asset)
+        old_idx = {key(t): float(t.amount_usd or 0.0) for t in (old or [])}
+        new_idx = {key(t): float(t.amount_usd or 0.0) for t in (new or [])}
+        if set(old_idx.keys()) != set(new_idx.keys()):
+            return False
+        for k, oa in old_idx.items():
+            na = new_idx[k]
+            if oa <= 0 and na <= 0:
+                continue
+            denom = max(abs(oa), abs(na), 1e-9)
+            if abs(oa - na) / denom > tol:
+                return False
+        return True
+
     # ── Scan loop ───────────────────────────────────────────────────────
 
     async def _loop(self) -> None:
@@ -296,6 +497,29 @@ class BalanceAgent(BaseAgent):
         for t in targets:
             inventory_state.apply_allocation(t.fund, t.exchange, t.asset, t.target_usd)
 
+        # Web UI v2 — buffer the per-target state BEFORE planning so the
+        # balance panel can surface targets/bands even when the planner
+        # finds nothing to do or fails. Bands are derived from the
+        # planner's _miller_orr_band (full spread); panel reads the
+        # (lower, upper) tuple computed here.
+        self._last_computed_targets = {
+            (t.fund, t.exchange, t.asset): t for t in targets
+        }
+        try:
+            bands: dict[tuple, tuple[float, float]] = {}
+            for t in targets:
+                width = float(self._planner._miller_orr_band(t))
+                half = width / 2.0
+                bands[(t.fund, t.exchange, t.asset)] = (
+                    max(0.0, t.target_usd - half),
+                    t.target_usd + half,
+                )
+            self._last_computed_bands = bands
+        except Exception as e:
+            logger.debug("BalanceAgent: band buffer failed: %s", e)
+            self._last_computed_bands = {}
+        self._last_computed_at = time.time()
+
         # Safety rail 1 — total invariant check.
         plan_sum = sum(max(0.0, float(t.target_usd)) for t in targets)
         if equity > 0 and plan_sum > equity * 1.05:
@@ -327,7 +551,17 @@ class BalanceAgent(BaseAgent):
         if not cleared:
             return
 
-        # Dispatch.
+        # Buffer the freshest plan for /action/rebalance to surface.
+        self._last_plan_transfers.append(list(cleared))
+        self._last_plan_proposed_at = time.time()
+        self._last_plan_proposal_id += 1
+
+        # Auto-dispatch gate — when False (the v2 default), the operator
+        # drives every move via execute_proposal(). When True (legacy),
+        # the scan loop dispatches immediately.
+        if not bool(getattr(settings, "BALANCE_AUTO_DISPATCH", False)):
+            return
+
         await asyncio.gather(
             *(self._dispatch(t) for t in cleared),
             return_exceptions=True,
@@ -431,14 +665,18 @@ class BalanceAgent(BaseAgent):
                 pass
         return True
 
-    async def _dispatch(self, t: Transfer) -> None:
+    async def _dispatch(self, t: Transfer) -> Optional[int]:
+        """Run one transfer through the first available rail. Returns the
+        rail's capital_movements row id on success (None on failure / no
+        rail / no row). Web UI v2's execute_proposal() reads this to
+        return transfer_ids to the operator."""
         rail = self._pick_rail(t)
         if rail is None:
             logger.warning(
                 "BalanceAgent: no available rail for %s -> %s — skipping",
                 t.from_exchange, t.to_exchange,
             )
-            return
+            return None
         result = await rail.execute(t)
         # Stats — count completed and in_transit as "moves today" (they
         # consumed the daily slot); failures bump the failed counter
@@ -449,6 +687,7 @@ class BalanceAgent(BaseAgent):
             # Cross-venue moves consumed a slot.
             if t.from_exchange != t.to_exchange:
                 self._daily_rebalances += 1
+            return result.movement_id
         else:
             self._transfers_failed_today += 1
             # Scoped auto-pause: stop deepening the affected route via
@@ -465,6 +704,7 @@ class BalanceAgent(BaseAgent):
                 )
             except Exception:
                 pass
+            return None
 
     def _pick_policy(self) -> Optional[BasePolicy]:
         for p in self._policies:

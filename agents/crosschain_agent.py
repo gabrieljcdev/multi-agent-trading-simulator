@@ -80,6 +80,14 @@ class CrossChainArbAgent(BaseAgent):
             return False
         return sum(1 for c in REGISTERED_CONNECTORS if c.is_available()) >= 2
 
+    @property
+    def observation_mode(self) -> bool:
+        """True when XCHAIN_CAPITAL == 0 — the agent logs evaluations to
+        xchain_observations but never opens positions. Mirrors the
+        FundingArbAgent.observation_mode pattern so the web UI can
+        consistently render an OBS badge across agents."""
+        return float(getattr(settings, "XCHAIN_CAPITAL", 0.0) or 0.0) <= 0.0
+
     def set_dashboard(self, dashboard) -> None:
         """Late-bind dashboard. Engine doesn't currently consume it, but
         the setter is here to keep the agent API consistent with arb /

@@ -43,9 +43,10 @@ logger = logging.getLogger(__name__)
 _HTML_PATH = Path(__file__).parent / "web_dashboard.html"
 _VALID_MODES = ("per_trade", "window", "autonomous")
 
-# Agent ids that have a dedicated page. Matches REGISTERED_AGENTS exactly —
-# note the sentiment placeholder registers as "sentiment_agent".
-_VALID_AGENTS = ("signal", "arb", "scalp", "macro", "sentiment_agent", "onchain")
+# Agent ids that have a dedicated page. Matches REGISTERED_AGENTS exactly.
+# Web UI v2 dropped the macro / sentiment_agent / onchain placeholders;
+# added xchain / funding_arb / balance now that those agents are real.
+_VALID_AGENTS = ("signal", "arb", "scalp", "xchain", "funding_arb", "balance")
 _SESSIONS = ("LONDON", "NEW_YORK", "ASIA", "OFF_HOURS")
 # Anchor city per session for the local clock + session-page header.
 _SESSION_TZ = {
@@ -386,27 +387,50 @@ class WebServer:
             return web.json_response({"ok": False, "error": str(e)})
 
     async def handle_rebalance(self, request) -> web.Response:
-        """Two-step arm → confirm with token. The BalanceAgent owns the
-        token state; this endpoint dispatches by request body shape.
+        """Web UI v2 three-action /action/rebalance.
 
-        Body shapes:
-          { "action": "arm" }                        — issue + return token
-          { "action": "confirm", "token": "<hex>" }  — consume token,
-              return summary on success
+        Bodies:
+          {"action": "arm"}
+              → {"ok": True, "confirm_token": str,
+                 "expires_in_s": int, "proposal": {...},
+                 "ring_fence_warnings": [str, ...]}
+          {"action": "confirm", "confirm_token": str}
+              → {"ok": True, "transfer_ids": [int, ...]}
+                | {"ok": False, "error": "<reason>"}
+          {"action": "cancel", "confirm_token": str}
+              → {"ok": True}
+
+        Errors:
+          balance_agent_unavailable, live_rebalance_disabled,
+          token_invalid, token_expired, no_pending_plan, plan_changed,
+          kill_blocked, replan_failed:<msg>, invalid_action.
+
+        The handler never raises; agent exceptions are wrapped in the
+        error envelope.
         """
         coord = self._coordinator
         if coord is None or not hasattr(coord, "get_agent"):
-            return web.json_response({"ok": False, "error": "no coordinator"})
+            return web.json_response({
+                "ok": False, "error": "balance_agent_unavailable",
+            })
         balance_agent = coord.get_agent("balance")
         if balance_agent is None:
-            return web.json_response({"ok": False, "error": "no balance agent"})
+            return web.json_response({
+                "ok": False, "error": "balance_agent_unavailable",
+            })
         body = await self._body(request)
         action = body.get("action")
+
         if action == "arm":
             try:
-                token, notice = balance_agent.arm()
+                token, _notice = balance_agent.arm()
+                proposal = balance_agent.get_pending_proposal()
             except Exception as e:
                 return web.json_response({"ok": False, "error": str(e)})
+            warnings = [
+                t.get("ring_fence_warning") for t in (proposal.get("transfers") or [])
+                if t.get("ring_fence_warning")
+            ]
             try:
                 db_queries.log_agent_event(
                     "balance", "REBALANCE_ARM", "armed via web UI",
@@ -414,32 +438,58 @@ class WebServer:
             except Exception:
                 pass
             return web.json_response({
-                "ok": True, "token": token, "ring_fence": notice,
+                "ok":                  True,
+                "confirm_token":       token,
+                "expires_in_s":        int(
+                    getattr(settings, "REBALANCE_ARM_TIMEOUT_S", 10) or 10
+                ),
+                "proposal":            proposal,
+                "ring_fence_warnings": warnings,
             })
+
         if action == "confirm":
-            token = body.get("token", "")
+            # Defence-in-depth: the agent also gates on this, but failing
+            # fast here keeps the error stream identical even if the agent
+            # is mocked in tests.
+            if (not settings.SIM_MODE and
+                    not bool(getattr(settings, "REBALANCE_LIVE_ENABLED", False))):
+                return web.json_response({
+                    "ok": False, "error": "live_rebalance_disabled",
+                })
+            token = body.get("confirm_token", "")
             try:
-                ok = balance_agent.consume_arm(token)
+                executor = balance_agent.execute_proposal(token)
+                if asyncio.iscoroutine(executor):
+                    result = await executor
+                else:
+                    result = executor
             except Exception as e:
                 return web.json_response({"ok": False, "error": str(e)})
-            if not ok:
-                return web.json_response({
-                    "ok": False, "error": "invalid or expired token",
-                })
+            if not isinstance(result, dict) or not result.get("ok"):
+                return web.json_response(
+                    result if isinstance(result, dict)
+                    else {"ok": False, "error": "agent_returned_non_dict"}
+                )
+            transfer_ids = result.get("transfer_ids", []) or []
             try:
                 db_queries.log_agent_event(
-                    "balance", "REBALANCE_CONFIRM", "confirmed via web UI",
+                    "balance", "REBALANCE_WEB",
+                    f"source=web_ui transfer_ids={transfer_ids}",
                 )
             except Exception:
                 pass
-            # The agent's own scan loop performs the planned moves —
-            # the confirm here just consumes the token and authorises
-            # the next cycle. Returns immediately; the operator watches
-            # the balance panel for the move.
+            return web.json_response({
+                "ok": True, "transfer_ids": transfer_ids,
+            })
+
+        if action == "cancel":
+            try:
+                balance_agent.consume_arm(body.get("confirm_token", ""))
+            except Exception:
+                pass
             return web.json_response({"ok": True})
-        return web.json_response({
-            "ok": False, "error": "action must be 'arm' or 'confirm'",
-        })
+
+        return web.json_response({"ok": False, "error": "invalid_action"})
 
     async def handle_approve_window(self, request) -> web.Response:
         bot = self._resolve_bot()
@@ -546,54 +596,447 @@ class WebServer:
             "top_strategies": self._safe(db_queries.get_strategy_performance, []),
             "insights":       self._safe(lambda: db_queries.get_recent_postmortems(3), []),
             "arb_history":    arb,
+            # Web UI v2 — dedicated agent panels read from these top-level
+            # keys. The existing arb_feed / arb_history above stay for
+            # backwards-compatible consumers (arb history tab); the new
+            # `arb` dict is the v2 panel surface.
+            "arb":            self._snap_arb_v2(),
+            "xchain":         self._snap_xchain(),
+            "funding":        self._snap_funding(),
             "balance":        self._snap_balance(),
         }
 
-    def _snap_balance(self) -> dict:
-        """Balance panel snapshot: per-fund allocation, per-node
-        effective balance, in-transit transfers, halted routes,
-        today's transfer count + fees, per-fund return-on-deployed.
-        Degrades gracefully — every field has a safe fallback."""
+    # ── Web UI v2 panel snapshots ───────────────────────────────────────
+
+    def _get_agent(self, agent_id: str):
+        """Coordinator.get_agent lookup that never raises."""
+        coord = self._coordinator
+        if coord is None:
+            return None
+        getter = getattr(coord, "get_agent", None)
+        if not callable(getter):
+            return None
+        try:
+            return getter(agent_id)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _status_from(agent, *, observation_attr: str = "observation_mode") -> str:
+        """Map a (possibly None) agent's state to the panel's
+        RUNNING / OBSERVATION / OFFLINE / ERROR taxonomy."""
+        if agent is None:
+            return "OFFLINE"
+        try:
+            if bool(getattr(agent, observation_attr, False)):
+                return "OBSERVATION"
+            running = bool(getattr(agent, "_running", False))
+            return "RUNNING" if running else "OFFLINE"
+        except Exception:
+            return "ERROR"
+
+    def _snap_arb_v2(self) -> dict:
+        """Web UI v2 arb-fund panel. Engine-backed fields default to
+        empty/zero per the hybrid scope — a later build can fill them by
+        exposing per-exchange health + gap distribution on the engine."""
         out = {
-            "allocations":          {},
-            "in_transit":           [],
-            "paused_routes":        [],
-            "transfers_today":      0,
-            "fees_today_usd":       0.0,
-            "fund_efficiency":      {},
+            "exchanges": [],
+            "gap_distribution": {
+                "bucket_edges_bps": [0, 5, 10, 20, 50, 100, 250],
+                "bucket_counts":    [0, 0, 0, 0, 0, 0, 0],
+                "median_bps":       0.0,
+                "p90_bps":          0.0,
+            },
+            "threshold": {
+                "min_net_gap_bps": (
+                    float(getattr(settings, "ARB_MIN_GAP_PCT", 0.003)) * 100.0
+                ),
+                "rationale": "default fallback — engine threshold not surfaced",
+            },
+            "semaphore": {
+                "active":   0,
+                "capacity": int(getattr(settings, "ARB_MAX_CONCURRENT", 3) or 3),
+            },
         }
         try:
-            from agents.balance.inventory_state import inventory_state
-            snap = inventory_state.get_snapshot()
-            out["allocations"]   = snap.get("allocations", {})
-            out["in_transit"]    = snap.get("pending", [])
-            out["paused_routes"] = snap.get("paused_routes", [])
+            agent = self._get_agent("arb")
+            engine = getattr(agent, "_engine", None) if agent is not None else None
+            if engine is not None:
+                out["semaphore"]["active"] = int(
+                    getattr(engine, "_active_arbs", 0) or 0
+                )
         except Exception as e:
-            logger.debug("balance snapshot inventory_state failed: %s", e)
+            logger.debug("arb_v2 semaphore read failed: %s", e)
+        return out
+
+    def _snap_xchain(self) -> dict:
+        """Web UI v2 cross-chain panel.
+
+        `chains` and `best_pair.would_entry` are not surfaced under the
+        hybrid scope (requires PoolState timestamp/error + engine
+        best-evaluation buffer). Real data appears for inventory_targets
+        and today_summary, sourced from the agent + DB respectively.
+        """
+        out = {
+            "status":            "OFFLINE",
+            "capital_usd":       float(getattr(settings, "XCHAIN_CAPITAL", 0.0) or 0.0),
+            "chains":            [],
+            "best_pair": {
+                "buy_chain":         None,
+                "sell_chain":        None,
+                "spread_bps":        0.0,
+                "net_edge_bps":      0.0,
+                "gas_breakeven_usd": 0.0,
+                "would_entry":       False,
+                "skip_reason":       "not_surfaced",
+            },
+            "inventory_targets": [],
+            "today_summary": {
+                "n_observations":          0,
+                "n_would_entry":           0,
+                "mean_net_edge_bps":       0.0,
+                "median_net_edge_bps":     0.0,
+                "pct_blocked_by_gas":      0.0,
+                "pct_blocked_by_min_edge": 0.0,
+            },
+        }
+        agent = self._get_agent("xchain")
+        out["status"] = self._status_from(agent)
         try:
-            moves = db_queries.get_capital_movements_today()
-            out["transfers_today"] = len(moves)
-            # Sim fee is a flat constant; live tracks per-tx fees later.
-            fee = float(getattr(settings, "SIM_WITHDRAWAL_FEE_USD", 1.0))
-            out["fees_today_usd"] = sum(
-                fee for m in moves if (m.state or "") == "completed"
+            if agent is not None:
+                targets = agent.get_inventory_targets() or []
+                out["inventory_targets"] = [
+                    {
+                        "fund":             getattr(t, "fund", "xchain"),
+                        "chain":            getattr(t, "exchange", ""),
+                        "asset":            getattr(t, "asset", "USDT"),
+                        "current_usd":      float(
+                            getattr(t, "current_usd", 0.0) or 0.0
+                        ) if hasattr(t, "current_usd") else 0.0,
+                        "target_usd":       float(getattr(t, "target_usd", 0.0) or 0.0),
+                        "drift_pct":        float(getattr(t, "drift_pct", 0.0) or 0.0),
+                        "needs_rebalance":  bool(getattr(t, "needs_rebalance", False)),
+                    }
+                    for t in targets
+                ]
+        except Exception as e:
+            logger.debug("xchain inventory_targets failed: %s", e)
+            out["status"] = "ERROR"
+        try:
+            out["today_summary"] = db_queries.get_xchain_today_summary()
+        except Exception as e:
+            logger.debug("xchain today_summary failed: %s", e)
+        return out
+
+    def _snap_funding(self) -> dict:
+        """Web UI v2 funding-rate panel.
+
+        `symbols` is empty under the hybrid scope — surfacing per-symbol
+        live state requires a new engine method. `positions` reads the
+        agent's in-memory book; today_summary aggregates the
+        FundingArbObservationModel rows logged today.
+        """
+        out = {
+            "status":         "OFFLINE",
+            "capital_usd":    float(getattr(settings, "FUNDING_CAPITAL_USD", 0.0) or 0.0),
+            "venue":          "binance",
+            "symbols":        [],
+            "positions":      [],
+            "today_summary": {
+                "n_observations":           0,
+                "n_would_enter":            0,
+                "utilisation_pct":          0.0,
+                "mean_projected_apr_pct":   0.0,
+                "median_projected_apr_pct": 0.0,
+                "blended_apr_pct":          0.0,
+                "skip_reasons": {
+                    "below_gate":         0,
+                    "basis_unfavourable": 0,
+                    "depth_thin":         0,
+                    "other":              0,
+                },
+            },
+        }
+        agent = self._get_agent("funding_arb")
+        out["status"] = self._status_from(agent)
+        try:
+            if agent is not None:
+                positions = getattr(agent, "_positions", None) or {}
+                for sym, pos in positions.items():
+                    try:
+                        opened = float(getattr(pos, "opened_at", 0.0) or 0.0)
+                        entry_ts = (
+                            datetime.utcfromtimestamp(opened).strftime("%H:%M:%S")
+                            if opened else "—"
+                        )
+                        notional = float(getattr(pos, "notional_usd", 0.0) or 0.0)
+                        out["positions"].append({
+                            "symbol":   sym,
+                            "side":     "SHORT_PERP_LONG_SPOT",
+                            "spot_qty": notional,
+                            "perp_qty": notional,
+                            "delta_usd": 0.0,                       # not tracked Phase 1
+                            "entry_ts":  entry_ts,
+                            "funding_collected_usd": float(
+                                getattr(pos, "funding_collected", 0.0) or 0.0
+                            ),
+                            "realised_apr_pct": 0.0,                # not tracked Phase 1
+                            "next_exit_check": "—",
+                        })
+                    except Exception:
+                        continue
+        except Exception as e:
+            logger.debug("funding positions read failed: %s", e)
+            out["status"] = "ERROR"
+        try:
+            out["today_summary"] = db_queries.get_funding_today_summary()
+        except Exception as e:
+            logger.debug("funding today_summary failed: %s", e)
+        return out
+
+    def _snap_balance(self) -> dict:
+        """Web UI v2 balance panel — wholesale replacement of the v1 shape.
+
+        Reads the BalanceAgent's buffered targets + bands + pending plan
+        (populated each scan), the inventory_state ledger view, and a
+        small set of DB queries. Every read defensive — one source
+        failing must not cascade to the whole block.
+        """
+        empty = {
+            "status":        "OFFLINE",
+            "kill_blocked":  False,
+            "pool": {
+                "equity_usd":   0.0,
+                "reserve_usd":  0.0,
+                "deployed_usd": 0.0,
+                "pool_usd":     0.0,
+            },
+            "funds":         [],
+            "nodes":         [],
+            "in_transit":    [],
+            "halted_pairs":  [],
+            "today": {
+                "transfers_count":     0,
+                "transfers_fees_usd":  0.0,
+                "transfers_remaining": int(
+                    getattr(settings, "REBALANCE_DAILY_LIMIT", 3) or 3
+                ),
+            },
+            "pending_plan": {
+                "proposed_at":   None,
+                "confirm_token": None,
+                "transfers":     [],
+            },
+        }
+        agent = self._get_agent("balance")
+        if agent is None:
+            return empty
+
+        out = dict(empty)
+        try:
+            kill_blocked = bool(getattr(agent, "_paused", False))
+            out["kill_blocked"] = kill_blocked
+            if kill_blocked:
+                out["status"] = "HALTED"
+            elif bool(getattr(agent, "_running", False)):
+                out["status"] = "RUNNING"
+        except Exception:
+            out["status"] = "ERROR"
+
+        # Pool aggregates — equity from FUND_* + realised P&L; reserve from
+        # COMPOUND_RESERVE_PCT; deployed from agent stats.
+        try:
+            starting = (
+                float(getattr(settings, "FUND_SIGNAL_CAPITAL", 0.0) or 0.0)
+                + float(getattr(settings, "FUND_ARB_CAPITAL", 0.0) or 0.0)
+                + float(getattr(settings, "FUND_MEXC_SCALP_CAPITAL", 0.0) or 0.0)
+            )
+            realised = float(self._safe(
+                db_queries.get_alltime_realised_pnl, 0.0) or 0.0)
+            equity = starting + realised
+            reserve_pct = float(getattr(settings, "COMPOUND_RESERVE_PCT", 0.0) or 0.0)
+            reserve = equity * reserve_pct
+            deployed = 0.0
+            for a in (self._agents_cache or []):
+                try:
+                    deployed += float(getattr(a, "capital_deployed", 0.0) or 0.0)
+                except Exception:
+                    continue
+            out["pool"] = {
+                "equity_usd":   round(equity, 2),
+                "reserve_usd":  round(reserve, 2),
+                "deployed_usd": round(deployed, 2),
+                "pool_usd":     round(max(0.0, equity - reserve - deployed), 2),
+            }
+        except Exception as e:
+            logger.debug("balance pool aggregates failed: %s", e)
+
+        # Per-fund table.
+        try:
+            eff_24h_idx = {
+                r["fund"]: r for r in
+                self._safe(lambda: db_queries.get_fund_efficiency_summary(24), [])
+            }
+            eff_7d_idx = {
+                r["fund"]: r for r in
+                self._safe(lambda: db_queries.get_fund_efficiency_summary(168), [])
+            }
+            cap_by_agent = {
+                getattr(a, "agent_id", ""): float(getattr(a, "capital_allocated", 0.0) or 0.0)
+                for a in (self._agents_cache or [])
+            }
+            dep_by_agent = {
+                getattr(a, "agent_id", ""): float(getattr(a, "capital_deployed", 0.0) or 0.0)
+                for a in (self._agents_cache or [])
+            }
+            # Sum target_usd from the buffered InventoryTargets by fund.
+            target_by_fund: dict[str, float] = {}
+            for (fund, _ex, _as), t in (
+                getattr(agent, "_last_computed_targets", {}) or {}
+            ).items():
+                target_by_fund[fund] = (
+                    target_by_fund.get(fund, 0.0) + float(getattr(t, "target_usd", 0.0) or 0.0)
+                )
+
+            # Map agent_id → fund_id. "scalp" agent stewards the "mexc_scalp" fund.
+            fund_of = {"signal": "signal", "arb": "arb", "scalp": "mexc_scalp"}
+            funds_rows = []
+            for agent_id in ("signal", "arb", "scalp"):
+                fund_id = fund_of[agent_id]
+                allocation = cap_by_agent.get(agent_id, 0.0)
+                target = float(target_by_fund.get(fund_id, 0.0))
+                drift = (
+                    (allocation - target) / target * 100.0
+                    if target > 0 else 0.0
+                )
+                eff_24 = eff_24h_idx.get(fund_id, {})
+                eff_7  = eff_7d_idx.get(fund_id, {})
+                funds_rows.append({
+                    "id":                    fund_id,
+                    "allocation_usd":        round(allocation, 2),
+                    "target_usd":            round(target, 2),
+                    "deployed_usd":          round(dep_by_agent.get(agent_id, 0.0), 2),
+                    "drift_pct":             round(drift, 2),
+                    "return_24h_pct":        eff_24.get("return_on_deployed_pct"),
+                    "return_7d_pct":         eff_7.get("return_on_deployed_pct"),
+                    "starvation_events_24h": int(eff_24.get("starvation_events", 0)),
+                })
+            out["funds"] = funds_rows
+        except Exception as e:
+            logger.debug("balance funds table failed: %s", e)
+
+        # Nodes — one per buffered target. Cold-start fallback uses the
+        # inventory_state allocations dict so the panel still shows
+        # something before the first scan.
+        try:
+            from agents.balance.inventory_state import inventory_state
+            nodes_rows = []
+            targets = getattr(agent, "_last_computed_targets", {}) or {}
+            bands   = getattr(agent, "_last_computed_bands",   {}) or {}
+            if targets:
+                for (fund, exchange, asset), tgt in targets.items():
+                    try:
+                        eff = float(
+                            inventory_state.effective_balance(fund, exchange, asset)
+                        )
+                        physical = float(
+                            getattr(settings, "EXCHANGE_BALANCES", {}).get(exchange, 0.0)
+                            or 0.0
+                        )
+                        floor_v = float(getattr(tgt, "floor_usd", 0.0) or 0.0)
+                        cap_v   = float(getattr(tgt, "cap_usd",   0.0) or 0.0)
+                        band = bands.get((fund, exchange, asset)) or (0.0, 0.0)
+                        lower, upper = float(band[0]), float(band[1])
+                        in_band = True
+                        if upper > lower > 0:
+                            in_band = (lower <= eff <= upper)
+                        nodes_rows.append({
+                            "fund":             fund,
+                            "exchange":         exchange,
+                            "asset":            asset,
+                            "physical_usd":     round(physical, 2),
+                            "effective_usd":    round(eff, 2),
+                            "floor_usd":        round(floor_v, 2),
+                            "cap_usd":          round(cap_v, 2),
+                            "band_lower_usd":   round(lower, 2),
+                            "band_upper_usd":   round(upper, 2),
+                            "in_band":          in_band,
+                        })
+                    except Exception:
+                        continue
+            else:
+                # Cold-start: synthesise rows from inventory_state allocations
+                # so the panel always has SOMETHING to render.
+                snap = inventory_state.get_snapshot() or {}
+                allocations = snap.get("allocations", {}) or {}
+                for key, amount in allocations.items():
+                    # keys look like "fund:exchange"
+                    if ":" in key:
+                        fund, exchange = key.split(":", 1)
+                    else:
+                        fund, exchange = key, ""
+                    try:
+                        eff = float(inventory_state.effective_balance(
+                            fund, exchange, "USDT",
+                        ))
+                    except Exception:
+                        eff = 0.0
+                    nodes_rows.append({
+                        "fund":             fund,
+                        "exchange":         exchange,
+                        "asset":            "USDT",
+                        "physical_usd":     0.0,
+                        "effective_usd":    round(eff, 2),
+                        "floor_usd":        0.0,
+                        "cap_usd":          0.0,
+                        "band_lower_usd":   0.0,
+                        "band_upper_usd":   0.0,
+                        "in_band":          True,
+                    })
+            out["nodes"] = nodes_rows
+        except Exception as e:
+            logger.debug("balance nodes table failed: %s", e)
+
+        # In-transit transfers from the DB.
+        try:
+            out["in_transit"] = (
+                self._safe(db_queries.get_capital_movements_in_transit, []) or []
             )
         except Exception as e:
-            logger.debug("balance snapshot capital_movements failed: %s", e)
+            logger.debug("balance in_transit failed: %s", e)
+
+        # Today counters from the agent's own tallies.
         try:
-            eff = {}
-            for fund in ("signal", "arb", "mexc_scalp"):
-                row = db_queries.get_latest_fund_efficiency(fund)
-                if row is None:
-                    continue
-                eff[fund] = {
-                    "deployed_usd": float(row.deployed_usd or 0.0),
-                    "return_pct":   float(row.return_on_deployed_pct or 0.0),
-                    "starved":      bool(row.starvation_event),
-                }
-            out["fund_efficiency"] = eff
+            count = int(getattr(agent, "_transfers_today", 0) or 0)
+            fees  = float(getattr(agent, "_fees_today_usd", 0.0) or 0.0)
+            limit = int(getattr(settings, "REBALANCE_DAILY_LIMIT", 3) or 3)
+            used  = int(getattr(agent, "_daily_rebalances", 0) or 0)
+            out["today"] = {
+                "transfers_count":     count,
+                "transfers_fees_usd":  round(fees, 2),
+                "transfers_remaining": max(0, limit - used),
+            }
         except Exception as e:
-            logger.debug("balance snapshot efficiency failed: %s", e)
+            logger.debug("balance today counters failed: %s", e)
+
+        # Pending plan + confirm token.
+        try:
+            getter = getattr(agent, "get_pending_proposal", None)
+            if callable(getter):
+                proposal = getter() or {}
+                token = getattr(agent, "_arm_token", None)
+                expires = float(getattr(agent, "_arm_expires_at", 0.0) or 0.0)
+                # Snapshot consumer only sees the token while it's actually
+                # valid — past expiry it's already as good as gone.
+                surfaced_token = token if (token and time.time() <= expires) else None
+                out["pending_plan"] = {
+                    "proposed_at":   proposal.get("proposed_at"),
+                    "confirm_token": surfaced_token,
+                    "transfers":     proposal.get("transfers", []) or [],
+                }
+        except Exception as e:
+            logger.debug("balance pending_plan failed: %s", e)
+
         return out
 
     @staticmethod

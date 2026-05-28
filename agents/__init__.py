@@ -376,46 +376,15 @@ class ArbAgentWrapper(BaseAgent):
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# Placeholder agents — render on dashboard, no behaviour yet
-# ─────────────────────────────────────────────────────────────────────────
-
-class MacroAgentPlaceholder(PlaceholderAgent):
-    """Placeholder — no capital, no behaviour. Reserves the dashboard
-    slot and the agent_id for the real implementation.
-
-    When implementing the real MacroAgent:
-      - Subclass BaseAgent (not PlaceholderAgent)
-      - Consume macro.macro_monitor.get_current_regime() for context
-        (scenario, scores, dimensional flags) — that's the regime view
-      - Consume macro.macro_monitor.get_macro_signals() for discrete
-        events (VIX_CRISIS, YIELD_CURVE_INVERSION, DOLLAR_STRENGTH).
-        These are generated each tick but not yet consumed by any agent
-      - See macro/signals.py for the MacroSignal dataclass shape
-      - React to scenarios rather than scan signals — e.g. open BTC
-        hedges on CRISIS, scale into longs on EASING_CYCLE, reduce
-        exposure on TIGHTENING_CYCLE
-      - Give it its own capital pool + circuit breakers in
-        config/settings.py (MACRO_AGENT_CAPITAL, etc.)
-      - The monitor's run_refresh_loop already runs as part of bot
-        startup, so no extra fetching plumbing is needed here
-    """
-    agent_id     = "macro"
-    display_name = "Macro Agent"
-
-
-class SentimentAgentPlaceholder(PlaceholderAgent):
-    agent_id     = "sentiment_agent"
-    display_name = "Sentiment Agent"
-
-
-class OnChainAgentPlaceholder(PlaceholderAgent):
-    agent_id     = "onchain"
-    display_name = "On-Chain Agent"
-
-
-# ─────────────────────────────────────────────────────────────────────────
 # Registry — Coordinator picks this up by default
 # ─────────────────────────────────────────────────────────────────────────
+#
+# Web UI v2 removed the macro / sentiment_agent / onchain placeholder
+# registrations — they took grid space without behaviour. The
+# PlaceholderAgent base class in agents.base remains for future agents
+# that want a UI presence before they're functional. To re-add one,
+# subclass PlaceholderAgent here and append an instance below; the
+# coordinator + dashboard pick it up automatically.
 
 from agents.scalping_agent import ScalpingAgent
 from agents.crosschain_agent import CrossChainArbAgent
@@ -430,9 +399,6 @@ REGISTERED_AGENTS: list[BaseAgent] = [
     CrossChainArbAgent(),
     FundingArbAgent(),
     BalanceAgent(),
-    MacroAgentPlaceholder(),
-    SentimentAgentPlaceholder(),
-    OnChainAgentPlaceholder(),
     # Add new agents here (instances).
 ]
 
@@ -447,7 +413,4 @@ __all__ = [
     "CrossChainArbAgent",
     "FundingArbAgent",
     "BalanceAgent",
-    "MacroAgentPlaceholder",
-    "SentimentAgentPlaceholder",
-    "OnChainAgentPlaceholder",
 ]

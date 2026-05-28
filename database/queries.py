@@ -2241,3 +2241,245 @@ def get_latest_fund_efficiency(fund: str):
             .order_by(desc(FundCapitalEfficiency.timestamp))
             .first()
         )
+
+
+# ── Web UI v2 — agent-panel snapshots ───────────────────────────────────────
+#
+# Each function is defensive (try/except returning empty/zero default), each
+# returns plain dicts so the snapshot helper never leaks ORM objects to the
+# WebSocket layer. The push loop runs every WEB_UI_PUSH_INTERVAL_S so these
+# must stay cheap — no joins beyond what's strictly required.
+
+def _today_utc_start():
+    """First instant of today's UTC date — used to scope 'today' aggregates."""
+    now = datetime.utcnow()
+    return datetime(now.year, now.month, now.day)
+
+
+def get_xchain_today_summary() -> dict:
+    """Same shape as get_xchain_summary but scoped to today's UTC rows.
+
+    Returns zeros for every field when no observations have been logged
+    today — the panel renders zeros, not "no data". `pct_blocked_by_*`
+    are percentages of `n_observations`, not of the blocked subset.
+    """
+    out = {
+        "n_observations":          0,
+        "n_would_entry":           0,
+        "mean_net_edge_bps":       0.0,
+        "median_net_edge_bps":     0.0,
+        "pct_blocked_by_gas":      0.0,
+        "pct_blocked_by_min_edge": 0.0,
+    }
+    try:
+        since = _today_utc_start()
+        with get_session() as s:
+            rows = (
+                s.query(XChainObservation)
+                .filter(XChainObservation.timestamp >= since)
+                .all()
+            )
+    except Exception:
+        return out
+    if not rows:
+        return out
+
+    out["n_observations"] = len(rows)
+    out["n_would_entry"]  = sum(1 for r in rows if r.would_entry)
+
+    edges = [r.net_edge_bps for r in rows if r.net_edge_bps is not None]
+    if edges:
+        out["mean_net_edge_bps"] = sum(edges) / len(edges)
+        srt = sorted(edges)
+        mid = len(srt) // 2
+        out["median_net_edge_bps"] = (
+            srt[mid] if len(srt) % 2 == 1 else (srt[mid - 1] + srt[mid]) / 2
+        )
+
+    n = len(rows)
+    gas_blocked = sum(
+        1 for r in rows
+        if r.skip_reason and "gas" in r.skip_reason.lower()
+    )
+    edge_blocked = sum(
+        1 for r in rows
+        if r.skip_reason and "min_edge" in r.skip_reason.lower()
+    )
+    out["pct_blocked_by_gas"]      = gas_blocked  / n * 100.0
+    out["pct_blocked_by_min_edge"] = edge_blocked / n * 100.0
+    return out
+
+
+def get_funding_today_summary() -> dict:
+    """Today's FundingArbObservationModel aggregate for the v2 funding panel.
+
+    `blended_apr_pct` is the conservative SOAK_CRITERIA read:
+    `(n_would_enter / n_observations) * mean_projected_apr_pct`. It serves
+    as a proxy for `deployed_fraction × in_deployment_apr` without needing
+    the coordinator's live deployed state.
+
+    `skip_reasons` is a four-bucket count keyed by case-insensitive string
+    matching on the observation row's free-form `skip_reason` column:
+      - "gate" / "below_gate" / "min_apr"  → below_gate
+      - "basis"                            → basis_unfavourable
+      - "depth"                            → depth_thin
+      - everything else (including empty)  → other (but only counted when
+        the row's would_enter is False; True rows contribute nothing here).
+    """
+    out = {
+        "n_observations":           0,
+        "n_would_enter":            0,
+        "utilisation_pct":          0.0,
+        "mean_projected_apr_pct":   0.0,
+        "median_projected_apr_pct": 0.0,
+        "blended_apr_pct":          0.0,
+        "skip_reasons": {
+            "below_gate":         0,
+            "basis_unfavourable": 0,
+            "depth_thin":         0,
+            "other":              0,
+        },
+    }
+    try:
+        # FundingArbObservationModel.timestamp is Unix epoch (Float).
+        since_ts = _today_utc_start().timestamp()
+        with get_session() as s:
+            rows = (
+                s.query(FundingArbObservationModel)
+                .filter(FundingArbObservationModel.timestamp >= since_ts)
+                .all()
+            )
+    except Exception:
+        return out
+    if not rows:
+        return out
+
+    out["n_observations"] = len(rows)
+    enter_rows = [r for r in rows if r.would_enter]
+    out["n_would_enter"]  = len(enter_rows)
+    if out["n_observations"]:
+        out["utilisation_pct"] = (
+            out["n_would_enter"] / out["n_observations"] * 100.0
+        )
+
+    if enter_rows:
+        aprs = [float(r.projected_net_apr or 0.0) * 100.0 for r in enter_rows]
+        out["mean_projected_apr_pct"] = sum(aprs) / len(aprs)
+        srt = sorted(aprs)
+        mid = len(srt) // 2
+        out["median_projected_apr_pct"] = (
+            srt[mid] if len(srt) % 2 == 1 else (srt[mid - 1] + srt[mid]) / 2
+        )
+        out["blended_apr_pct"] = (
+            out["mean_projected_apr_pct"]
+            * (out["n_would_enter"] / out["n_observations"])
+        )
+
+    # Skip-reason taxonomy: count only on rows that did NOT enter — the
+    # operator wants to see WHY entries were rejected, not why winners won.
+    for r in rows:
+        if r.would_enter:
+            continue
+        reason = (r.skip_reason or "").lower()
+        if any(tok in reason for tok in ("gate", "below_gate", "min_apr")):
+            out["skip_reasons"]["below_gate"] += 1
+        elif "basis" in reason:
+            out["skip_reasons"]["basis_unfavourable"] += 1
+        elif "depth" in reason:
+            out["skip_reasons"]["depth_thin"] += 1
+        else:
+            out["skip_reasons"]["other"] += 1
+    return out
+
+
+def _capital_movement_to_dict(r) -> dict:
+    """Stable dict shape the web layer renders. Used by both
+    get_capital_movements_recent and get_capital_movements_in_transit."""
+    ts = r.timestamp
+    return {
+        "id":            r.id,
+        "ts":            ts.strftime("%H:%M:%S") if ts else "—",
+        "from_fund":     r.from_fund,
+        "to_fund":       r.to_fund,
+        "from_exchange": r.from_exchange,
+        "to_exchange":   r.to_exchange,
+        "asset":         r.asset or "USDT",
+        "amount_usd":    float(r.amount_usd or 0.0),
+        "state":         r.state or "pending",
+        "initiated_by":  r.initiated_by or "",
+        "error":         r.error,
+    }
+
+
+def get_capital_movements_recent(limit: int = 50) -> list[dict]:
+    """Newest-first capital_movements rows as plain dicts. Used by the
+    Balance panel's in-transit + recent-history surfaces."""
+    from .models import CapitalMovement
+    try:
+        with get_session() as s:
+            rows = (
+                s.query(CapitalMovement)
+                .order_by(desc(CapitalMovement.timestamp))
+                .limit(limit)
+                .all()
+            )
+        return [_capital_movement_to_dict(r) for r in rows]
+    except Exception:
+        return []
+
+
+def get_capital_movements_in_transit() -> list[dict]:
+    """Subset of capital_movements with state in ('pending', 'in_transit'),
+    newest first. Same dict shape as get_capital_movements_recent."""
+    from .models import CapitalMovement
+    try:
+        with get_session() as s:
+            rows = (
+                s.query(CapitalMovement)
+                .filter(CapitalMovement.state.in_(("pending", "in_transit")))
+                .order_by(desc(CapitalMovement.timestamp))
+                .all()
+            )
+        return [_capital_movement_to_dict(r) for r in rows]
+    except Exception:
+        return []
+
+
+def get_fund_efficiency_summary(window_hours: int = 24) -> list[dict]:
+    """One dict per fund summarising the efficiency rows in the window.
+
+    `deployed_usd` and `return_on_deployed_pct` come from the most recent
+    row in the window (latest snapshot). `realised_return_usd` is the SUM
+    of returns logged in the window (so a 24h window approximates the
+    fund's realised daily P&L). `starvation_events` counts rows where
+    `starvation_event=True`.
+    """
+    from .models import FundCapitalEfficiency
+    out: dict[str, dict] = {}
+    try:
+        since = datetime.utcnow() - timedelta(hours=int(window_hours))
+        with get_session() as s:
+            rows = (
+                s.query(FundCapitalEfficiency)
+                .filter(FundCapitalEfficiency.timestamp >= since)
+                .order_by(FundCapitalEfficiency.timestamp)
+                .all()
+            )
+    except Exception:
+        return []
+    for r in rows:
+        fund = r.fund or "unknown"
+        bucket = out.setdefault(fund, {
+            "fund":                   fund,
+            "deployed_usd":           0.0,
+            "realised_return_usd":    0.0,
+            "return_on_deployed_pct": 0.0,
+            "starvation_events":      0,
+        })
+        # Latest deployed + return_on_deployed_pct (rows are ascending by ts).
+        bucket["deployed_usd"]           = float(r.deployed_usd or 0.0)
+        bucket["return_on_deployed_pct"] = float(r.return_on_deployed_pct or 0.0)
+        bucket["realised_return_usd"]   += float(r.realised_return_usd or 0.0)
+        if r.starvation_event:
+            bucket["starvation_events"] += 1
+    return list(out.values())

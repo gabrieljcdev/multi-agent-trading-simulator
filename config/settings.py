@@ -652,6 +652,28 @@ SIM_TRANSFER_DELAY_S       = 600     # test: 60-7200    (simulated in-transit ti
 SIM_REBALANCE_FAILURE_RATE = 0.0     # test: 0.0-0.10   (inject failures to exercise auto-pause)
 REBALANCE_CONFIRM_WINDOW_S = 3       # test: 2-30       (/action/rebalance arm→confirm window)
 
+# Web UI v2 — rebalance arm token timeout. The server holds the token in
+# memory only; expiry is independent of the confirm-click window so an
+# operator that armed but then walked away gets a stale-token error
+# rather than a successful confirm from a forgotten browser tab.
+REBALANCE_ARM_TIMEOUT_S = 10         # test: 5-30
+
+# Web UI v2 — operator-gated rebalance dispatch.
+#   False : _scan_once() buffers targets/bands/transfers only; the operator
+#           drives every real move via /action/rebalance confirm. Required
+#           for the v2 web UI flow.
+#   True  : auto-dispatch at end of _scan_once() (legacy). Use only when no
+#           operator is in the loop and you trust the policy + planner to
+#           move capital unattended.
+BALANCE_AUTO_DISPATCH = False        # test: True/False
+
+# Web UI v2 — fallback thresholds the HTML reads to colour panels.
+# Above the stablecoin benchmark, funding's blended APR renders green; below
+# it grey. Above the funding delta tolerance, an open funding position's
+# delta_usd renders amber (the leg drifted off neutral).
+STABLECOIN_BENCHMARK_APR_PCT = 5.0   # test: 3-8
+FUNDING_DELTA_TOLERANCE_USD  = 5.0   # test: 1-20
+
 # Default agent allocation for the BalanceAgent itself — it's operational
 # (no alpha, no positions), so its capital_allocation is zero. The fund
 # pools it manages live in FUND_*_CAPITAL above.

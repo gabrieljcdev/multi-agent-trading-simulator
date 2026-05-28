@@ -30,6 +30,8 @@ _TOP_LEVEL_KEYS = (
     "exchanges", "signals", "pending_signal", "positions", "scalp", "arb_feed",
     "session_pnl", "log", "top_pairs", "top_strategies", "insights",
     "arb_history",
+    # Web UI v2 — dedicated agent-panel keys.
+    "arb", "xchain", "funding", "balance",
 )
 
 
@@ -523,14 +525,16 @@ async def test_api_agent_scalp_returns_trades_and_insights(web_temp):
 
 
 @pytest.mark.asyncio
-async def test_api_agent_macro_returns_empty_lists(web_temp):
+async def test_api_agent_placeholders_now_404(web_temp):
+    """Web UI v2 dropped macro / sentiment_agent / onchain from
+    _VALID_AGENTS — their detail endpoints now 404, matching the snapshot
+    side (those ids are no longer in REGISTERED_AGENTS either)."""
     wsm, db, q = web_temp
     client = await _client(wsm.WebServer(coordinator=None, bot=None))
     try:
         for aid in ("macro", "sentiment_agent", "onchain"):
             r = await client.get("/api/agent/" + aid)
-            assert r.status == 200
-            assert await r.json() == {"trades": [], "insights": []}
+            assert r.status == 404
     finally:
         await client.close()
 
@@ -625,5 +629,399 @@ async def test_api_session_unknown_returns_404(web_temp):
     client = await _client(wsm.WebServer(coordinator=None, bot=None))
     try:
         assert (await client.get("/api/session/atlantis")).status == 404
+    finally:
+        await client.close()
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Web UI v2 — dedicated agent panels (arb extension, xchain, funding, balance)
+# + /action/rebalance three-action contract.
+#
+# Each new snapshot key must be present even with no agent wired up
+# (defensive default). The rebalance endpoint mirrors /action/kill's
+# two-step (arm → confirm) shape with an added cancel action.
+# ════════════════════════════════════════════════════════════════════════════
+
+
+def _build_balance_agent_mock(*, paused=False, transfers=None, arm_token=None,
+                              arm_expires=None, execute_result=None,
+                              execute_raises=None):
+    """Reusable BalanceAgent mock with the v2-required public surface."""
+    agent = MagicMock()
+    agent._paused           = paused
+    agent._arm_token        = arm_token
+    agent._arm_expires_at   = (
+        arm_expires if arm_expires is not None
+        else (time.time() + 60 if arm_token else 0.0)
+    )
+    agent._running          = True
+    agent._transfers_today  = 0
+    agent._fees_today_usd   = 0.0
+    agent._daily_rebalances = 0
+    agent._last_computed_targets = {}
+    agent._last_computed_bands   = {}
+
+    def _arm():
+        token = "tok-" + str(int(time.time() * 1000))
+        agent._arm_token      = token
+        agent._arm_expires_at = time.time() + 60
+        return token, {"live": False, "mexc_warning": ""}
+    agent.arm = _arm
+    agent.consume_arm = lambda t: (t and t == agent._arm_token)
+    agent.get_pending_proposal = lambda: {
+        "proposed_at":  "12:00:00",
+        "proposal_id":  1,
+        "transfers":    transfers or [],
+    }
+    if execute_raises is not None:
+        async def _exec_raise(token):
+            raise execute_raises
+        agent.execute_proposal = _exec_raise
+    else:
+        async def _exec(token):
+            if execute_result is not None:
+                return execute_result
+            return {"ok": True, "transfer_ids": [101, 102]}
+        agent.execute_proposal = _exec
+    return agent
+
+
+def _build_coordinator(*, agents_by_id=None):
+    """Coordinator stub with the get_agent/get_primary_bot surface the
+    web layer reads. agents_by_id maps agent_id → mock agent."""
+    by_id = agents_by_id or {}
+    coord = SimpleNamespace(
+        get_agent=lambda aid: by_id.get(aid),
+        get_primary_bot=lambda: None,
+        get_portfolio_stats=AsyncMock(return_value={}),
+        get_agent_stats=AsyncMock(return_value=[]),
+    )
+    return coord
+
+
+# ── Snapshot — new top-level keys present + defaults safe ────────────────────
+
+def test_snapshot_includes_arb_extended_keys():
+    ws = WebServer(coordinator=None, bot=None)
+    snap = ws._build_snapshot()
+    arb = snap["arb"]
+    for k in ("exchanges", "gap_distribution", "threshold", "semaphore"):
+        assert k in arb, f"missing arb.{k}"
+    assert arb["gap_distribution"]["bucket_edges_bps"] == [0, 5, 10, 20, 50, 100, 250]
+    assert arb["semaphore"]["capacity"] >= 1
+
+
+def test_snapshot_includes_xchain_keys():
+    ws = WebServer(coordinator=None, bot=None)
+    x = ws._build_snapshot()["xchain"]
+    for k in ("status", "capital_usd", "chains", "best_pair",
+              "inventory_targets", "today_summary"):
+        assert k in x, f"missing xchain.{k}"
+    # Empty defaults when no agent registered.
+    assert x["chains"] == []
+    assert x["inventory_targets"] == []
+    assert x["status"] in ("OFFLINE", "OBSERVATION", "RUNNING", "ERROR")
+
+
+def test_snapshot_includes_funding_keys():
+    ws = WebServer(coordinator=None, bot=None)
+    f = ws._build_snapshot()["funding"]
+    for k in ("status", "capital_usd", "venue", "symbols",
+              "positions", "today_summary"):
+        assert k in f, f"missing funding.{k}"
+    assert f["symbols"] == []
+    assert f["positions"] == []
+    for k in ("below_gate", "basis_unfavourable", "depth_thin", "other"):
+        assert k in f["today_summary"]["skip_reasons"]
+
+
+def test_snapshot_includes_balance_keys():
+    ws = WebServer(coordinator=None, bot=None)
+    b = ws._build_snapshot()["balance"]
+    for k in ("status", "kill_blocked", "pool", "funds", "nodes",
+              "in_transit", "halted_pairs", "today", "pending_plan"):
+        assert k in b, f"missing balance.{k}"
+    for k in ("equity_usd", "reserve_usd", "deployed_usd", "pool_usd"):
+        assert k in b["pool"]
+    assert b["pending_plan"]["confirm_token"] is None
+
+
+def test_snapshot_safe_when_balance_agent_raises():
+    bad = MagicMock()
+    type(bad)._paused = property(lambda self: (_ for _ in ()).throw(RuntimeError("boom")))
+    bad.get_pending_proposal = MagicMock(side_effect=RuntimeError("boom"))
+    coord = _build_coordinator(agents_by_id={"balance": bad})
+    ws = WebServer(coordinator=coord, bot=None)
+    snap = ws._build_snapshot()   # must not raise
+    assert "balance" in snap
+    assert snap["balance"]["pending_plan"]["transfers"] == []
+
+
+def test_snapshot_safe_when_xchain_engine_raises():
+    bad = MagicMock()
+    bad.observation_mode = False
+    bad.get_inventory_targets = MagicMock(side_effect=RuntimeError("engine down"))
+    coord = _build_coordinator(agents_by_id={"xchain": bad})
+    ws = WebServer(coordinator=coord, bot=None)
+    snap = ws._build_snapshot()
+    assert snap["xchain"]["status"] == "ERROR"
+    assert snap["xchain"]["inventory_targets"] == []
+
+
+def test_snapshot_safe_when_funding_engine_raises():
+    bad = MagicMock()
+    bad.observation_mode = False
+    # property that raises whenever _positions is read
+    type(bad)._positions = property(lambda self: (_ for _ in ()).throw(RuntimeError("oops")))
+    coord = _build_coordinator(agents_by_id={"funding_arb": bad})
+    ws = WebServer(coordinator=coord, bot=None)
+    snap = ws._build_snapshot()
+    assert snap["funding"]["status"] == "ERROR"
+    assert snap["funding"]["positions"] == []
+
+
+@pytest.mark.asyncio
+async def test_placeholder_agents_not_in_snapshot():
+    """The three placeholder agent_ids must not surface in snapshot.agents[]
+    even when the coordinator returns AgentStats-like rows for them — the
+    Web UI v2 dropped their registrations entirely."""
+    agents = [
+        SimpleNamespace(agent_id="signal",          status="RUNNING", capital_allocated=100.0,
+                        daily_pnl=0.0, trades_today=0, win_rate_today=0.0),
+        SimpleNamespace(agent_id="scalp",           status="RUNNING", capital_allocated=200.0,
+                        daily_pnl=0.0, trades_today=0, win_rate_today=0.0),
+    ]
+    coord = SimpleNamespace(
+        get_agent=lambda aid: None,
+        get_primary_bot=lambda: None,
+        get_portfolio_stats=AsyncMock(return_value={}),
+        get_agent_stats=AsyncMock(return_value=agents),
+    )
+    ws = WebServer(coordinator=coord, bot=None)
+    await ws._refresh_coordinator()
+    ids = [a["id"] for a in ws._build_snapshot()["agents"]]
+    for placeholder in ("macro", "sentiment_agent", "onchain"):
+        assert placeholder not in ids
+
+
+# ── /action/rebalance — three actions, error envelope ───────────────────────
+
+@pytest.mark.asyncio
+async def test_rebalance_arm_returns_token():
+    transfers = [{"from_fund": "signal", "to_fund": "arb",
+                  "from_exchange": "binance", "to_exchange": "kraken",
+                  "asset": "USDT", "amount_usd": 25.0,
+                  "est_fee_usd": 1.0, "est_time_s": 600,
+                  "ring_fence_warning": None}]
+    agent = _build_balance_agent_mock(transfers=transfers)
+    coord = _build_coordinator(agents_by_id={"balance": agent})
+    ws = WebServer(coordinator=coord, bot=None)
+    client = await _client(ws)
+    try:
+        r = await client.post("/action/rebalance", json={"action": "arm"})
+        d = await r.json()
+        assert d["ok"] is True
+        assert d["confirm_token"].startswith("tok-")
+        assert d["expires_in_s"] >= 1
+        assert d["proposal"]["transfers"] == transfers
+        assert isinstance(d["ring_fence_warnings"], list)
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_rebalance_confirm_executes_within_window(monkeypatch):
+    monkeypatch.setattr(settings, "SIM_MODE", True)
+    monkeypatch.setattr("ui.web_server.db_queries.log_agent_event",
+                        lambda *a, **k: None)
+    agent = _build_balance_agent_mock(
+        transfers=[{"from_fund": "signal", "to_fund": "arb",
+                    "from_exchange": "binance", "to_exchange": "kraken",
+                    "asset": "USDT", "amount_usd": 25.0,
+                    "est_fee_usd": 1.0, "est_time_s": 600,
+                    "ring_fence_warning": None}],
+        execute_result={"ok": True, "transfer_ids": [42]},
+    )
+    coord = _build_coordinator(agents_by_id={"balance": agent})
+    ws = WebServer(coordinator=coord, bot=None)
+    client = await _client(ws)
+    try:
+        arm = await (await client.post("/action/rebalance", json={"action": "arm"})).json()
+        token = arm["confirm_token"]
+        r = await client.post("/action/rebalance",
+                              json={"action": "confirm", "confirm_token": token})
+        d = await r.json()
+        assert d["ok"] is True
+        assert d["transfer_ids"] == [42]
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_rebalance_confirm_expired_token(monkeypatch):
+    monkeypatch.setattr(settings, "SIM_MODE", True)
+    agent = _build_balance_agent_mock(
+        execute_result={"ok": False, "error": "token_expired"},
+    )
+    coord = _build_coordinator(agents_by_id={"balance": agent})
+    ws = WebServer(coordinator=coord, bot=None)
+    client = await _client(ws)
+    try:
+        await client.post("/action/rebalance", json={"action": "arm"})
+        # Force the agent into "token expired" mode (mock returns directly).
+        r = await client.post("/action/rebalance",
+                              json={"action": "confirm", "confirm_token": "anything"})
+        d = await r.json()
+        assert d["ok"] is False
+        assert d["error"] == "token_expired"
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_rebalance_confirm_mismatched_token(monkeypatch):
+    monkeypatch.setattr(settings, "SIM_MODE", True)
+    agent = _build_balance_agent_mock(
+        execute_result={"ok": False, "error": "token_invalid"},
+    )
+    coord = _build_coordinator(agents_by_id={"balance": agent})
+    ws = WebServer(coordinator=coord, bot=None)
+    client = await _client(ws)
+    try:
+        await client.post("/action/rebalance", json={"action": "arm"})
+        r = await client.post("/action/rebalance",
+                              json={"action": "confirm", "confirm_token": "wrong-token"})
+        d = await r.json()
+        assert d["ok"] is False
+        assert d["error"] == "token_invalid"
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_rebalance_cancel_invalidates_token(monkeypatch):
+    monkeypatch.setattr(settings, "SIM_MODE", True)
+    agent = _build_balance_agent_mock(
+        execute_result={"ok": False, "error": "token_invalid"},
+    )
+    coord = _build_coordinator(agents_by_id={"balance": agent})
+    ws = WebServer(coordinator=coord, bot=None)
+    client = await _client(ws)
+    try:
+        arm = await (await client.post("/action/rebalance", json={"action": "arm"})).json()
+        token = arm["confirm_token"]
+        canc = await (await client.post(
+            "/action/rebalance",
+            json={"action": "cancel", "confirm_token": token},
+        )).json()
+        assert canc["ok"] is True
+        # Subsequent confirm fails.
+        r = await client.post("/action/rebalance",
+                              json={"action": "confirm", "confirm_token": token})
+        d = await r.json()
+        assert d["ok"] is False
+        assert d["error"] == "token_invalid"
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_rebalance_blocked_when_live_disabled(monkeypatch):
+    """SIM_MODE=False + REBALANCE_LIVE_ENABLED=False → confirm refuses
+    before even reaching the agent (defence-in-depth)."""
+    monkeypatch.setattr(settings, "SIM_MODE", False)
+    monkeypatch.setattr(settings, "REBALANCE_LIVE_ENABLED", False)
+    agent = _build_balance_agent_mock()
+    coord = _build_coordinator(agents_by_id={"balance": agent})
+    ws = WebServer(coordinator=coord, bot=None)
+    client = await _client(ws)
+    try:
+        await client.post("/action/rebalance", json={"action": "arm"})
+        r = await client.post("/action/rebalance",
+                              json={"action": "confirm", "confirm_token": "anything"})
+        d = await r.json()
+        assert d["ok"] is False
+        assert d["error"] == "live_rebalance_disabled"
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_rebalance_blocked_when_balance_agent_missing():
+    """Coordinator returns None for the balance agent — every action
+    returns the same envelope so the operator gets a clean error
+    regardless of which button they pressed."""
+    coord = _build_coordinator(agents_by_id={})   # no balance entry
+    ws = WebServer(coordinator=coord, bot=None)
+    client = await _client(ws)
+    try:
+        for action_body in (
+            {"action": "arm"},
+            {"action": "confirm", "confirm_token": "anything"},
+            {"action": "cancel",  "confirm_token": "anything"},
+        ):
+            r = await client.post("/action/rebalance", json=action_body)
+            d = await r.json()
+            assert d["ok"] is False
+            assert d["error"] == "balance_agent_unavailable"
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_rebalance_logs_event_on_confirm(monkeypatch):
+    """On confirm success, log_agent_event is called with the agent id,
+    the REBALANCE_WEB event type, and a detail line containing
+    'source=web_ui' + the transfer IDs."""
+    monkeypatch.setattr(settings, "SIM_MODE", True)
+    captured = []
+    monkeypatch.setattr(
+        "ui.web_server.db_queries.log_agent_event",
+        lambda agent_id, event_type, detail="": captured.append(
+            (agent_id, event_type, detail)
+        ),
+    )
+    agent = _build_balance_agent_mock(
+        execute_result={"ok": True, "transfer_ids": [7, 8]},
+    )
+    coord = _build_coordinator(agents_by_id={"balance": agent})
+    ws = WebServer(coordinator=coord, bot=None)
+    client = await _client(ws)
+    try:
+        await client.post("/action/rebalance", json={"action": "arm"})
+        await client.post("/action/rebalance",
+                          json={"action": "confirm", "confirm_token": "anything"})
+        # Two events fire: REBALANCE_ARM and REBALANCE_WEB. Match the WEB one.
+        web_events = [e for e in captured if e[1] == "REBALANCE_WEB"]
+        assert len(web_events) == 1
+        agent_id, _evt, detail = web_events[0]
+        assert agent_id == "balance"
+        assert "source=web_ui" in detail
+        assert "transfer_ids=[7, 8]" in detail
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_rebalance_confirm_replan_mismatch(monkeypatch):
+    """The handler propagates a 'plan_changed' error from the agent's
+    re-plan-on-confirm guard verbatim — the operator sees the same error
+    string the agent emitted, and the response stays {ok:false}."""
+    monkeypatch.setattr(settings, "SIM_MODE", True)
+    monkeypatch.setattr("ui.web_server.db_queries.log_agent_event",
+                        lambda *a, **k: None)
+    agent = _build_balance_agent_mock(
+        execute_result={"ok": False, "error": "plan_changed"},
+    )
+    coord = _build_coordinator(agents_by_id={"balance": agent})
+    ws = WebServer(coordinator=coord, bot=None)
+    client = await _client(ws)
+    try:
+        await client.post("/action/rebalance", json={"action": "arm"})
+        r = await client.post("/action/rebalance",
+                              json={"action": "confirm", "confirm_token": "anything"})
+        d = await r.json()
+        assert d["ok"] is False
+        assert d["error"] == "plan_changed"
     finally:
         await client.close()
