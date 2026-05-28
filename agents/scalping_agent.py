@@ -1585,8 +1585,20 @@ class ScalpingAgent(BaseAgent):
                 self._consec_losses += 1
             else:
                 self._consec_losses = 0
-            if abs(self._daily_loss) >= settings.SCALP_DAILY_LOSS_HALT:
-                self._halt(f"Daily loss halt: ${abs(self._daily_loss):.2f}")
+            # %-based daily-loss halt — scales with this agent's
+            # allocation so a compounding fund doesn't tighten its leash.
+            # get_capital_allocation() reads the live deployable pool
+            # (max of fund allocation and trading budget). 0 → no-op:
+            # observation mode has no allocated capital to halt against.
+            alloc = float(self.get_capital_allocation() or 0.0)
+            if alloc > 0:
+                halt_usd = (float(settings.SCALP_DAILY_LOSS_HALT_PCT) / 100.0) * alloc
+                if abs(self._daily_loss) >= halt_usd:
+                    self._halt(
+                        f"Daily loss halt: ${abs(self._daily_loss):.2f} >= "
+                        f"${halt_usd:.2f} "
+                        f"({settings.SCALP_DAILY_LOSS_HALT_PCT:.1f}% of ${alloc:.0f})"
+                    )
             if self._consec_losses >= settings.SCALP_CONSEC_LOSS_PAUSE:
                 self._halt(f"Consecutive losses: {self._consec_losses}")
 

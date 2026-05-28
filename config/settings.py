@@ -228,7 +228,7 @@ ARB_BASE_POSITION_USD     = 25.0      # test: 10.0–50.0  (base for gap-proport
 ARB_SIZE_MULTIPLIER_CAP   = 4.0       # test: 2.0–6.0    (max gap/threshold scale-up)
 ARB_MIN_LIQUIDITY_USD     = 500.0     # test: 250–2000   (sum of top 3 book levels)
 ARB_MAX_CONCURRENT        = 3         # test: 1–5
-ARB_DAILY_LOSS_HALT_USD   = 10.0      # test: 5–50
+ARB_DAILY_LOSS_HALT_PCT   = 2.0       # test: 1-5    (% of arb fund allocation)
 ARB_CONSECUTIVE_LOSS_HALT = 5         # test: 3–10
 
 # Pre-execution capital verification — query both exchange balances via
@@ -246,7 +246,7 @@ ARB_SLIPPAGE_MAX_PCT      = 0.25      # test: 0.1–0.5
 # circuit-breaker shape as ArbEngine with independent thresholds.
 ARB_FUNDING_RATE_MIN_PCT          = 0.05   # test: 0.03–0.10  (per 8h funding)
 ARB_FUNDING_RATE_EXIT_PCT         = 0.02   # test: 0.01–0.05
-ARB_FUNDING_DAILY_LOSS_HALT_USD   = 15.0
+ARB_FUNDING_DAILY_LOSS_HALT_PCT   = 3.0    # test: 1-5    (% of arb fund allocation)
 ARB_FUNDING_CONSECUTIVE_LOSS_HALT = 4
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -275,7 +275,7 @@ FUNDING_BASIS_SIGMA_EXIT       = 1.5        # test: 1.0-3.0
 FUNDING_MARGIN_ALERT_RATIO     = 1.5        # test: 1.2-2.0
 FUNDING_MAX_HOLD_SEC           = 1209600    # test: 86400-2592000
 FUNDING_SIM_SLIPPAGE_PCT       = 0.0002     # test: 0.0001-0.001
-FUNDING_DAILY_LOSS_HALT_USD    = 10.0       # test: 5-50
+FUNDING_DAILY_LOSS_HALT_PCT    = 2.0        # test: 1-5    (% of FUNDING_CAPITAL_USD; 0-alloc → no-op)
 FUNDING_CONSECUTIVE_LOSS_HALT  = 4          # test: 3-6
 
 # Pairs the arb engine watches. Distinct from signal-track FALLBACK_PAIRS.
@@ -642,6 +642,12 @@ WITHDRAWAL_ROUTES: dict = {}      # test: seeded from ccxt; live cex rail no-ops
 
 # ── Sim realism + UX ──────────────────────────────────────────────────────
 SIM_WITHDRAWAL_FEE_USD     = 1.0     # test: 0.04-1.6   (simulated per-transfer fee, route-dependent live)
+
+# GreedyNetPlanner internalize step: a target whose |drift_pct| exceeds
+# this hint is treated as STRUCTURAL (the strategy can't self-correct);
+# below the hint, we let the strategy mop up the drift inside its own
+# window. NOT the Miller-Orr band — band stays runtime-derived.
+BALANCE_STRUCTURAL_DRIFT_HINT = 0.20   # test: 0.10-0.40
 SIM_TRANSFER_DELAY_S       = 600     # test: 60-7200    (simulated in-transit time, sim_rail)
 SIM_REBALANCE_FAILURE_RATE = 0.0     # test: 0.0-0.10   (inject failures to exercise auto-pause)
 REBALANCE_CONFIRM_WINDOW_S = 3       # test: 2-30       (/action/rebalance arm→confirm window)
@@ -787,7 +793,7 @@ SCALP_MAX_CONCURRENT      = 2      # test: 1-3       (max open scalp positions)
 SCALP_POSITION_SIZE_USD   = 50.0   # test: 10-50     (per-trade size USD)
 
 # Circuit breakers
-SCALP_DAILY_LOSS_HALT     = 25.0   # test: 2-10      (daily loss halt USD)
+SCALP_DAILY_LOSS_HALT_PCT = 3.0    # test: 1-5       (% of scalp fund allocation; was abs USD)
 SCALP_CONSEC_LOSS_PAUSE   = 4      # test: 3-6       (consecutive loss pause count)
 
 # Session window — scalp edge depends on tight spreads + active flow,
@@ -908,7 +914,7 @@ XCHAIN_SLIPPAGE_TOLERANCE_BPS  = 10.0   # test: 5, 10, 20     (per-leg price imp
 XCHAIN_MAX_POSITION_USD        = 50.0   # test: 25, 50, 100, 250
 XCHAIN_INVENTORY_DRIFT_PCT     = 0.20   # test: 0.10, 0.20, 0.30  (theta; rebalance trigger)
 XCHAIN_SCAN_INTERVAL_MS        = 2000   # test: 1000, 2000, 5000
-XCHAIN_DAILY_LOSS_HALT_USD     = 10.0   # test: 5, 10, 20
+XCHAIN_DAILY_LOSS_HALT_PCT     = 2.0    # test: 1-5    (% of XCHAIN_CAPITAL; 0-alloc → no-op)
 XCHAIN_CONSECUTIVE_LOSS_HALT   = 5      # test: 3, 5
 XCHAIN_MAX_CONCURRENT          = 1      # test: 1, 2          (per-symbol scan concurrency cap)
 # Pool block staleness cap. An L2 opportunity that hasn't refreshed within this

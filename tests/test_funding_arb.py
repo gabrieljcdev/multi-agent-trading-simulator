@@ -409,12 +409,52 @@ async def test_observation_mode_zero_routing(monkeypatch, _force_observation):
 # ─────────────────────────────────────────────────────────────────────────
 
 def test_daily_loss_circuit_breaker_halts(monkeypatch):
-    monkeypatch.setattr(settings, "FUNDING_DAILY_LOSS_HALT_USD", 5.0)
+    # %-based: halt fires when daily_loss reaches (PCT/100) * allocation.
+    # Pick concrete alloc + PCT so the threshold is deterministic.
+    monkeypatch.setattr(settings, "FUNDING_DAILY_LOSS_HALT_PCT", 2.0)
     agent = FundingArbAgent(engine=_engine_with())
+    agent.capital_allocation = 250.0   # 2% of $250 → $5 halt
     agent._daily_loss = 6.0
     agent._check_circuit_breakers()
     assert agent._halted is True
     assert agent._halt_reason == "daily_loss"
+
+
+def test_daily_loss_circuit_breaker_zero_alloc_noop(monkeypatch):
+    """0-allocation observation-mode agent never halts on the daily-loss
+    rule — never divides by zero, never silently stops a zero-capital
+    agent from observing."""
+    monkeypatch.setattr(settings, "FUNDING_DAILY_LOSS_HALT_PCT", 2.0)
+    agent = FundingArbAgent(engine=_engine_with())
+    agent.capital_allocation = 0.0
+    agent._daily_loss = 1_000_000.0
+    agent._check_circuit_breakers()
+    assert agent._halted is False
+
+
+def test_daily_loss_halt_scales_with_allocation(monkeypatch):
+    """Doubling allocation doubles the USD loss tolerated — that's the
+    whole point of the %-based rule (it scales with the fund)."""
+    monkeypatch.setattr(settings, "FUNDING_DAILY_LOSS_HALT_PCT", 2.0)
+    # Small fund, $5 halt
+    a1 = FundingArbAgent(engine=_engine_with())
+    a1.capital_allocation = 250.0
+    a1._daily_loss = 4.99
+    a1._check_circuit_breakers()
+    assert a1._halted is False
+    a1._daily_loss = 5.01
+    a1._check_circuit_breakers()
+    assert a1._halted is True
+
+    # Double the fund → halt should ride up to $10
+    a2 = FundingArbAgent(engine=_engine_with())
+    a2.capital_allocation = 500.0
+    a2._daily_loss = 9.99
+    a2._check_circuit_breakers()
+    assert a2._halted is False
+    a2._daily_loss = 10.01
+    a2._check_circuit_breakers()
+    assert a2._halted is True
 
 
 # ─────────────────────────────────────────────────────────────────────────

@@ -282,16 +282,32 @@ def test_evaluate_pair_allows_600_at_5bps_budget():
 # (E) Circuit breakers halt on daily-loss and consecutive-loss
 # ─────────────────────────────────────────────────────────────────────────
 
-def test_circuit_breaker_halts_on_daily_loss():
+def test_circuit_breaker_halts_on_daily_loss(monkeypatch):
+    # %-based: with XCHAIN_CAPITAL=$500, PCT=2 → halt at -$10.
+    monkeypatch.setattr(settings, "XCHAIN_CAPITAL", 500.0)
     engine = CrossChainArbEngine(connectors=[
         _StubConnector("arbitrum", _state("arbitrum")),
         _StubConnector("base",     _state("base")),
     ])
-    # Push daily_pnl below -XCHAIN_DAILY_LOSS_HALT_USD.
-    engine.cb.daily_pnl_usd = -(settings.XCHAIN_DAILY_LOSS_HALT_USD + 0.01)
+    halt_usd = (settings.XCHAIN_DAILY_LOSS_HALT_PCT / 100.0) * 500.0
+    engine.cb.daily_pnl_usd = -(halt_usd + 0.01)
     assert engine._cb_triggered() is True
     assert engine.cb.halted is True
     assert "daily_loss" in engine.cb.halt_reason
+
+
+def test_circuit_breaker_zero_alloc_noop(monkeypatch):
+    """Observation-mode default (XCHAIN_CAPITAL=0) → daily-loss rule is a
+    no-op. Halt only on consecutive losses, even on a massive simulated
+    daily_pnl loss."""
+    monkeypatch.setattr(settings, "XCHAIN_CAPITAL", 0.0)
+    engine = CrossChainArbEngine(connectors=[
+        _StubConnector("arbitrum", _state("arbitrum")),
+        _StubConnector("base",     _state("base")),
+    ])
+    engine.cb.daily_pnl_usd = -1_000_000.0
+    assert engine._cb_triggered() is False
+    assert engine.cb.halted is False
 
 
 def test_circuit_breaker_halts_on_consecutive_losses():

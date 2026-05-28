@@ -1051,8 +1051,30 @@ class Dashboard:
         footer.append(str(missed), style=miss_style)
         footer.append(miss_suffix, style=miss_style)
 
-        return Panel(self._stack(t, footer), title="[bold]ARB FEED[/bold]",
-                     border_style="cyan")
+        # True-P&L strip: gross arb P&L | rebalance cost | TRUE net (7d).
+        # Pulls from queries.get_true_pnl so the cost is the same number
+        # the upcoming soak measures. Defensive: any failure renders an
+        # em-dash placeholder so the panel doesn't blow up on a fresh DB.
+        try:
+            from database import queries as _q
+            true_pnl = _q.get_true_pnl(days=7)
+            gross = float(true_pnl.get("gross_arb_pnl",  0.0) or 0.0)
+            cost  = float(true_pnl.get("rebalance_cost", 0.0) or 0.0)
+            net   = float(true_pnl.get("net_pnl",        0.0) or 0.0)
+            g_col, n_col = _pnl_colour(gross), _pnl_colour(net)
+            true_strip = Text()
+            true_strip.append("7d gross ", style="dim")
+            true_strip.append(f"${gross:+.2f}", style=g_col)
+            true_strip.append("   │   rebalance cost ", style="dim")
+            true_strip.append(f"${cost:.2f}", style="yellow" if cost > 0 else "dim")
+            true_strip.append("   │   TRUE net ", style="dim")
+            true_strip.append(f"${net:+.2f}", style=n_col)
+        except Exception as e:
+            logger.debug(f"true-pnl strip failed: {e}")
+            true_strip = Text("7d true-P&L unavailable", style="dim italic")
+
+        return Panel(self._stack(t, footer, true_strip),
+                     title="[bold]ARB FEED[/bold]", border_style="cyan")
 
     def _panel_arb_opportunities(self) -> Panel:
         """Detection-vs-execution funnel for the arb engine.

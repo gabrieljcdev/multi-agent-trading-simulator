@@ -595,13 +595,20 @@ class CrossChainArbEngine:
     def _cb_triggered(self) -> bool:
         if self.cb.halted:
             return True
-        if self.cb.daily_pnl_usd <= -settings.XCHAIN_DAILY_LOSS_HALT_USD:
-            self.cb.halted = True
-            self.cb.halt_reason = (
-                f"daily_loss_halt (${self.cb.daily_pnl_usd:.2f} <= "
-                f"-${settings.XCHAIN_DAILY_LOSS_HALT_USD})"
-            )
-            return True
+        # %-based: scale the daily-loss halt to XCHAIN_CAPITAL so a
+        # compounding fund doesn't tighten its leash silently. Observation
+        # mode (XCHAIN_CAPITAL=0) → halt is a no-op on this rule.
+        alloc = float(getattr(settings, "XCHAIN_CAPITAL", 0.0) or 0.0)
+        if alloc > 0:
+            halt_usd = (float(settings.XCHAIN_DAILY_LOSS_HALT_PCT) / 100.0) * alloc
+            if self.cb.daily_pnl_usd <= -halt_usd:
+                self.cb.halted = True
+                self.cb.halt_reason = (
+                    f"daily_loss_halt (${self.cb.daily_pnl_usd:.2f} <= "
+                    f"-${halt_usd:.2f}; "
+                    f"{settings.XCHAIN_DAILY_LOSS_HALT_PCT:.1f}% of ${alloc:.0f})"
+                )
+                return True
         if self.cb.consecutive_losses >= settings.XCHAIN_CONSECUTIVE_LOSS_HALT:
             self.cb.halted = True
             self.cb.halt_reason = (

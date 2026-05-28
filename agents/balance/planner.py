@@ -147,17 +147,23 @@ class GreedyNetPlanner(BaseRebalancePlanner):
         # ── Step 3: Derived Miller-Orr band — per node, breach
         # required before a transfer fires. Transfer brings the node
         # back to the RETURN POINT (target), not the band edge.
+        # _miller_orr_band returns the FULL SPREAD; the do-nothing
+        # region is target ± spread/2. Comparing against ±band (full)
+        # makes the do-nothing region 2× wider than intended — that's
+        # the FIX 4 correction below.
         breached: list[tuple["InventoryTarget", float, float]] = []
         for tgt in structural:
             cur = inv.effective_balance(tgt.fund, tgt.exchange, tgt.asset)
             band = self._miller_orr_band(tgt)
             if band <= 0:
                 continue
-            # Breach if current is OUTSIDE [target − band, target + band].
-            if cur < tgt.target_usd - band or cur > tgt.target_usd + band:
+            half = band / 2.0
+            # Breach if current is OUTSIDE [target − spread/2, target + spread/2].
+            if cur < tgt.target_usd - half or cur > tgt.target_usd + half:
                 # Per-cell signed residual (positive → surplus, send out;
                 # negative → deficit, pull in). The amount is the move
-                # back to the target (the return point).
+                # back to the target (the return point) — independent of
+                # spread, so no change here.
                 residual = cur - tgt.target_usd
                 breached.append((tgt, residual, band))
 
@@ -258,10 +264,12 @@ class GreedyNetPlanner(BaseRebalancePlanner):
             recent_starvations = set()
         out = []
         for t in targets:
-            # Pure drift over the policy's hint (≥20% drift) keeps the
-            # planner from getting talkative on routine fluctuation;
-            # a logged starvation accelerates the trip.
-            if t.fund in recent_starvations or abs(t.drift_pct) > 0.20:
+            # Pure drift over the policy's hint
+            # (settings.BALANCE_STRUCTURAL_DRIFT_HINT) keeps the planner
+            # from getting talkative on routine fluctuation; a logged
+            # starvation accelerates the trip regardless of drift size.
+            if (t.fund in recent_starvations
+                    or abs(t.drift_pct) > settings.BALANCE_STRUCTURAL_DRIFT_HINT):
                 out.append(t)
         return out
 
@@ -281,13 +289,16 @@ class GreedyNetPlanner(BaseRebalancePlanner):
 
     @staticmethod
     def _miller_orr_band(tgt: "InventoryTarget") -> float:
-        """Derived control-band half-width for one node.
+        """Derived Miller-Orr spread (FULL WIDTH) for one node.
 
             spread = (0.75 · transfer_cost · σ²_depletion / opportunity_cost)^(1/3)
 
-        Returns the SPREAD (full width). Half-width = spread/2 (we
-        compare cur − target against ±spread/2 implicitly via the
-        return-point logic above).
+        Returns the FULL spread. The do-nothing region is
+        ``target ± spread/2`` — the caller (`_plan_inner`) computes
+        ``half = band / 2.0`` and breaches the band when current is
+        outside ``[target − half, target + half]``. This contract — band
+        returns full spread, caller halves it — is the FIX 4 invariant;
+        do not change it without updating the breach test in tandem.
 
         transfer_cost is the simulated per-transfer fee
         (SIM_WITHDRAWAL_FEE_USD) by default; opportunity_cost is the

@@ -588,6 +588,66 @@ def log_funding_arb_trade(result, sim_mode: bool = True) -> int:
         return row.id
 
 
+def get_true_pnl(days: int = 7) -> dict:
+    """Gross arb P&L netted against the BalanceAgent's rebalance cost.
+
+    Returns:
+        {
+          "gross_arb_pnl": float,  # SUM(arb_trades.net_pnl_usd) over window
+          "rebalance_cost": float, # SUM(capital_movements fee) over same window,
+                                   #   completed + in_transit only (failed excluded)
+          "net_pnl":        float, # gross_arb_pnl − rebalance_cost
+          "movements":      int,   # count of fee-bearing movements in window
+        }
+
+    Raw rows are NOT mutated — this aggregation is derived at read time.
+    The rebalance cost is per-movement: sim rows charge
+    SIM_WITHDRAWAL_FEE_USD (what the SimTransferRail actually deducted);
+    live rows charge 0 because the live rail doesn't yet persist per-row
+    network fees (TODO: wire once live transfers carry a fee_usd column).
+
+    This is the single source of truth for "is arb profitable AFTER moving
+    capital around" — which is the metric the upcoming soak needs.
+    """
+    from config import settings as _s
+    from .models import CapitalMovement
+
+    since = datetime.utcnow() - timedelta(days=days)
+    sim_fee = float(getattr(_s, "SIM_WITHDRAWAL_FEE_USD", 0.0) or 0.0)
+
+    with get_session() as s:
+        # Gross arb P&L — successful arbs with a recorded net_pnl.
+        gross_rows = (
+            s.query(ArbTrade.net_pnl_usd)
+            .filter(ArbTrade.timestamp >= since,
+                    ArbTrade.success == True,   # noqa: E712
+                    ArbTrade.net_pnl_usd.isnot(None))
+            .all()
+        )
+        gross = float(sum((r[0] or 0.0) for r in gross_rows))
+
+        # Movements that incurred a real cost — completed + in_transit;
+        # failed rows are excluded because they were rolled back and the
+        # rail refunds the fee. Sim and live rows are counted; cost
+        # mapping depends on mode.
+        mvts = (
+            s.query(CapitalMovement.mode)
+            .filter(CapitalMovement.timestamp >= since,
+                    CapitalMovement.state.in_(("completed", "in_transit")))
+            .all()
+        )
+        sim_count  = sum(1 for (m,) in mvts if (m or "sim") == "sim")
+        cost = sim_count * sim_fee
+        n_total = len(mvts)
+
+    return {
+        "gross_arb_pnl":  round(gross, 2),
+        "rebalance_cost": round(cost,  2),
+        "net_pnl":        round(gross - cost, 2),
+        "movements":      n_total,
+    }
+
+
 def get_funding_arb_pnl_today() -> float:
     today = datetime.utcnow().date()
     with get_session() as s:

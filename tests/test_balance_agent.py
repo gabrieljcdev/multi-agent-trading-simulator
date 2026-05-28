@@ -461,3 +461,252 @@ class TestScalpAgentCompounding:
         a.capital_allocation = 700.0
         a._capital = 500.0
         assert a.get_capital_allocation() == 700.0
+
+
+# ── FIX 3: structural-drift hint comes from settings ────────────────────
+
+class TestStructuralDriftHint:
+    """The internalize step's drift hint must be the configured value,
+    not a literal — required for the soak so an operator can sweep it
+    without touching planner.py."""
+
+    def _tgt(self, drift_pct: float) -> InventoryTarget:
+        return InventoryTarget(
+            fund="arb", exchange="kraken", asset="USDT",
+            target_usd=100.0, floor_usd=0.0, cap_usd=200.0,
+            drift_pct=drift_pct, needs_rebalance=True,
+        )
+
+    def test_drift_hint_below_threshold_internalized(self, monkeypatch):
+        # With the hint at 0.20, drift 0.15 → strategy can self-correct
+        # (filtered out).
+        monkeypatch.setattr(settings, "BALANCE_STRUCTURAL_DRIFT_HINT", 0.20)
+        out = GreedyNetPlanner._filter_to_structural([self._tgt(0.15)])
+        assert out == []
+
+    def test_drift_hint_above_threshold_structural(self, monkeypatch):
+        # Drift 0.25 > hint 0.20 → structural, planner sees it.
+        monkeypatch.setattr(settings, "BALANCE_STRUCTURAL_DRIFT_HINT", 0.20)
+        out = GreedyNetPlanner._filter_to_structural([self._tgt(0.25)])
+        assert len(out) == 1
+
+    def test_drift_hint_can_be_swept(self, monkeypatch):
+        # A loose hint admits more candidates; a tight hint admits fewer.
+        # Same drift on both sides of the boundary — the hint is what
+        # decides, not the literal.
+        targets = [self._tgt(0.12)]
+        monkeypatch.setattr(settings, "BALANCE_STRUCTURAL_DRIFT_HINT", 0.10)
+        assert len(GreedyNetPlanner._filter_to_structural(targets)) == 1
+        monkeypatch.setattr(settings, "BALANCE_STRUCTURAL_DRIFT_HINT", 0.30)
+        assert GreedyNetPlanner._filter_to_structural(targets) == []
+
+    def test_no_020_literal_in_planner(self):
+        """Regression guard — the literal 0.20 must not reappear in the
+        structural-filter heuristic. Drift-hint comparison is the only
+        place the literal would creep back in."""
+        import inspect as _inspect
+        src = _inspect.getsource(GreedyNetPlanner._filter_to_structural)
+        assert "0.20" not in src, (
+            "0.20 literal re-introduced into _filter_to_structural — "
+            "must read settings.BALANCE_STRUCTURAL_DRIFT_HINT"
+        )
+        assert "BALANCE_STRUCTURAL_DRIFT_HINT" in src
+
+
+# ── FIX 4: Miller-Orr breach uses half-width, not full ──────────────────
+
+class TestMillerOrrHalfWidth:
+    """Regression for the factor-of-2 bug: the do-nothing region must be
+    target ± spread/2, NOT target ± spread (which is what the code did
+    before — making the band 2× wider than the canonical Miller-Orr
+    formula intends, so transfers fired far too rarely)."""
+
+    def _tgt(self, target_usd: float) -> InventoryTarget:
+        return InventoryTarget(
+            fund="arb", exchange="kraken", asset="USDT",
+            target_usd=target_usd, floor_usd=0.0,
+            cap_usd=target_usd * 5.0,
+            # drift_pct > BALANCE_STRUCTURAL_DRIFT_HINT so the
+            # structural filter doesn't drop the node before the band
+            # check.
+            drift_pct=0.50, needs_rebalance=True,
+        )
+
+    def test_node_at_0_4_spread_does_not_breach(self, monkeypatch):
+        """At 0.4 × spread from target, current is inside the do-nothing
+        region (|drift| < spread/2) → no transfer fires."""
+        monkeypatch.setattr(settings, "BALANCE_STRUCTURAL_DRIFT_HINT", 0.10)
+        tgt = self._tgt(target_usd=100.0)
+        planner = GreedyNetPlanner()
+        # Pin the band to a known value so the test is independent of
+        # SIM_WITHDRAWAL_FEE_USD / opportunity-cost defaults.
+        spread = 20.0
+        monkeypatch.setattr(planner, "_miller_orr_band",
+                            staticmethod(lambda t: spread))
+        # 0.4 * spread = 8 from target → cur=108 is INSIDE [target ± 10].
+        inv = MagicMock()
+        inv.effective_balance = MagicMock(return_value=108.0)
+        out = planner.plan(
+            inv=inv, targets=[tgt], cost_matrix={},
+            constraints=PlannerConstraints(daily_limit=3, daily_used=0,
+                                           in_flight=0),
+        )
+        assert out == [], "0.4*spread should NOT breach the do-nothing region"
+
+    def test_node_at_0_6_spread_breaches(self, monkeypatch):
+        """At 0.6 × spread from target, current is OUTSIDE the do-nothing
+        region (|drift| > spread/2) → transfer fires.
+
+        Before the FIX 4 correction the breach test used ±band (full
+        spread), so a 0.6*spread drift was inside the region and no
+        transfer fired — this regression test pins the corrected
+        behaviour.
+        """
+        monkeypatch.setattr(settings, "BALANCE_STRUCTURAL_DRIFT_HINT", 0.10)
+        # Surplus at one node, deficit at a paired node — same fund so
+        # the greedy match has something to do once the breach fires.
+        surplus = self._tgt(target_usd=100.0)
+        deficit = InventoryTarget(
+            fund="arb", exchange="bitget", asset="USDT",
+            target_usd=100.0, floor_usd=0.0, cap_usd=500.0,
+            drift_pct=-0.50, needs_rebalance=True,
+        )
+        planner = GreedyNetPlanner()
+        spread = 20.0
+        monkeypatch.setattr(planner, "_miller_orr_band",
+                            staticmethod(lambda t: spread))
+        # Surplus side: 0.6 * spread = 12 > 10 (half-width) — breach.
+        # Deficit side mirrors so the match has both ends.
+        balances = {("arb", "kraken", "USDT"): 112.0,
+                    ("arb", "bitget", "USDT"): 88.0}
+        inv = MagicMock()
+        inv.effective_balance = MagicMock(
+            side_effect=lambda fund, ex, asset: balances.get((fund, ex, asset), 0.0),
+        )
+        out = planner.plan(
+            inv=inv, targets=[surplus, deficit], cost_matrix={},
+            constraints=PlannerConstraints(daily_limit=3, daily_used=0,
+                                           in_flight=0),
+        )
+        assert len(out) == 1, "0.6*spread SHOULD breach the do-nothing region"
+        assert out[0].from_exchange == "kraken"
+        assert out[0].to_exchange   == "bitget"
+
+
+# ── FIX 2: get_true_pnl gross/cost/net round-trip ───────────────────────
+
+class TestGetTruePnl:
+    """End-to-end DB round trip for get_true_pnl against a temp SQLite.
+
+    Seeds arb_trades + capital_movements with known shapes and asserts
+    the gross/cost/net math, that failed movements are excluded, and
+    that raw rows are not mutated by the read."""
+
+    def _temp_db(self, tmp_path, monkeypatch):
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+        from database import db as db_module
+        from database.models import Base
+        test_engine = create_engine(
+            f"sqlite:///{tmp_path / 'truepnl.db'}",
+            connect_args={"check_same_thread": False}, echo=False,
+        )
+        Base.metadata.create_all(bind=test_engine)
+        TS = sessionmaker(bind=test_engine, autoflush=False,
+                          autocommit=False, expire_on_commit=False)
+        monkeypatch.setattr(db_module, "engine", test_engine)
+        monkeypatch.setattr(db_module, "SessionLocal", TS)
+        return test_engine, TS
+
+    def test_gross_cost_net_round_trip(self, tmp_path, monkeypatch):
+        _, TS = self._temp_db(tmp_path, monkeypatch)
+        monkeypatch.setattr(settings, "SIM_WITHDRAWAL_FEE_USD", 1.0)
+        from database.models import ArbTrade, CapitalMovement
+        from datetime import datetime
+        from database import queries as q
+
+        with TS() as s:
+            s.add(ArbTrade(symbol="BTC/USDT", net_pnl_usd=5.0,
+                           success=True, sim_mode=True,
+                           timestamp=datetime.utcnow()))
+            s.add(ArbTrade(symbol="ETH/USDT", net_pnl_usd=2.5,
+                           success=True, sim_mode=True,
+                           timestamp=datetime.utcnow()))
+            # Three sim transfers: 2 completed + 1 in_transit + 1 FAILED
+            # (must be excluded). Total fee = 3 × $1 = $3.
+            for state in ("completed", "completed", "in_transit"):
+                s.add(CapitalMovement(
+                    from_fund="arb", to_fund="signal",
+                    amount_usd=50.0, mode="sim", state=state,
+                    timestamp=datetime.utcnow(),
+                ))
+            s.add(CapitalMovement(
+                from_fund="arb", to_fund="signal",
+                amount_usd=50.0, mode="sim", state="failed",
+                timestamp=datetime.utcnow(),
+            ))
+            s.commit()
+
+        out = q.get_true_pnl(days=7)
+        assert out["gross_arb_pnl"] == 7.5
+        assert out["rebalance_cost"] == 3.0
+        assert out["net_pnl"] == 4.5
+        assert out["movements"] == 3      # failed excluded
+
+    def test_raw_rows_unmutated(self, tmp_path, monkeypatch):
+        _, TS = self._temp_db(tmp_path, monkeypatch)
+        monkeypatch.setattr(settings, "SIM_WITHDRAWAL_FEE_USD", 1.0)
+        from database.models import ArbTrade
+        from datetime import datetime
+        from database import queries as q
+
+        with TS() as s:
+            s.add(ArbTrade(symbol="BTC/USDT", net_pnl_usd=5.0,
+                           success=True, sim_mode=True,
+                           timestamp=datetime.utcnow()))
+            s.commit()
+
+        # Call get_true_pnl a few times — the raw row's net_pnl_usd
+        # must still equal 5.0 after the read.
+        for _ in range(3):
+            q.get_true_pnl(days=7)
+        with TS() as s:
+            rows = s.query(ArbTrade).all()
+            assert len(rows) == 1
+            assert rows[0].net_pnl_usd == 5.0
+
+    def test_excludes_old_rows_outside_window(self, tmp_path, monkeypatch):
+        _, TS = self._temp_db(tmp_path, monkeypatch)
+        monkeypatch.setattr(settings, "SIM_WITHDRAWAL_FEE_USD", 1.0)
+        from database.models import ArbTrade, CapitalMovement
+        from datetime import datetime, timedelta
+        from database import queries as q
+
+        now = datetime.utcnow()
+        old = now - timedelta(days=30)
+        with TS() as s:
+            s.add(ArbTrade(symbol="BTC/USDT", net_pnl_usd=5.0,
+                           success=True, sim_mode=True, timestamp=now))
+            s.add(ArbTrade(symbol="ETH/USDT", net_pnl_usd=100.0,
+                           success=True, sim_mode=True, timestamp=old))
+            s.add(CapitalMovement(from_fund="arb", to_fund="signal",
+                                  amount_usd=50.0, mode="sim",
+                                  state="completed", timestamp=now))
+            s.add(CapitalMovement(from_fund="arb", to_fund="signal",
+                                  amount_usd=50.0, mode="sim",
+                                  state="completed", timestamp=old))
+            s.commit()
+
+        out = q.get_true_pnl(days=7)
+        assert out["gross_arb_pnl"] == 5.0    # old row excluded
+        assert out["movements"]    == 1       # old movement excluded
+        assert out["rebalance_cost"] == 1.0
+
+
+# ── Smoke: the import path the prompt's verification step checks ────────
+
+def test_get_true_pnl_importable():
+    """`python -c "from database.queries import get_true_pnl"` must succeed —
+    the prompt's verification step runs this exact import."""
+    from database.queries import get_true_pnl as _f
+    assert callable(_f)

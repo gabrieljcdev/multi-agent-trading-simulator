@@ -745,8 +745,15 @@ class ArbEngine:
     # ── Circuit breakers ────────────────────────────────────────────────
 
     def _cb_triggered(self) -> bool:
-        if self._daily_pnl_usd <= -settings.ARB_DAILY_LOSS_HALT_USD:
-            return True
+        # %-based daily-loss halt — scales with the fund's allocation so a
+        # compounding fund doesn't silently tighten its leash. 0-alloc means
+        # no allocation gate to lose against → halt is a no-op (never divide
+        # by zero, never halt a zero-capital engine on this rule).
+        alloc = float(self._capital_allocation or 0.0)
+        if alloc > 0:
+            halt_usd = (float(settings.ARB_DAILY_LOSS_HALT_PCT) / 100.0) * alloc
+            if self._daily_pnl_usd <= -halt_usd:
+                return True
         if self._consecutive_losses >= settings.ARB_CONSECUTIVE_LOSS_HALT:
             return True
         return False
@@ -959,8 +966,14 @@ class FundingRateArbEngine:
     # ── Circuit breakers ────────────────────────────────────────────────
 
     def _cb_triggered(self) -> bool:
-        if self._daily_pnl_usd <= -settings.ARB_FUNDING_DAILY_LOSS_HALT_USD:
-            return True
+        # FundingRateArbEngine lives inside the arb fund — there's no
+        # per-engine allocation, so we measure the daily-loss halt against
+        # the arb fund constant. 0-allocation (test fixture, etc.) → no-op.
+        alloc = float(getattr(settings, "FUND_ARB_CAPITAL", 0.0) or 0.0)
+        if alloc > 0:
+            halt_usd = (float(settings.ARB_FUNDING_DAILY_LOSS_HALT_PCT) / 100.0) * alloc
+            if self._daily_pnl_usd <= -halt_usd:
+                return True
         if self._consecutive_losses >= settings.ARB_FUNDING_CONSECUTIVE_LOSS_HALT:
             return True
         return False

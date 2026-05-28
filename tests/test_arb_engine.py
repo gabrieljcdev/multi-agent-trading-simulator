@@ -264,8 +264,11 @@ async def test_per_symbol_lock_blocks_second_attempt(monkeypatch):
 def test_circuit_breaker_halts_on_daily_loss():
     engine = ArbEngine(exchange_clients={"bitget": MagicMock(), "kraken": MagicMock()},
                        sim_mode=True)
-    # Push daily P&L past the halt threshold
-    engine._daily_pnl_usd = -settings.ARB_DAILY_LOSS_HALT_USD - 0.01
+    # %-based: halt fires when daily P&L falls below -(PCT/100)*alloc.
+    # Pick a concrete alloc so the threshold is deterministic.
+    engine._capital_allocation = 500.0
+    halt_usd = (settings.ARB_DAILY_LOSS_HALT_PCT / 100.0) * engine._capital_allocation
+    engine._daily_pnl_usd = -halt_usd - 0.01
     assert engine._cb_triggered() is True
 
 
@@ -279,6 +282,7 @@ def test_circuit_breaker_halts_on_consecutive_losses():
 def test_circuit_breaker_clear_when_under_thresholds():
     engine = ArbEngine(exchange_clients={"bitget": MagicMock(), "kraken": MagicMock()},
                        sim_mode=True)
+    engine._capital_allocation = 500.0
     engine._daily_pnl_usd = -1.0
     engine._consecutive_losses = 1
     assert engine._cb_triggered() is False
@@ -627,14 +631,26 @@ async def test_funding_arb_engine_returns_empty_when_no_coinglass_data(monkeypat
     assert out == {}
 
 
-def test_funding_arb_circuit_breaker_halts_on_daily_loss():
+def test_funding_arb_circuit_breaker_halts_on_daily_loss(monkeypatch):
     """Independent thresholds — the funding engine's halt uses
-    ARB_FUNDING_DAILY_LOSS_HALT_USD, distinct from ArbEngine's."""
+    ARB_FUNDING_DAILY_LOSS_HALT_PCT against FUND_ARB_CAPITAL, distinct
+    from ArbEngine's."""
+    monkeypatch.setattr(settings, "FUND_ARB_CAPITAL", 500.0)
     engine = FundingRateArbEngine(sim_mode=True)
-    engine._daily_pnl_usd = -settings.ARB_FUNDING_DAILY_LOSS_HALT_USD - 0.01
+    halt_usd = (settings.ARB_FUNDING_DAILY_LOSS_HALT_PCT / 100.0) * 500.0
+    engine._daily_pnl_usd = -halt_usd - 0.01
     assert engine._cb_triggered() is True
     engine._daily_pnl_usd = 0.0
     engine._consecutive_losses = settings.ARB_FUNDING_CONSECUTIVE_LOSS_HALT
     assert engine._cb_triggered() is True
     engine._consecutive_losses = 0
     assert engine._cb_triggered() is False
+
+
+def test_funding_arb_circuit_breaker_zero_alloc_noop(monkeypatch):
+    """FUND_ARB_CAPITAL == 0 → the daily-loss halt is a no-op; only the
+    consecutive-loss halt can trip the breaker."""
+    monkeypatch.setattr(settings, "FUND_ARB_CAPITAL", 0.0)
+    engine = FundingRateArbEngine(sim_mode=True)
+    engine._daily_pnl_usd = -1_000_000.0
+    assert engine._cb_triggered() is False  # never halts on % rule with 0 alloc

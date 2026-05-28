@@ -18,7 +18,8 @@ Phase 1 invariants:
   * Single venue (Binance), single variant (delta-neutral), majors only.
 
 Circuit breakers:
-  * Daily-loss halt at settings.FUNDING_DAILY_LOSS_HALT_USD.
+  * Daily-loss halt at settings.FUNDING_DAILY_LOSS_HALT_PCT — % of
+    FUNDING_CAPITAL_USD. 0-alloc (Phase 1 observation default) → no-op.
   * Consecutive-loss halt at settings.FUNDING_CONSECUTIVE_LOSS_HALT.
   Daily counters reset at UTC midnight (same shape as ScalpingAgent).
 """
@@ -371,17 +372,27 @@ class FundingArbAgent(BaseAgent):
     def _check_circuit_breakers(self) -> None:
         """Halt the loop if either circuit breaker trips.
 
-        We compare daily_loss (cumulative loss USD) against the configured
-        cap, and consec_losses against the configured run. Once halted the
-        loop continues to tick (so the dashboard keeps reading get_stats)
-        but the scan is short-circuited — same shape as ScalpingAgent.
+        Daily-loss halt is %-based — scales with FUNDING_CAPITAL_USD so the
+        leash doesn't tighten as the fund compounds. 0-allocation (Phase 1
+        observation default) → no-op: never divide by zero, never halt a
+        zero-capital agent on this rule. consec_losses is a count and
+        scales naturally. Once halted the loop continues to tick (so the
+        dashboard keeps reading get_stats) but the scan is short-circuited.
         """
-        if self._daily_loss >= float(settings.FUNDING_DAILY_LOSS_HALT_USD):
-            if not self._halted:
-                self._halted = True
-                self._halt_reason = "daily_loss"
-                log.warning("[FundingArbAgent] HALTED — daily-loss cap reached")
-            return
+        alloc = float(self.get_capital_allocation() or 0.0)
+        if alloc > 0:
+            halt_usd = (float(settings.FUNDING_DAILY_LOSS_HALT_PCT) / 100.0) * alloc
+            if self._daily_loss >= halt_usd:
+                if not self._halted:
+                    self._halted = True
+                    self._halt_reason = "daily_loss"
+                    log.warning(
+                        "[FundingArbAgent] HALTED — daily-loss cap reached "
+                        "($%.2f >= $%.2f, %.1f%% of $%.0f)",
+                        self._daily_loss, halt_usd,
+                        settings.FUNDING_DAILY_LOSS_HALT_PCT, alloc,
+                    )
+                return
         if self._consec_losses >= int(settings.FUNDING_CONSECUTIVE_LOSS_HALT):
             if not self._halted:
                 self._halted = True
