@@ -384,7 +384,7 @@ function updateUI(s){
   $("m-bank-sub").innerHTML =
     `<span class="${cls(ap)}">${(ap==null?"—":(ap>=0?"+$":"-$")+Math.abs(ap).toFixed(2))} since start</span>`;
   $("m-dpnl").innerHTML =
-    `<span class="${cls(p.daily_pnl)}">${fmtUsd(p.daily_pnl)} (${fmtPct(p.daily_pnl_pct)} of bankroll)</span>`;
+    `<span class="${cls(p.daily_pnl)}">${fmtUsd(p.daily_pnl)} (${fmtPct(p.daily_pnl_pct)})</span>`;
   $("m-dfees").textContent = "Fees: " + fmtUsd(p.daily_fees);
   $("m-exp").textContent = (p.exposure_pct==null?"—":p.exposure_pct.toFixed(1)+"%");
   $("m-exp-sub").textContent = (p.exposure_usd==null?"—":fmtUsd(p.exposure_usd)+" deployed");
