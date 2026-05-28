@@ -249,6 +249,35 @@ ARB_FUNDING_RATE_EXIT_PCT         = 0.02   # test: 0.01–0.05
 ARB_FUNDING_DAILY_LOSS_HALT_USD   = 15.0
 ARB_FUNDING_CONSECUTIVE_LOSS_HALT = 4
 
+# ══════════════════════════════════════════════════════════════════════════════
+# FUNDING-RATE ARB AGENT (Phase 1 — observation mode, delta-neutral, binance)
+# ══════════════════════════════════════════════════════════════════════════════
+# Dedicated agent that scans Binance funding rates via CCXT public endpoints,
+# builds a delta-neutral (spot-long + perp-short) opportunity per symbol, and
+# logs every would-enter to funding_arb_observations. OBSERVATION MODE is a
+# hard gate in Phase 1 — _place is unreachable while FUNDING_OBSERVATION_MODE
+# is True. Distinct from the FundingRateArbEngine (ARB_FUNDING_* above): that
+# one is a passive rate reader inside the arb fund; this is its own agent
+# with its own observation ledger and circuit breakers.
+
+FUNDING_OBSERVATION_MODE       = True       # test: True/False  (NEVER False this phase)
+FUNDING_CAPITAL_USD            = 0.0        # test: 0-5000
+FUNDING_SYMBOLS                = ["BTC/USDT", "ETH/USDT"]
+FUNDING_SCAN_INTERVAL_SEC      = 60         # test: 30-300
+FUNDING_MIN_APR                = 0.12       # test: 0.06-0.30
+FUNDING_MIN_OI_MULT            = 10.0       # test: 5-50
+FUNDING_MAX_NOTIONAL_USD       = 250.0      # test: 100-5000
+FUNDING_MAX_CONCURRENT         = 2          # test: 1-5
+FUNDING_MAX_OI_FRACTION        = 0.001      # test: 0.0005-0.01
+FUNDING_TARGET_LEVERAGE        = 2.0        # test: 1.5-3.0
+FUNDING_FLIP_EXIT_APR          = 0.0        # test: -0.05-0.03
+FUNDING_BASIS_SIGMA_EXIT       = 1.5        # test: 1.0-3.0
+FUNDING_MARGIN_ALERT_RATIO     = 1.5        # test: 1.2-2.0
+FUNDING_MAX_HOLD_SEC           = 1209600    # test: 86400-2592000
+FUNDING_SIM_SLIPPAGE_PCT       = 0.0002     # test: 0.0001-0.001
+FUNDING_DAILY_LOSS_HALT_USD    = 10.0       # test: 5-50
+FUNDING_CONSECUTIVE_LOSS_HALT  = 4          # test: 3-6
+
 # Pairs the arb engine watches. Distinct from signal-track FALLBACK_PAIRS.
 ARB_WATCH_PAIRS = [
     "BTC/USDT",  "ETH/USDT",  "SOL/USDT",  "BNB/USDT",

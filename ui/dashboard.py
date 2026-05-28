@@ -151,6 +151,23 @@ class Dashboard:
             "stats":           {},
         }
 
+        # Funding-arb agent snapshot — observation-mode opportunities,
+        # open positions, recent closed observations, summary stats.
+        # Refreshed in _refresh_coordinator_data so the funding panel
+        # itself stays sync. Defaults to "unavailable" so the panel
+        # renders an empty-state hint until the agent registers.
+        self._funding_data_cache: dict = {
+            "available":      False,
+            "observation":    True,
+            "venues":         ["binance"],
+            "live_opps":      [],
+            "open_positions": [],
+            "recent_closed":  [],
+            "stats":          {},
+            "daily_pnl":      0.0,
+            "daily_loss":     0.0,
+        }
+
         self._console = Console()
 
     # ── Push API ────────────────────────────────────────────────────────
@@ -239,6 +256,8 @@ class Dashboard:
             Layout(name="row7", size=11),
             Layout(self._safe(self._panel_scalp_feed, "scalp"),
                    name="row_scalp", size=20),
+            Layout(self._safe(self._panel_funding_feed, "funding"),
+                   name="row_funding", size=20),
             Layout(name="row8", size=8),
             Layout(name="row9", size=12),
             Layout(self._safe(self._panel_insights,  "insights"),  name="row10", size=4),
@@ -381,6 +400,12 @@ class Dashboard:
             self._scalp_data_cache = self._snapshot_scalp_agent()
         except Exception as e:
             logger.debug(f"dashboard scalp snapshot refresh: {e}")
+
+        # Funding-arb agent snapshot — mirrors the scalp snapshot's shape.
+        try:
+            self._funding_data_cache = self._snapshot_funding_agent()
+        except Exception as e:
+            logger.debug(f"dashboard funding snapshot refresh: {e}")
 
     def stop(self) -> None:
         self._running = False
@@ -1390,6 +1415,239 @@ class Dashboard:
 
         return Panel(
             self._stack(header, ofi_table, pos_table, closed_table, stats_bar),
+            title=title, border_style="cyan",
+        )
+
+    # ── Funding-arb feed ────────────────────────────────────────────────
+
+    def _snapshot_funding_agent(self) -> dict:
+        """Render-friendly snapshot of the funding-arb agent state.
+
+        Sync — called from _refresh_coordinator_data once per tick. Returns
+        the canonical empty shape when no agent is registered, the
+        observation summary is unavailable, or any single access raises
+        (defensive across every attribute because the agent mutates its
+        state on its own loop).
+        """
+        empty = {
+            "available":      False,
+            "observation":    True,
+            "venues":         ["binance"],
+            "live_opps":      [],
+            "open_positions": [],
+            "recent_closed":  [],
+            "stats":          {},
+            "daily_pnl":      0.0,
+            "daily_loss":     0.0,
+        }
+        if self._coordinator is None:
+            return empty
+        try:
+            agents = getattr(self._coordinator, "_agents", None) or []
+        except Exception:
+            return empty
+
+        agent = None
+        for a in agents:
+            if getattr(a, "agent_id", None) == "funding_arb":
+                agent = a
+                break
+        if agent is None:
+            return empty
+
+        snap = dict(empty)
+        snap["available"]   = True
+        try:
+            snap["observation"] = bool(getattr(agent, "observation_mode", True))
+        except Exception:
+            snap["observation"] = True
+        snap["daily_pnl"]  = float(getattr(agent, "_daily_pnl",  0.0) or 0.0)
+        snap["daily_loss"] = float(getattr(agent, "_daily_loss", 0.0) or 0.0)
+
+        # Top 5 live opportunities by net APR. Pulled from the agent's
+        # in-memory _last_opps cache so we don't poll the engine again.
+        try:
+            opps = list(getattr(agent, "_last_opps", []) or [])
+            opps.sort(key=lambda o: getattr(o, "funding_apr", 0.0), reverse=True)
+            snap["live_opps"] = [
+                {
+                    "symbol":      o.symbol,
+                    "venue_long":  o.venue_long,
+                    "venue_short": o.venue_short,
+                    "funding_apr": float(getattr(o, "funding_apr", 0.0)),
+                    "oi_usd":      float(getattr(o, "oi_usd", 0.0)),
+                    "depth_ok":    bool(getattr(o, "depth_ok", False)),
+                }
+                for o in opps[:5]
+            ]
+        except Exception as e:
+            logger.debug(f"funding live-opps snapshot: {e}")
+
+        # Open positions — same shape as scalp's panel.
+        positions = []
+        try:
+            for symbol, pos in (getattr(agent, "_positions", {}) or {}).items():
+                positions.append({
+                    "symbol":            symbol,
+                    "variant":           getattr(pos.opp, "variant", "delta_neutral"),
+                    "notional":          float(getattr(pos, "notional_usd", 0.0)),
+                    "funding_collected": float(getattr(pos, "funding_collected", 0.0)),
+                    "basis_drift":       float(getattr(pos, "basis_at_entry", 0.0)),
+                    "hold_sec":          max(0.0, datetime.utcnow().timestamp() - float(pos.opened_at)),
+                })
+        except Exception as e:
+            logger.debug(f"funding positions snapshot: {e}")
+        snap["open_positions"] = positions
+
+        # Last 10 closed observations — read from the DB so the panel
+        # survives a restart of the in-memory agent.
+        try:
+            from database import queries as q
+            closed = q.get_funding_observations(would_entry_only=True, limit=50) or []
+            closed = [r for r in closed if (r.get("exit_time") or 0) > 0][:10]
+            snap["recent_closed"] = [
+                {
+                    "symbol":       r["symbol"],
+                    "exit_reason":  r.get("exit_reason") or "—",
+                    "net_apr":      float(r.get("projected_net_apr") or 0.0),
+                    "pnl_usd":      float(r.get("pnl_usd") or 0.0),
+                    "hold_sec":     float(r.get("hold_sec") or 0.0),
+                }
+                for r in closed
+            ]
+        except Exception as e:
+            logger.debug(f"funding recent-closed snapshot: {e}")
+
+        # Aggregate stats — observation count, would-enter rate, mean net APR.
+        try:
+            snap["stats"] = agent.get_observation_summary() or {}
+        except Exception as e:
+            logger.debug(f"funding stats snapshot: {e}")
+            snap["stats"] = {}
+
+        return snap
+
+    def _panel_funding_feed(self) -> Panel:
+        """Five-section funding-arb panel: header, live opportunities,
+        open positions, recent closed, stats bar. Mirrors _panel_scalp_feed."""
+        title = "[bold]FUNDING[/bold]"
+        snap  = self._funding_data_cache or {}
+
+        if not snap.get("available"):
+            return Panel(
+                Text("Funding scanner silent", style="dim italic"),
+                title=title, border_style="dim",
+            )
+
+        # ── 1. Header strip ────────────────────────────────────────────
+        observation = bool(snap.get("observation", True))
+        header = Text()
+        header.append("FUNDING", style="bold cyan")
+        header.append(" │ ", style="dim")
+        header.append("obs-mode" if observation else "LIVE",
+                      style="yellow" if observation else "red bold")
+        header.append(" │ ", style="dim")
+        for ex in snap.get("venues", ["binance"]):
+            header.append(f"[{ex} ", style="white")
+            header.append("✓", style="bright_green")
+            header.append("] ", style="white")
+
+        # ── 2. Live opportunities (top 5 by net APR) ───────────────────
+        opps_table = Table(expand=True, show_header=True, header_style="bold",
+                           title="LIVE OPPS", title_style="bold")
+        opps_table.add_column("Symbol")
+        opps_table.add_column("Long")
+        opps_table.add_column("Short")
+        opps_table.add_column("APR",    justify="right")
+        opps_table.add_column("OI USD", justify="right")
+        opps_table.add_column("Depth")
+        live_opps = snap.get("live_opps") or []
+        if not live_opps:
+            opps_table.add_row("[dim]No opportunities yet[/dim]",
+                               "", "", "", "", "")
+        else:
+            for o in live_opps:
+                depth_cell = (
+                    "[bright_green]ok[/bright_green]" if o["depth_ok"]
+                    else "[red]thin[/red]"
+                )
+                opps_table.add_row(
+                    o["symbol"],
+                    f"[dim]{o['venue_long']}[/dim]",
+                    f"[dim]{o['venue_short']}[/dim]",
+                    f"{o['funding_apr']*100:+.2f}%",
+                    f"{o['oi_usd']:,.0f}" if o["oi_usd"] > 0 else "—",
+                    depth_cell,
+                )
+
+        # ── 3. Open positions ──────────────────────────────────────────
+        pos_table = Table(expand=True, show_header=True, header_style="bold",
+                          title="OPEN", title_style="bold")
+        pos_table.add_column("Symbol")
+        pos_table.add_column("Variant")
+        pos_table.add_column("Notional",   justify="right")
+        pos_table.add_column("Funding $",  justify="right")
+        pos_table.add_column("Basis Δ",    justify="right")
+        pos_table.add_column("Hold")
+        positions = snap.get("open_positions") or []
+        if not positions:
+            pos_table.add_row("[dim]No open positions[/dim]",
+                              "", "", "", "", "")
+        else:
+            for p in positions:
+                pos_table.add_row(
+                    p["symbol"],
+                    f"[dim]{p['variant']}[/dim]",
+                    f"${p['notional']:.0f}",
+                    f"${p['funding_collected']:+.2f}",
+                    f"{p['basis_drift']*100:+.2f}bps",
+                    self._fmt_duration(timedelta(seconds=p["hold_sec"])),
+                )
+
+        # ── 4. Recent closed observations (last 10) ────────────────────
+        closed_table = Table(expand=True, show_header=True, header_style="bold",
+                             title="RECENT CLOSED", title_style="bold")
+        closed_table.add_column("Symbol")
+        closed_table.add_column("Net APR",  justify="right")
+        closed_table.add_column("PnL $",    justify="right")
+        closed_table.add_column("Exit")
+        closed_table.add_column("Hold s",   justify="right")
+        recent = snap.get("recent_closed") or []
+        if not recent:
+            closed_table.add_row("[dim]—[/dim]", "", "", "", "")
+        else:
+            for r in recent:
+                pnl_col = _pnl_colour(r["pnl_usd"])
+                closed_table.add_row(
+                    r["symbol"],
+                    f"{r['net_apr']*100:+.2f}%",
+                    f"[{pnl_col}]{r['pnl_usd']:+.2f}[/{pnl_col}]",
+                    f"[dim]{r['exit_reason']}[/dim]",
+                    f"{r['hold_sec']:.0f}",
+                )
+
+        # ── 5. Stats bar ───────────────────────────────────────────────
+        stats         = snap.get("stats") or {}
+        observed      = int(stats.get("total", 0) or 0)
+        would_enter   = int(stats.get("would_enter", 0) or 0)
+        mean_net_apr  = float(stats.get("mean_net_apr_realized", 0.0) or 0.0)
+        daily_loss    = float(snap.get("daily_loss", 0.0) or 0.0)
+        net_col  = _pnl_colour(mean_net_apr)
+        loss_col = "red" if daily_loss > 0 else "dim"
+
+        stats_bar = Text()
+        stats_bar.append("observed ",   style="dim"); stats_bar.append(f"{observed}", style="white")
+        stats_bar.append("  │  ", style="dim")
+        stats_bar.append("would-enter ",style="dim"); stats_bar.append(f"{would_enter}", style="white")
+        stats_bar.append("  │  ", style="dim")
+        stats_bar.append("mean-net-apr ", style="dim")
+        stats_bar.append(f"{mean_net_apr*100:+.2f}%", style=net_col)
+        stats_bar.append("  │  ", style="dim")
+        stats_bar.append("daily-loss ",  style="dim")
+        stats_bar.append(f"${daily_loss:.2f}", style=loss_col)
+
+        return Panel(
+            self._stack(header, opps_table, pos_table, closed_table, stats_bar),
             title=title, border_style="cyan",
         )
 

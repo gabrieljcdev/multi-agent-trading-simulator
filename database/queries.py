@@ -16,6 +16,7 @@ from .models import (
     DataLog,
     MacroLog, CalendarEvent,
     ScalpObservationModel,
+    FundingArbObservationModel,
     XChainObservation,
 )
 
@@ -1116,6 +1117,166 @@ def get_scalp_observations(
             "observation_only": r.observation_only,
             "price_30s": r.price_30s, "price_1m": r.price_1m,
             "price_3m":  r.price_3m,  "price_5m": r.price_5m,
+        }
+        for r in rows
+    ]
+
+
+# ── Funding-rate arb observations (Phase 1 — observation mode) ─────────────
+
+def save_funding_observations(rows: list) -> None:
+    """Upsert a batch of funding-rate arb observations.
+
+    Each row is a dict (NOT a dataclass — that lets the agent build rows
+    inline without a wrapper class). Natural key is (symbol, timestamp)
+    plus variant so the same opportunity can reappear with exit fields.
+    First write creates the row; later writes (when the position closes)
+    overwrite when exit_time>0 so the close-time row carries the final
+    funding_collected / pnl / exit_reason.
+
+    Synchronous — matches save_scalp_observations. DB failures raise; the
+    agent wraps with asyncio.to_thread + try/except so a hiccup never
+    halts the loop.
+    """
+    if not rows:
+        return
+    allowed = {
+        "timestamp", "symbol", "variant", "venue_long", "venue_short",
+        "funding_apr", "spread_apr", "oi_usd", "depth_ok",
+        "notional_usd", "margin_used", "basis_at_entry",
+        "projected_funding_per_interval", "projected_fees", "projected_net_apr",
+        "would_enter", "skip_reason",
+        "exit_time", "exit_reason", "hold_sec",
+        "funding_collected", "fees_paid", "pnl_usd",
+        "observation_only",
+    }
+    with get_session() as s:
+        for r in rows:
+            payload = {k: v for k, v in r.items() if k in allowed}
+            existing = (
+                s.query(FundingArbObservationModel)
+                .filter_by(
+                    symbol=payload.get("symbol"),
+                    timestamp=payload.get("timestamp"),
+                    variant=payload.get("variant"),
+                )
+                .first()
+            )
+            if existing is None:
+                s.add(FundingArbObservationModel(**payload))
+            else:
+                # Overwrite when exit data has arrived — entry rows are
+                # already persisted; later writes carry the close-time fields.
+                if (payload.get("exit_time") or 0) > 0:
+                    for k, v in payload.items():
+                        setattr(existing, k, v)
+
+
+def get_funding_summary(days: int = 7) -> dict:
+    """Aggregate metrics across the last `days` of funding observations.
+
+    Keys: total, would_enter, closed, mean_net_apr_realized, mean_hold_hours,
+    exit_reason breakdown. Closed = a would_enter row whose exit_time>0.
+    Returns zeros when the table is empty so callers don't carry the
+    empty-case dance.
+    """
+    import time as _time
+    cutoff = _time.time() - days * 86400
+    out = {
+        "total":                 0,
+        "would_enter":           0,
+        "closed":                0,
+        "mean_net_apr_realized": 0.0,
+        "mean_hold_hours":       0.0,
+        "exit_reason":           {},
+    }
+    with get_session() as s:
+        rows = (
+            s.query(FundingArbObservationModel)
+            .filter(FundingArbObservationModel.timestamp >= cutoff)
+            .all()
+        )
+    if not rows:
+        return out
+
+    out["total"] = len(rows)
+    entries = [r for r in rows if r.would_enter]
+    out["would_enter"] = len(entries)
+    closed = [r for r in entries if (r.exit_time or 0) > 0]
+    out["closed"] = len(closed)
+
+    if closed:
+        # Realised net APR: annualise (pnl / notional) by elapsed time. Fall
+        # back to projected_net_apr when notional/hold are zero (defensive).
+        apr_sum  = 0.0
+        hold_sum = 0.0
+        for r in closed:
+            hold_sec = float(r.hold_sec or 0.0)
+            hold_sum += hold_sec
+            notional = float(r.notional_usd or 0.0)
+            if notional > 0 and hold_sec > 0:
+                yearly = (float(r.pnl_usd or 0.0) / notional) * (365.0 * 86400.0 / hold_sec)
+                apr_sum += yearly
+            else:
+                apr_sum += float(r.projected_net_apr or 0.0)
+        out["mean_net_apr_realized"] = apr_sum / len(closed)
+        out["mean_hold_hours"]       = (hold_sum / len(closed)) / 3600.0
+
+        from collections import Counter
+        reasons = Counter(
+            (r.exit_reason or "unknown") for r in closed
+        )
+        out["exit_reason"] = dict(reasons)
+
+    return out
+
+
+def get_funding_observations(
+    symbol: Optional[str] = None,
+    would_enter_only: bool = False,
+    limit: int = 500,
+) -> list:
+    """Newest-first FundingArbObservationModel rows as plain dicts.
+    Powers the dashboard panel's "live opportunities" + "recent closed"
+    sections without keeping ORM rows alive past the session."""
+    with get_session() as s:
+        q = s.query(FundingArbObservationModel)
+        if symbol:
+            q = q.filter(FundingArbObservationModel.symbol == symbol)
+        if would_enter_only:
+            q = q.filter(FundingArbObservationModel.would_enter.is_(True))
+        rows = (
+            q.order_by(desc(FundingArbObservationModel.timestamp))
+            .limit(limit)
+            .all()
+        )
+    return [
+        {
+            "id":           r.id,
+            "timestamp":    r.timestamp,
+            "symbol":       r.symbol,
+            "variant":      r.variant,
+            "venue_long":   r.venue_long,
+            "venue_short":  r.venue_short,
+            "funding_apr":  r.funding_apr,
+            "spread_apr":   r.spread_apr,
+            "oi_usd":       r.oi_usd,
+            "depth_ok":     r.depth_ok,
+            "notional_usd": r.notional_usd,
+            "margin_used":  r.margin_used,
+            "basis_at_entry":  r.basis_at_entry,
+            "projected_funding_per_interval": r.projected_funding_per_interval,
+            "projected_fees":     r.projected_fees,
+            "projected_net_apr":  r.projected_net_apr,
+            "would_enter":     r.would_enter,
+            "skip_reason":     r.skip_reason,
+            "exit_time":       r.exit_time,
+            "exit_reason":     r.exit_reason,
+            "hold_sec":        r.hold_sec,
+            "funding_collected": r.funding_collected,
+            "fees_paid":         r.fees_paid,
+            "pnl_usd":           r.pnl_usd,
+            "observation_only":  r.observation_only,
         }
         for r in rows
     ]

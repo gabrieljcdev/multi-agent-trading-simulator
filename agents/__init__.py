@@ -420,6 +420,7 @@ class OnChainAgentPlaceholder(PlaceholderAgent):
 from agents.scalping_agent import ScalpingAgent
 from agents.crosschain_agent import CrossChainArbAgent
 from agents.balance_agent import BalanceAgent
+from agents.funding_arb_agent import FundingArbAgent
 
 
 REGISTERED_AGENTS: list[BaseAgent] = [
@@ -427,6 +428,7 @@ REGISTERED_AGENTS: list[BaseAgent] = [
     ArbAgentWrapper(),
     ScalpingAgent(),
     CrossChainArbAgent(),
+    FundingArbAgent(),
     BalanceAgent(),
     MacroAgentPlaceholder(),
     SentimentAgentPlaceholder(),
@@ -443,6 +445,7 @@ __all__ = [
     "ArbAgentWrapper",
     "ScalpingAgent",
     "CrossChainArbAgent",
+    "FundingArbAgent",
     "BalanceAgent",
     "MacroAgentPlaceholder",
     "SentimentAgentPlaceholder",

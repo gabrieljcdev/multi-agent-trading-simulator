@@ -541,6 +541,60 @@ class FundingArbTrade(Base):
     )
 
 
+class FundingArbObservationModel(Base):
+    """One row per evaluated funding-rate arb opportunity by FundingArbAgent.
+
+    Mirrors ScalpObservationModel: would_enter splits the rows the engine
+    would have opened from the gate-blocked ones, and exit fields are
+    written when (or if) a position closes. Phase 1 is observation-only,
+    so almost every row carries observation_only=True and stays open at
+    the "entry" step — exit fields fill as the simulated position is
+    closed by exit_reason() in the agent loop.
+
+    pnl_usd is realised net (funding collected minus simulated fees and
+    sim slippage). funding_apr is annualised from the 8h rate at evaluation
+    time. notional_usd is the size the agent WOULD have opened given
+    settings.FUNDING_MAX_NOTIONAL_USD + OI fraction.
+
+    TODO: new table — fresh init_db creates it; existing databases need
+    an Alembic migration.
+    """
+    __tablename__ = "funding_arb_observations"
+
+    id                = Column(Integer, primary_key=True)
+    timestamp         = Column(Float,      nullable=False, index=True)
+    symbol            = Column(String(20), nullable=False, index=True)
+    variant           = Column(String(20), nullable=False)  # delta_neutral
+    venue_long        = Column(String(20))
+    venue_short       = Column(String(20))
+    funding_apr       = Column(Float)                       # annualised from 8h
+    spread_apr        = Column(Float)
+    oi_usd            = Column(Float)
+    depth_ok          = Column(Boolean, default=True)
+    notional_usd      = Column(Float)
+    margin_used       = Column(Float)
+    basis_at_entry    = Column(Float, default=0.0)
+    projected_funding_per_interval = Column(Float, default=0.0)
+    projected_fees    = Column(Float, default=0.0)
+    projected_net_apr = Column(Float, default=0.0)
+    would_enter       = Column(Boolean, default=False, index=True)
+    skip_reason       = Column(String(160))
+    # Exit-side fields — filled when _close runs (Phase 1 mostly leaves
+    # these zero because positions are simulated open only).
+    exit_time         = Column(Float,  default=0.0)
+    exit_reason       = Column(String(30))
+    hold_sec          = Column(Float,  default=0.0)
+    funding_collected = Column(Float,  default=0.0)
+    fees_paid         = Column(Float,  default=0.0)
+    pnl_usd           = Column(Float,  default=0.0)   # realised net
+    observation_only  = Column(Boolean, default=True)
+    created_at        = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        Index("ix_funding_arb_obs_lookup", "symbol", "timestamp"),
+    )
+
+
 class XChainObservation(Base):
     """One row per cross-CHAIN arb evaluation by execution/crosschain_engine.py.
 
