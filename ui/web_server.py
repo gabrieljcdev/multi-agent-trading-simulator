@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import time
 from collections import Counter, deque
 from datetime import datetime
@@ -75,6 +76,24 @@ def _local_time(tz: str) -> str:
         return datetime.now(ZoneInfo(tz)).strftime("%H:%M")
     except Exception:
         return datetime.utcnow().strftime("%H:%M")
+
+
+def _jsonable(obj):
+    """Recursively coerce a snapshot into JSON-spec-compliant Python.
+
+    json.dumps writes float('inf') / -inf / nan as the literal tokens
+    Infinity / -Infinity / NaN, which the browser's JSON.parse rejects
+    (RFC 8259 doesn't permit them). One stray non-finite float anywhere
+    in the snapshot would silently take the whole dashboard down. This
+    walker replaces them with None so the UI renders a placeholder
+    instead of imploding. Cheap — runs once per push tick."""
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: _jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_jsonable(v) for v in obj]
+    return obj
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -233,7 +252,11 @@ class WebServer:
         while self._running:
             try:
                 await self._refresh_coordinator()
-                payload = json.dumps(self._build_snapshot(), default=str)
+                payload = json.dumps(
+                    _jsonable(self._build_snapshot()),
+                    default=str,
+                    allow_nan=False,
+                )
                 await self._broadcast(payload)
             except asyncio.CancelledError:
                 break
@@ -303,7 +326,11 @@ class WebServer:
         self._ws_clients.add(ws)
         # Send an immediate snapshot so a fresh client paints without waiting.
         try:
-            await ws.send_str(json.dumps(self._build_snapshot(), default=str))
+            await ws.send_str(json.dumps(
+                _jsonable(self._build_snapshot()),
+                default=str,
+                allow_nan=False,
+            ))
         except Exception as e:
             logger.debug(f"ws initial snapshot: {e}")
         try:
@@ -527,7 +554,7 @@ class WebServer:
             lambda: db_queries.get_postmortems_by_agent(agent_id, 3), [])
         return web.json_response(
             {"trades": trades, "insights": insights},
-            dumps=lambda o: json.dumps(o, default=str),
+            dumps=lambda o: json.dumps(_jsonable(o), default=str, allow_nan=False),
         )
 
     async def handle_session_detail(self, request) -> web.Response:
@@ -550,7 +577,7 @@ class WebServer:
             "total_pnl":   round(total_pnl, 2),
             "trade_count": len(trades),
             "trades":      trades,
-        }, dumps=lambda o: json.dumps(o, default=str))
+        }, dumps=lambda o: json.dumps(_jsonable(o), default=str, allow_nan=False))
 
     # ── Snapshot ─────────────────────────────────────────────────────────
 

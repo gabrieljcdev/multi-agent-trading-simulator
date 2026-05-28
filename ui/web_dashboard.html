@@ -1141,7 +1141,10 @@ function renderLog(){
 function connect(){
   const ws = new WebSocket("ws://" + location.host + "/ws");
   ws.onopen = () => { $("conn").textContent = "● live"; $("conn").className = "pos"; };
-  ws.onmessage = (ev) => { try{ updateUI(JSON.parse(ev.data)); }catch(e){} };
+  ws.onmessage = (ev) => { try{ updateUI(JSON.parse(ev.data)); }catch(e){ console.error("updateUI failed:", e); } };
+  // ^ logging the error is on purpose — a single bad-JSON push (e.g. inf
+  //   leaking through a snapshot field) would otherwise silently blank the
+  //   whole UI. Cheap to keep, invaluable when something regresses.
   ws.onclose = () => {
     $("conn").textContent = "○ reconnecting…"; $("conn").className = "dim";
     setTimeout(connect, 2000);
