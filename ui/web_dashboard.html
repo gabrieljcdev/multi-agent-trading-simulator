@@ -181,6 +181,13 @@
         <h2>Live Arb Feed</h2><div class="scroll" id="arbFeed"></div>
       </div>
 
+      <div class="card" style="margin-bottom:10px">
+        <h2>Balance Agent
+          <button id="rebalanceArmBtn" style="float:right;font-size:11px">Rebalance…</button>
+        </h2>
+        <div id="balancePanel"></div>
+      </div>
+
       <div class="card">
         <h2>Session P&amp;L</h2><div class="sessions" id="sessions"></div>
       </div>
@@ -320,6 +327,53 @@ function wireKill(btn){
 }
 wireKill($("killBtn")); wireKill($("killBtn2"));
 
+/* Rebalance — two-step arm → confirm mirroring /action/kill UX.
+   First click POSTs {action:"arm"}, receives a token + ring-fence notice
+   and a 3s window. Second click within the window POSTs
+   {action:"confirm", token}. Outside the window the button auto-resets. */
+let rebalanceArmTimer = null;
+let rebalanceToken = null;
+(function wireRebalance(){
+  const btn = $("rebalanceArmBtn");
+  if(!btn) return;
+  btn.onclick = async () => {
+    if(btn.classList.contains("armed") && rebalanceToken){
+      clearTimeout(rebalanceArmTimer);
+      btn.classList.remove("armed");
+      btn.textContent = btn.dataset.label || "Rebalance…";
+      const tok = rebalanceToken; rebalanceToken = null;
+      try{
+        await fetch("/action/rebalance", {
+          method:"POST", headers:{"Content-Type":"application/json"},
+          body: JSON.stringify({action:"confirm", token:tok})
+        });
+      }catch(e){}
+    }else{
+      btn.dataset.label = btn.textContent;
+      try{
+        const r = await fetch("/action/rebalance", {
+          method:"POST", headers:{"Content-Type":"application/json"},
+          body: JSON.stringify({action:"arm"})
+        });
+        const d = await r.json();
+        if(!d.ok){ btn.textContent = "Error"; return; }
+        rebalanceToken = d.token;
+        const rf = d.ring_fence || {};
+        const warn = rf.mexc_warning ? " ⚠ " + rf.mexc_warning : "";
+        btn.classList.add("armed");
+        btn.textContent = "Confirm?" + warn;
+        rebalanceArmTimer = setTimeout(() => {
+          btn.classList.remove("armed");
+          btn.textContent = btn.dataset.label;
+          rebalanceToken = null;
+        }, 3000);
+      }catch(e){
+        btn.textContent = "Error";
+      }
+    }
+  };
+})();
+
 /* ---------- helpers ---------- */
 const fmtUsd = (v) => (v==null? "—" : (v<0?"-$":"$") + Math.abs(v).toFixed(2));
 const fmtPct = (v) => (v==null? "—" : (v>=0?"+":"") + Number(v).toFixed(2) + "%");
@@ -453,6 +507,9 @@ function updateUI(s){
   // live arb feed (dashboard)
   $("arbFeed").innerHTML = arbFeedHtml(s.arb_feed);
 
+  // balance panel
+  $("balancePanel").innerHTML = balancePanelHtml(s.balance);
+
   // session P&L (clickable + local clocks)
   const sp = s.session_pnl || {};
   $("sessions").innerHTML = SESSION_KEYS.map(k => {
@@ -560,6 +617,51 @@ function renderPending(pend){
   }else{
     $("pending").innerHTML = `<span class="muted">no signal pending</span>`;
   }
+}
+
+/* ---------- balance panel ---------- */
+function balancePanelHtml(b){
+  if(!b) return `<span class="muted">balance agent not started</span>`;
+  const allocs = b.allocations || {};
+  const allocKeys = Object.keys(allocs).sort();
+  const allocsHtml = allocKeys.length
+    ? `<table><thead><tr><th>fund:venue</th><th>target USD</th></tr></thead><tbody>` +
+      allocKeys.map(k => `<tr><td>${esc(k)}</td><td>${fmtUsd(allocs[k])}</td></tr>`).join("") +
+      `</tbody></table>`
+    : `<span class="muted">no allocations recorded</span>`;
+  const inflight = b.in_transit || [];
+  const inflightHtml = inflight.length
+    ? `<table><thead><tr><th>from</th><th>to</th><th>$</th><th>state</th><th>age</th></tr></thead><tbody>` +
+      inflight.map(t => `<tr><td>${esc(t.from_fund)}@${esc(t.from_exchange||"—")}</td>` +
+        `<td>${esc(t.to_fund)}@${esc(t.to_exchange||"—")}</td>` +
+        `<td>${fmtUsd(t.amount_usd)}</td><td>${esc(t.state)}</td>` +
+        `<td>${fmtAge(t.age_sec)}</td></tr>`).join("") +
+      `</tbody></table>`
+    : `<span class="muted">no transfers in flight</span>`;
+  const paused = b.paused_routes || [];
+  const pausedHtml = paused.length
+    ? paused.map(p => `<span class="chip err">${esc(p.buy_exchange)}→${esc(p.sell_exchange)}: ${esc(p.reason)}</span>`).join(" ")
+    : `<span class="muted">no routes paused</span>`;
+  const eff = b.fund_efficiency || {};
+  const effHtml = Object.keys(eff).length
+    ? `<table><thead><tr><th>fund</th><th>deployed</th><th>ret %</th><th>starved</th></tr></thead><tbody>` +
+      Object.entries(eff).map(([f, v]) => `<tr><td>${esc(f)}</td><td>${fmtUsd(v.deployed_usd)}</td>` +
+        `<td class="${cls(v.return_pct)}">${fmtPct(v.return_pct)}</td>` +
+        `<td>${v.starved?'<span class="chip warn">yes</span>':'<span class="dim">no</span>'}</td></tr>`).join("") +
+      `</tbody></table>`
+    : `<span class="muted">no efficiency data yet</span>`;
+  return `
+    <div class="grid2">
+      <div><h2 class="dim">Allocations</h2>${allocsHtml}</div>
+      <div><h2 class="dim">In-Transit</h2>${inflightHtml}</div>
+    </div>
+    <div style="margin-top:6px">
+      <h2 class="dim">Today</h2>
+      <span class="dim">transfers ${b.transfers_today||0} · fees ${fmtUsd(b.fees_today_usd||0)}</span>
+    </div>
+    <div style="margin-top:6px"><h2 class="dim">Paused Routes</h2>${pausedHtml}</div>
+    <div style="margin-top:6px"><h2 class="dim">Fund Efficiency</h2>${effHtml}</div>
+  `;
 }
 
 /* ---------- agent page ---------- */

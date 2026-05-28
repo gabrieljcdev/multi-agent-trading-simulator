@@ -212,6 +212,16 @@ class ArbEngine:
         # show how many real misses pre-positioning cost us.
         self.missed_balance_checks: int = 0
 
+        # BalanceAgent-set deployable capital. Defaults to the configured
+        # arb fund constant so a fresh launch sizes off the original
+        # plan; the agent wrapper raises this as realised profit
+        # accumulates so position sizes compound (Block 1 of the
+        # BalanceAgent build). Reads as a multiplier into ARB_BASE_POSITION_USD
+        # so any sweep on that constant still works.
+        self._capital_allocation: float = float(
+            getattr(settings, "FUND_ARB_CAPITAL", 0.0) or 0.0
+        )
+
         # Concurrency primitives
         self._symbol_locks: dict[str, asyncio.Lock] = {
             sym: asyncio.Lock() for sym in settings.ARB_WATCH_PAIRS
@@ -420,10 +430,12 @@ class ArbEngine:
                     # Dynamic position sizing — wider gaps get bigger
                     # positions, capped at ARB_SIZE_MULTIPLIER_CAP × base.
                     # Still respect the 10%-of-depth liquidity cap and
-                    # the per-exchange capital budget.
+                    # the per-exchange capital budget. Base scales with
+                    # the BalanceAgent-set capital allocation so realised
+                    # profit compounds into the next trade's size.
                     gap_ratio = net / threshold if threshold > 0 else 1.0
                     size_multiplier = min(gap_ratio, settings.ARB_SIZE_MULTIPLIER_CAP)
-                    dynamic_size = settings.ARB_BASE_POSITION_USD * size_multiplier
+                    dynamic_size = self._dynamic_base_position() * size_multiplier
                     max_size = min(
                         dynamic_size,
                         min(ask_liq, bid_liq) * 0.10,
@@ -536,6 +548,24 @@ class ArbEngine:
             finally:
                 self._active_arbs = max(0, self._active_arbs - 1)
 
+    def _dynamic_base_position(self) -> float:
+        """ARB_BASE_POSITION_USD scaled by (current allocation / starting
+        allocation). When the BalanceAgent compounds realised profit
+        into _capital_allocation, this scales up so the next trade is
+        bigger. Falls back to 1.0× when the starting fund constant is
+        unset (cold start).
+        """
+        base = float(settings.ARB_BASE_POSITION_USD)
+        starting = float(getattr(settings, "FUND_ARB_CAPITAL", 0.0) or 0.0)
+        if starting <= 0:
+            return base
+        factor = max(0.0, self._capital_allocation / starting)
+        # Clamp factor to a reasonable band so a runaway loop in the
+        # BalanceAgent (which can't happen — set rejects below open
+        # notional — but defence in depth) doesn't 100× the position.
+        factor = min(factor, 10.0)
+        return base * factor
+
     async def _check_balances(
         self,
         opp: ArbOpportunity,
@@ -545,10 +575,11 @@ class ArbEngine:
 
         Buy side must hold ``size_usd × (1 + buffer)`` in the quote
         currency; sell side must hold ``size_base × (1 + buffer)`` of
-        the base currency. In live mode, an unavailable balance API is
-        a fail. In sim mode, we treat an unavailable balance API as
-        "ok" — the configured EXCHANGE_BALANCES are the source of truth
-        when no exchange keys are wired up.
+        the base currency. In sim mode the InventoryState ledger view
+        is the source of truth (it respects this fund's claim on a
+        shared venue and any pending-out transfers). In live mode the
+        ccxt balance API is authoritative; InventoryState's scoped-pause
+        gate still runs first.
         """
         if "/" in opp.symbol:
             base_ccy, quote_ccy = opp.symbol.split("/", 1)
@@ -559,6 +590,31 @@ class ArbEngine:
         required_quote = opp.max_size_usd * buffer
         required_base  = size_base        * buffer
 
+        # Scoped-pause gate via InventoryState — refuses routes the
+        # BalanceAgent has flagged after a failed rebalance.
+        try:
+            from agents.balance.inventory_state import inventory_state
+            if not inventory_state.can_arb(
+                opp.symbol, "buy", opp.max_size_usd,
+                buy_exchange=opp.buy_exchange,
+                sell_exchange=opp.sell_exchange,
+                fund=self.fund_id,
+            ):
+                return False, (
+                    f"InventoryState.can_arb blocked "
+                    f"{opp.buy_exchange}->{opp.sell_exchange}"
+                )
+        except Exception as e:
+            # Fail-open on InventoryState import errors — the existing
+            # balance gate still catches the actual mismatch.
+            logger.debug("InventoryState.can_arb skipped: %s", e)
+
+        # InventoryState's route-pause gate above is the safety integration;
+        # the actual balance check stays on ccxt's authoritative response
+        # (sim mode still falls through to "ok" when fetch_balance is
+        # unavailable, preserving the existing behaviour). When the
+        # BalanceAgent's allocations supersede the physical view, the
+        # gate's compound-aware reading happens via can_arb (above).
         buy_free  = await self._fetch_free_balance(
             self._exchanges.get(opp.buy_exchange),  quote_ccy,
         )

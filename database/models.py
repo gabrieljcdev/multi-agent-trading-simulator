@@ -619,6 +619,72 @@ class AgentEvent(Base):
     )
 
 
+class CapitalMovement(Base):
+    """Audit + lifecycle for every BalanceAgent rebalance attempt.
+
+    One row per attempt, success or failure. The state machine
+    (pending → in_transit → completed | failed) is what the cex_rail
+    drives, and what restart reconciliation reads to resume in-flight
+    withdrawals. Sim rail writes a single row with state="completed"
+    atomically.
+
+    SCHEMA EXTENSION: from_exchange / to_exchange are added beyond the
+    documented fund-to-fund spec — the cross-exchange path needs
+    venue granularity to choose a physical network and to match a
+    ccxt.withdraw() response on restart reconciliation.
+    """
+    __tablename__ = "capital_movements"
+
+    id              = Column(Integer, primary_key=True)
+    timestamp       = Column(DateTime, nullable=False, default=datetime.utcnow)
+    from_fund       = Column(String(30), nullable=False)
+    to_fund         = Column(String(30), nullable=False)
+    from_exchange   = Column(String(30))   # SCHEMA EXTENSION — see CAPITAL_REBALANCE_UI spec
+    to_exchange     = Column(String(30))   # SCHEMA EXTENSION — see CAPITAL_REBALANCE_UI spec
+    asset           = Column(String(10),  default="USDT")
+    amount_usd      = Column(Float,  nullable=False)
+    mode            = Column(String(8),   default="sim")  # sim | live
+    state           = Column(String(12),  default="pending")  # pending | in_transit | completed | failed
+    initiated_by    = Column(String(30))   # "policy" | "web_ui" | "auto" | …
+    note            = Column(Text)
+    rail_id         = Column(String(30))   # which rail handled the transfer (sim | cex | …)
+    network         = Column(String(20))   # ccxt network identifier on the live path
+    transfer_tx_hash = Column(String(120)) # live only — populated once ccxt confirms
+    error           = Column(Text)
+    completed_at    = Column(DateTime)
+
+    __table_args__ = (
+        Index("ix_capital_movements_state", "state", "timestamp"),
+        Index("ix_capital_movements_lookup", "from_fund", "to_fund", "timestamp"),
+    )
+
+
+class FundCapitalEfficiency(Base):
+    """Per-fund return-on-deployed-capital snapshot, written each scan.
+
+    Feeds the GrowthOptimalPolicy's edge estimates and the planner's
+    Miller-Orr band: depletion_variance is computed from the rolling
+    series of `deployed_usd`, opportunity_cost from
+    `return_on_deployed_pct`. starvation_event flags whenever a fund
+    had a viable opportunity but lacked capital on the right venue —
+    that's the strongest data signal that capital is mis-placed.
+    """
+    __tablename__ = "fund_capital_efficiency"
+
+    id                      = Column(Integer, primary_key=True)
+    timestamp               = Column(DateTime, nullable=False, default=datetime.utcnow)
+    fund                    = Column(String(30), nullable=False)
+    deployed_usd            = Column(Float,  default=0.0)
+    realised_return_usd     = Column(Float,  default=0.0)
+    return_on_deployed_pct  = Column(Float,  default=0.0)
+    starvation_event        = Column(Boolean, default=False)
+    starvation_detail       = Column(String(200))
+
+    __table_args__ = (
+        Index("ix_fund_capital_efficiency_lookup", "fund", "timestamp"),
+    )
+
+
 class CircuitBreakerLog(Base):
     """Log every time a circuit breaker fires."""
     __tablename__ = "circuit_breaker_log"

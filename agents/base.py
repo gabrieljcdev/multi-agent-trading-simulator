@@ -112,6 +112,59 @@ class BaseAgent(ABC):
         keys present, etc.). Coordinator skips unavailable agents on start."""
         return True
 
+    # ── BalanceAgent compounding hooks — safe inherited defaults ────────
+    # These let the BalanceAgent scale per-agent capital up as realised
+    # profit accumulates without touching individual agents' sizing code.
+    # Existing agents keep working with the defaults; agents that want to
+    # compound override get/set and pair them with their sizing logic.
+
+    def get_capital_allocation(self) -> float:
+        """Current deployable capital for this agent's fund.
+
+        Default reads ``self.capital_allocation`` — the configured fund
+        constant. Subclasses that compound override this to track a
+        live, P&L-grown deployable amount.
+        """
+        return float(getattr(self, "capital_allocation", 0.0) or 0.0)
+
+    def set_capital_allocation(self, amount: float) -> bool:
+        """Set deployable capital. Returns False (no-op) if the new
+        amount would be below the agent's currently open-position
+        notional — never shrink the deployable pool past committed risk.
+
+        Default updates ``self.capital_allocation`` in place. Subclasses
+        with a separate deployable pool (e.g. ScalpingAgent's ``_capital``
+        vs ``capital_allocation``) override this to update both. Safe:
+        always returns False on bad input; never raises.
+        """
+        try:
+            amt = float(amount)
+        except (TypeError, ValueError):
+            return False
+        if amt < 0:
+            return False
+        try:
+            open_notional = float(self.get_open_position_notional() or 0.0)
+        except Exception:
+            open_notional = 0.0
+        if amt < open_notional:
+            return False
+        try:
+            self.capital_allocation = amt
+        except Exception:
+            return False
+        return True
+
+    def get_open_position_notional(self) -> float:
+        """USD notional of this agent's open positions.
+
+        Default 0.0 — placeholder / operational agents have no open
+        positions. Trading agents override to sum their live exposure.
+        Drives the rail-2 floor: BalanceAgent never lowers an agent's
+        allocation below this number.
+        """
+        return 0.0
+
     # ── Standard lifecycle — do not override ────────────────────────────
 
     async def pause(self) -> None:

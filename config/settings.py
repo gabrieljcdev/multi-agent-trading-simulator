@@ -569,6 +569,63 @@ ARB_AGENT_CAPITAL    = FUND_ARB_CAPITAL      # test: 100–1000
 ARB_CAPITAL_PER_EXCHANGE = 100.0   # test: 50–200
 
 # ══════════════════════════════════════════════════════════════════════════════
+# BALANCE AGENT (agents/balance_agent.py)
+# ══════════════════════════════════════════════════════════════════════════════
+# Operational agent. Owns the bot's capital position across funds × exchanges,
+# compounds realised profit by scaling position sizes, and rebalances inventory
+# under cost-derived Miller-Orr bands. Sim-first; live ccxt.withdraw is gated
+# behind REBALANCE_LIVE_ENABLED, mirroring SIM_MODE discipline.
+#
+# Layers (strictly separated): policy → planner → rails, with safety rails
+# wrapping the planner's output and dispatch. Adding a fund, exchange, policy,
+# or rail touches exactly one layer.
+
+# ── Feature flags ─────────────────────────────────────────────────────────
+REBALANCE_LIVE_ENABLED            = False  # test: False         (hard gate; live ccxt.withdraw)
+BALANCE_STRICT_OPEN_POSITION_BLOCK = True   # test: True/False    (rail 3; floor rail 2 is always-on)
+
+# ── Compounding / sizing (start conservative; raise with data confidence) ──
+KELLY_FRACTION         = 0.25     # test: 0.10-0.50  (fraction of full Kelly; never use full)
+COMPOUND_RESERVE_PCT   = 0.05     # test: 0.02-0.15  (uncommitted buffer held out of the pool)
+
+# ── Allocation policy ─────────────────────────────────────────────────────
+ALLOCATION_CONFIDENCE  = 0.0      # test: 0.0-1.0    (0 = risk-parity, 1 = growth-optimal)
+# Per-(fund, exchange) capacity ceiling in USD. MEXC nodes carry a hard cap
+# (un-mitigated counterparty risk; no OES). Empty default → planner uses
+# +inf for every cell, i.e. no capacity ceiling until measured book depth
+# is wired in.
+FUND_CAPACITY_CEILINGS_USD: dict = {}   # test: tune from depth data; MEXC nodes carry a hard cap
+
+# ── Transfer minimisation ─────────────────────────────────────────────────
+INTERNALIZE_WINDOW_S   = 300      # test: 60-1800    (wait for self-correction before transferring)
+REBALANCE_DAILY_LIMIT  = 3        # test: 1-10       (max physical rebalances per UTC day)
+# Control band is DERIVED, not chosen:
+#   spread = (0.75 * transfer_cost * depletion_variance / opportunity_cost)^(1/3)
+# depletion_variance is measured from fund_capital_efficiency; opportunity_cost
+# from per-fund return-on-deployed. Do NOT add a band-width constant.
+
+# ── Network routing (REQUIRED per-route map; identifiers differ per exchange) ─
+# Map (from_exchange, to_exchange, asset) -> ordered [network_id...] (cheapest
+# first). Seeded from ccxt.fetch_currencies() / fetch_deposit_withdraw_fees()
+# in a periodic refresh; empty default keeps the live cex rail dormant until
+# operator-pinned routes land. Mirrors WITHDRAWAL_ROUTES discipline.
+WITHDRAWAL_ROUTES: dict = {}      # test: seeded from ccxt; live cex rail no-ops with empty map
+
+# ── Sim realism + UX ──────────────────────────────────────────────────────
+SIM_WITHDRAWAL_FEE_USD     = 1.0     # test: 0.04-1.6   (simulated per-transfer fee, route-dependent live)
+SIM_TRANSFER_DELAY_S       = 600     # test: 60-7200    (simulated in-transit time, sim_rail)
+SIM_REBALANCE_FAILURE_RATE = 0.0     # test: 0.0-0.10   (inject failures to exercise auto-pause)
+REBALANCE_CONFIRM_WINDOW_S = 3       # test: 2-30       (/action/rebalance arm→confirm window)
+
+# Default agent allocation for the BalanceAgent itself — it's operational
+# (no alpha, no positions), so its capital_allocation is zero. The fund
+# pools it manages live in FUND_*_CAPITAL above.
+BALANCE_AGENT_CAPITAL  = 0.0      # test: 0.0       (BalanceAgent is operational, not alpha)
+# Scan interval — runs much slower than alpha agents; one cycle = compound
+# realised profit + maybe one rebalance.
+BALANCE_SCAN_INTERVAL_SEC = 60    # test: 15-300
+
+# ══════════════════════════════════════════════════════════════════════════════
 # STRATEGY → EXCHANGE ROUTING
 # ══════════════════════════════════════════════════════════════════════════════
 # Encodes which exchanges are approved for each strategy type. Scalping

@@ -122,6 +122,42 @@ class SignalAgentWrapper(BaseAgent):
             except Exception as e:
                 logger.error(f"SignalAgent kill: {e}")
 
+    # ── BalanceAgent compounding hooks ──────────────────────────────────
+
+    def get_open_position_notional(self) -> float:
+        """USD notional of the signal fund's open positions.
+
+        Reads non-scalp open trades (scalp belongs to its own fund) and
+        sums their size_usd. Defensive: never raises."""
+        try:
+            return float(sum(
+                (t.size_usd or 0.0) for t in db_queries.get_open_trades()
+                if (t.strategy or "") != "scalp"
+            ))
+        except Exception:
+            return 0.0
+
+    def set_capital_allocation(self, amount: float) -> bool:
+        """Update the deployable pool. Propagates to the OrderRouter's
+        _portfolio_value via the bot so position sizing scales as the
+        fund compounds. Refuses if amount < open-position notional."""
+        ok = super().set_capital_allocation(amount)
+        if not ok:
+            return False
+        # Propagate to OrderRouter — sizing reads _portfolio_value.
+        if self._bot is not None:
+            router = getattr(self._bot, "_router", None)
+            if router is None:
+                router = getattr(self._bot, "_order_router", None)
+            if router is not None:
+                update = getattr(router, "update_portfolio_value", None)
+                if callable(update):
+                    try:
+                        update(float(amount))
+                    except Exception as e:
+                        logger.debug("SignalAgent update_portfolio_value: %s", e)
+        return True
+
     async def get_stats(self) -> AgentStats:
         # Bot not started yet → OFFLINE with zeroed numbers.
         if self._bot is None:
@@ -276,6 +312,31 @@ class ArbAgentWrapper(BaseAgent):
             except Exception as e:
                 logger.error(f"ArbAgent close_all: {e}")
 
+    # ── BalanceAgent compounding hooks ──────────────────────────────────
+
+    def get_open_position_notional(self) -> float:
+        """Arb positions complete in milliseconds — there's never a
+        material open notional. We approximate as engine's in-flight
+        arbs × base position so the floor is non-zero while a trade is
+        live (the floor still rejects shrinking past zero)."""
+        if self._engine is None:
+            return 0.0
+        active = int(getattr(self._engine, "_active_arbs", 0) or 0)
+        return active * float(settings.ARB_BASE_POSITION_USD)
+
+    def set_capital_allocation(self, amount: float) -> bool:
+        """Update the engine's deployable allocation so position sizing
+        scales with realised P&L. Refuses below open-position notional."""
+        ok = super().set_capital_allocation(amount)
+        if not ok:
+            return False
+        if self._engine is not None:
+            try:
+                self._engine._capital_allocation = float(amount)
+            except Exception as e:
+                logger.debug("ArbAgent _capital_allocation propagation: %s", e)
+        return True
+
     async def get_stats(self) -> AgentStats:
         if self._engine is None:
             return AgentStats(
@@ -358,6 +419,7 @@ class OnChainAgentPlaceholder(PlaceholderAgent):
 
 from agents.scalping_agent import ScalpingAgent
 from agents.crosschain_agent import CrossChainArbAgent
+from agents.balance_agent import BalanceAgent
 
 
 REGISTERED_AGENTS: list[BaseAgent] = [
@@ -365,6 +427,7 @@ REGISTERED_AGENTS: list[BaseAgent] = [
     ArbAgentWrapper(),
     ScalpingAgent(),
     CrossChainArbAgent(),
+    BalanceAgent(),
     MacroAgentPlaceholder(),
     SentimentAgentPlaceholder(),
     OnChainAgentPlaceholder(),
@@ -380,6 +443,7 @@ __all__ = [
     "ArbAgentWrapper",
     "ScalpingAgent",
     "CrossChainArbAgent",
+    "BalanceAgent",
     "MacroAgentPlaceholder",
     "SentimentAgentPlaceholder",
     "OnChainAgentPlaceholder",

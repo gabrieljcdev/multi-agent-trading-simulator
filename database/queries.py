@@ -1900,3 +1900,123 @@ def get_xchain_observations(
         }
         for r in rows
     ]
+
+
+# ── BalanceAgent: capital movements (audit + state machine) ─────────────────
+
+def log_capital_movement(data: dict) -> int:
+    """Insert a capital_movements row and return its id.
+
+    Required keys: from_fund, to_fund, amount_usd.
+    Optional: from_exchange, to_exchange, asset, mode, state, initiated_by,
+    note, rail_id, network, error.
+    """
+    from .models import CapitalMovement
+    with get_session() as s:
+        row = CapitalMovement(**data)
+        s.add(row)
+        s.flush()
+        return row.id
+
+
+def update_capital_movement(movement_id: int, fields: dict) -> None:
+    """Patch a capital_movements row in place. Unknown keys are ignored.
+    Use for state transitions (pending → in_transit → completed/failed)
+    and for backfilling transfer_tx_hash / error / completed_at.
+    """
+    from .models import CapitalMovement
+    allowed = {"state", "transfer_tx_hash", "error", "note",
+               "completed_at", "rail_id", "network"}
+    with get_session() as s:
+        row = s.get(CapitalMovement, movement_id)
+        if row is None:
+            return
+        for k, v in fields.items():
+            if k in allowed and v is not None:
+                setattr(row, k, v)
+
+
+def get_in_transit_movements() -> list:
+    """All capital_movements rows in `pending` or `in_transit` state.
+    Loaded on startup by CexTransferRail for reconciliation against ccxt.
+    """
+    from .models import CapitalMovement
+    with get_session() as s:
+        return (
+            s.query(CapitalMovement)
+            .filter(CapitalMovement.state.in_(("pending", "in_transit")))
+            .order_by(CapitalMovement.timestamp)
+            .all()
+        )
+
+
+def get_capital_movements_today() -> list:
+    """All capital_movements rows from today (UTC), newest first.
+    Backs the dashboard's "today's transfer count/fees" panel."""
+    from .models import CapitalMovement
+    today = datetime.utcnow().date()
+    with get_session() as s:
+        return (
+            s.query(CapitalMovement)
+            .filter(func.date(CapitalMovement.timestamp) == today)
+            .order_by(desc(CapitalMovement.timestamp))
+            .all()
+        )
+
+
+def get_capital_movement_history(hours: int = 168) -> list:
+    """Movements in the lookback window — chronological, oldest first.
+    7-day window by default, suitable for analysing rebalance cadence.
+    """
+    from .models import CapitalMovement
+    since = datetime.utcnow() - timedelta(hours=hours)
+    with get_session() as s:
+        return (
+            s.query(CapitalMovement)
+            .filter(CapitalMovement.timestamp >= since)
+            .order_by(CapitalMovement.timestamp)
+            .all()
+        )
+
+
+# ── BalanceAgent: fund capital efficiency (policy edge estimates) ───────────
+
+def log_fund_capital_efficiency(data: dict) -> int:
+    """Insert a fund_capital_efficiency snapshot. Required: fund. All other
+    fields default safely; pass realised_return_usd, deployed_usd, etc."""
+    from .models import FundCapitalEfficiency
+    with get_session() as s:
+        row = FundCapitalEfficiency(**data)
+        s.add(row)
+        s.flush()
+        return row.id
+
+
+def get_fund_capital_efficiency(fund: str, hours: int = 720) -> list:
+    """All efficiency rows for a fund in the lookback window (default 30d).
+    Chronological. Used to compute depletion_variance + opportunity_cost
+    for the Miller-Orr band, and edge estimates for the growth-optimal
+    policy.
+    """
+    from .models import FundCapitalEfficiency
+    since = datetime.utcnow() - timedelta(hours=hours)
+    with get_session() as s:
+        return (
+            s.query(FundCapitalEfficiency)
+            .filter(FundCapitalEfficiency.fund == fund,
+                    FundCapitalEfficiency.timestamp >= since)
+            .order_by(FundCapitalEfficiency.timestamp)
+            .all()
+        )
+
+
+def get_latest_fund_efficiency(fund: str):
+    """Most recent efficiency row for a fund, or None."""
+    from .models import FundCapitalEfficiency
+    with get_session() as s:
+        return (
+            s.query(FundCapitalEfficiency)
+            .filter(FundCapitalEfficiency.fund == fund)
+            .order_by(desc(FundCapitalEfficiency.timestamp))
+            .first()
+        )

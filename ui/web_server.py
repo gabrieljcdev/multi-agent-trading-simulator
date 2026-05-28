@@ -162,6 +162,7 @@ class WebServer:
             web.post("/action/pause",          self.handle_pause),
             web.post("/action/set_mode",       self.handle_set_mode),
             web.post("/action/approve_window", self.handle_approve_window),
+            web.post("/action/rebalance",      self.handle_rebalance),
         ])
         return app
 
@@ -384,6 +385,62 @@ class WebServer:
         except Exception as e:
             return web.json_response({"ok": False, "error": str(e)})
 
+    async def handle_rebalance(self, request) -> web.Response:
+        """Two-step arm → confirm with token. The BalanceAgent owns the
+        token state; this endpoint dispatches by request body shape.
+
+        Body shapes:
+          { "action": "arm" }                        — issue + return token
+          { "action": "confirm", "token": "<hex>" }  — consume token,
+              return summary on success
+        """
+        coord = self._coordinator
+        if coord is None or not hasattr(coord, "get_agent"):
+            return web.json_response({"ok": False, "error": "no coordinator"})
+        balance_agent = coord.get_agent("balance")
+        if balance_agent is None:
+            return web.json_response({"ok": False, "error": "no balance agent"})
+        body = await self._body(request)
+        action = body.get("action")
+        if action == "arm":
+            try:
+                token, notice = balance_agent.arm()
+            except Exception as e:
+                return web.json_response({"ok": False, "error": str(e)})
+            try:
+                db_queries.log_agent_event(
+                    "balance", "REBALANCE_ARM", "armed via web UI",
+                )
+            except Exception:
+                pass
+            return web.json_response({
+                "ok": True, "token": token, "ring_fence": notice,
+            })
+        if action == "confirm":
+            token = body.get("token", "")
+            try:
+                ok = balance_agent.consume_arm(token)
+            except Exception as e:
+                return web.json_response({"ok": False, "error": str(e)})
+            if not ok:
+                return web.json_response({
+                    "ok": False, "error": "invalid or expired token",
+                })
+            try:
+                db_queries.log_agent_event(
+                    "balance", "REBALANCE_CONFIRM", "confirmed via web UI",
+                )
+            except Exception:
+                pass
+            # The agent's own scan loop performs the planned moves —
+            # the confirm here just consumes the token and authorises
+            # the next cycle. Returns immediately; the operator watches
+            # the balance panel for the move.
+            return web.json_response({"ok": True})
+        return web.json_response({
+            "ok": False, "error": "action must be 'arm' or 'confirm'",
+        })
+
     async def handle_approve_window(self, request) -> web.Response:
         bot = self._resolve_bot()
         if bot is None:
@@ -489,7 +546,55 @@ class WebServer:
             "top_strategies": self._safe(db_queries.get_strategy_performance, []),
             "insights":       self._safe(lambda: db_queries.get_recent_postmortems(3), []),
             "arb_history":    arb,
+            "balance":        self._snap_balance(),
         }
+
+    def _snap_balance(self) -> dict:
+        """Balance panel snapshot: per-fund allocation, per-node
+        effective balance, in-transit transfers, halted routes,
+        today's transfer count + fees, per-fund return-on-deployed.
+        Degrades gracefully — every field has a safe fallback."""
+        out = {
+            "allocations":          {},
+            "in_transit":           [],
+            "paused_routes":        [],
+            "transfers_today":      0,
+            "fees_today_usd":       0.0,
+            "fund_efficiency":      {},
+        }
+        try:
+            from agents.balance.inventory_state import inventory_state
+            snap = inventory_state.get_snapshot()
+            out["allocations"]   = snap.get("allocations", {})
+            out["in_transit"]    = snap.get("pending", [])
+            out["paused_routes"] = snap.get("paused_routes", [])
+        except Exception as e:
+            logger.debug("balance snapshot inventory_state failed: %s", e)
+        try:
+            moves = db_queries.get_capital_movements_today()
+            out["transfers_today"] = len(moves)
+            # Sim fee is a flat constant; live tracks per-tx fees later.
+            fee = float(getattr(settings, "SIM_WITHDRAWAL_FEE_USD", 1.0))
+            out["fees_today_usd"] = sum(
+                fee for m in moves if (m.state or "") == "completed"
+            )
+        except Exception as e:
+            logger.debug("balance snapshot capital_movements failed: %s", e)
+        try:
+            eff = {}
+            for fund in ("signal", "arb", "mexc_scalp"):
+                row = db_queries.get_latest_fund_efficiency(fund)
+                if row is None:
+                    continue
+                eff[fund] = {
+                    "deployed_usd": float(row.deployed_usd or 0.0),
+                    "return_pct":   float(row.return_on_deployed_pct or 0.0),
+                    "starved":      bool(row.starvation_event),
+                }
+            out["fund_efficiency"] = eff
+        except Exception as e:
+            logger.debug("balance snapshot efficiency failed: %s", e)
+        return out
 
     @staticmethod
     def _safe(fn, fallback):

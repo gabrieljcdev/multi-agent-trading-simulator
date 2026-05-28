@@ -661,6 +661,42 @@ class ScalpingAgent(BaseAgent):
         # the wiring TODOs, both checked at evaluation time.
         return True
 
+    # ── BalanceAgent compounding hooks ──────────────────────────────────
+
+    def get_capital_allocation(self) -> float:
+        """Effective deployable for sizing: max(allocation, trading
+        budget). Observation mode keeps the trading budget at 0 even
+        when the fund is funded — the larger of the two is what the
+        BalanceAgent's compounding view should track."""
+        return float(max(self.capital_allocation, self._capital))
+
+    def set_capital_allocation(self, amount: float) -> bool:
+        """Update both the fund-level allocation AND the trading budget
+        in lockstep. The trading budget is what observation-mode reads
+        to decide between a sim entry and observation-only. Refuses
+        below open-position notional."""
+        ok = super().set_capital_allocation(amount)
+        if not ok:
+            return False
+        # Mirror the trading budget. We keep observation mode intact:
+        # if SCALP_CAPITAL was 0 by configuration, raising allocation
+        # via the BalanceAgent should NOT auto-flip observation mode
+        # — observation mode is operator-driven. We only mirror when
+        # SCALP_CAPITAL is already > 0 (already-live fund).
+        if float(settings.SCALP_CAPITAL) > 0:
+            try:
+                self._capital = float(amount)
+            except Exception as e:
+                log.debug("ScalpingAgent _capital propagation: %s", e)
+        return True
+
+    def get_open_position_notional(self) -> float:
+        """USD notional of open scalp positions — sum size_usd."""
+        try:
+            return float(sum(p.size_usd for p in self._positions.values()))
+        except Exception:
+            return 0.0
+
     # ── Late-binding setters (Optional dependency injection) ────────────
 
     def set_market_data(self, market_data) -> None:
@@ -1330,11 +1366,18 @@ class ScalpingAgent(BaseAgent):
         self._pending_flush.append(obs)
 
         observation_only = self._capital <= 0
+        # Position size scales with the BalanceAgent-set allocation so
+        # realised profit compounds: base = SCALP_POSITION_SIZE_USD ×
+        # (allocation / FUND_MEXC_SCALP_CAPITAL). 1.0× on cold start.
+        starting_pool = float(getattr(settings, "FUND_MEXC_SCALP_CAPITAL", 0.0) or 0.0)
+        factor = 1.0
+        if starting_pool > 0:
+            factor = min(10.0, max(0.0, self.capital_allocation / starting_pool))
         pos = ScalpPosition(
             symbol=symbol, exchange=exchange, direction=direction,
             entry_price=entry_price, entry_time=now,
             entry_ofi_z=ofi["z"], entry_tfi=ofi["raw_tfi"],
-            size_usd=(settings.SCALP_POSITION_SIZE_USD
+            size_usd=(settings.SCALP_POSITION_SIZE_USD * factor
                       if not observation_only else 0.0),
             tp_price=tp_price, sl_price=sl_price,
             tp_bps=tp_bps, sl_bps=sl_bps,
