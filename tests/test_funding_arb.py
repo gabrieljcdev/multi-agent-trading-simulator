@@ -150,6 +150,76 @@ async def test_filter_drops_below_min_apr(monkeypatch):
 
 
 # ─────────────────────────────────────────────────────────────────────────
+# 3b. Negative funding → reverse_carry variant; symmetric |APR| filter
+# ─────────────────────────────────────────────────────────────────────────
+# Live Binance pull (2026-05-29) showed OP -25% APR, INJ -20%, TIA -5%
+# — rich short-funding inversions the original one-sided filter ignored.
+# These tests pin the new symmetric behaviour: emit reverse_carry for
+# negative funding, accept it through _filter, and keep open() blocked
+# on that variant as defence-in-depth.
+
+@pytest.mark.asyncio
+async def test_negative_funding_builds_reverse_carry_variant(monkeypatch):
+    """A negative funding rate flips the carry direction — the agent should
+    see variant='reverse_carry' so observation logging + downstream
+    consumers can distinguish the two legs without re-deriving the sign."""
+    monkeypatch.setattr(settings, "FUNDING_SYMBOLS", ["OP/USDT"])
+    monkeypatch.setattr(settings, "FUNDING_MIN_APR", 0.0)
+    # -0.0001 * 1095 = -0.1095 → negative funding → reverse_carry
+    eng = _engine_with(rate_8h=-0.0001)
+    opps = await eng.scan()
+    assert len(opps) == 1
+    assert opps[0].variant == "reverse_carry"
+    assert opps[0].funding_apr == pytest.approx(-0.1095)
+
+
+@pytest.mark.asyncio
+async def test_filter_uses_abs_funding_apr(monkeypatch):
+    """A -10% APR opportunity must pass the 6% floor — `|funding_apr| >= floor`."""
+    monkeypatch.setattr(settings, "FUNDING_SYMBOLS", ["OP/USDT"])
+    monkeypatch.setattr(settings, "FUNDING_MIN_APR", 0.06)
+    # -0.0001 * 1095 = -0.1095 = -10.95% APR → |x| = 0.1095 ≥ 0.06 ✓
+    eng = _engine_with(rate_8h=-0.0001)
+    opps = await eng.scan()
+    assert len(opps) == 1
+    assert opps[0].variant == "reverse_carry"
+
+
+@pytest.mark.asyncio
+async def test_filter_drops_subthreshold_negative(monkeypatch):
+    """A -3% APR opportunity must NOT pass a 6% floor (|−3| < 6)."""
+    monkeypatch.setattr(settings, "FUNDING_SYMBOLS", ["BTC/USDT"])
+    monkeypatch.setattr(settings, "FUNDING_MIN_APR", 0.06)
+    # -0.00003 * 1095 = -0.03285 = -3.3% APR → |x| < 0.06
+    eng = _engine_with(rate_8h=-0.00003)
+    opps = await eng.scan()
+    assert opps == []
+
+
+@pytest.mark.asyncio
+async def test_open_refuses_reverse_carry_variant(monkeypatch):
+    """Defence in depth: open() must refuse reverse_carry even if the agent
+    somehow reaches it (e.g. FUNDING_OBSERVATION_MODE flipped off without
+    the Phase-2 leg map being wired). The guard logs + returns rather than
+    routing a wrong-direction order pair."""
+    monkeypatch.setattr(settings, "SIM_MODE", True, raising=False)
+    monkeypatch.setattr(settings, "FUNDING_OBSERVATION_MODE", True, raising=False)
+    eng = _engine_with(rate_8h=0.0001)
+    # Build the inverse-variant opp manually so we don't depend on a
+    # negative rate to trigger the guard.
+    opp = FundingOpportunity(
+        symbol="OP/USDT", variant="reverse_carry",
+        venue_long="binance", venue_short="binance",
+        funding_apr=-0.20, spread_apr=0.0, oi_usd=1e7, depth_ok=True,
+    )
+    # If the guard fails, _place would be reached and the patched
+    # save_trade fixture would record the call. Spy on _place to be sure.
+    with patch.object(eng, "_place", new=AsyncMock()) as place:
+        await eng.open(opp)
+        place.assert_not_called()
+
+
+# ─────────────────────────────────────────────────────────────────────────
 # 4. depth gate — depth_ok rejects when oi_usd < min × notional
 # ─────────────────────────────────────────────────────────────────────────
 

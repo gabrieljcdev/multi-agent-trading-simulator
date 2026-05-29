@@ -271,9 +271,24 @@ ARB_FUNDING_CONSECUTIVE_LOSS_HALT = 4
 
 FUNDING_OBSERVATION_MODE       = True       # test: True/False  (NEVER False this phase)
 FUNDING_CAPITAL_USD            = 0.0        # test: 0-5000
-FUNDING_SYMBOLS                = ["BTC/USDT", "ETH/USDT"]
+# Widened from majors-only after 2026-05-29 observation pull showed BTC at
+# 4% APR / ETH at 7% — both below the original 12% gate, leaving the obs
+# table empty. Altcoin perps (esp. memecoins + L2 governance) routinely
+# push 15-30% APR and ALSO produce rich negative-funding inversions
+# (reverse_carry variant) the engine now also accepts. All symbols below
+# verified live on Binance USD-M perp markets.
+FUNDING_SYMBOLS                = [
+    "BTC/USDT",  "ETH/USDT",  "SOL/USDT",  "DOGE/USDT",
+    "ARB/USDT",  "OP/USDT",   "INJ/USDT",  "TIA/USDT",
+    "SUI/USDT",  "APT/USDT",  "AVAX/USDT", "LINK/USDT",
+]
 FUNDING_SCAN_INTERVAL_SEC      = 60         # test: 30-300
-FUNDING_MIN_APR                = 0.12       # test: 0.06-0.30
+# Threshold is now symmetric — `|funding_apr| >= FUNDING_MIN_APR` admits
+# both delta_neutral (positive carry, long-spot + short-perp) and
+# reverse_carry (negative carry, long-perp + short-spot) variants. Lowered
+# from 0.12 → 0.06 so the more numerous mid-APR opportunities populate
+# funding_arb_observations during the soak.
+FUNDING_MIN_APR                = 0.06       # test: 0.03-0.30 (now |apr| >= floor)
 FUNDING_MIN_OI_MULT            = 10.0       # test: 5-50
 FUNDING_MAX_NOTIONAL_USD       = 250.0      # test: 100-5000
 FUNDING_MAX_CONCURRENT         = 2          # test: 1-5

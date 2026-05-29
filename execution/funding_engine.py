@@ -155,6 +155,16 @@ class FundingEngine:
             assert settings.SIM_MODE, (
                 "FUNDING_OBSERVATION_MODE refuses to open while SIM_MODE is False"
             )
+        # Phase-1 open() supports only delta_neutral (long-spot + short-perp).
+        # reverse_carry is observation-only until Phase 2 wires the inverse
+        # leg map; refuse here so a future code path that bypasses the
+        # FUNDING_OBSERVATION_MODE check can't route the wrong pair.
+        if opp.variant != "delta_neutral":
+            logger.warning(
+                "[FundingEngine] refusing to open variant=%s (observation-only)",
+                opp.variant,
+            )
+            return
 
         lock = self._symbol_locks.get(opp.symbol)
         if lock is None:
@@ -309,12 +319,25 @@ class FundingEngine:
     def _build_opportunities(
         self, symbol: str, venue: str, funding_apr: float, oi_usd: float,
     ) -> list[FundingOpportunity]:
-        """Construct the delta-neutral opportunity for one (symbol, venue).
+        """Construct the funding-carry opportunity for one (symbol, venue).
 
-        Phase 1 returns exactly one opportunity per symbol — venue_long
-        and venue_short are the same exchange (spot vs perp). The check
-        for OI sufficiency happens here so callers see a clean list of
-        opportunities, each with its depth_ok flag already populated.
+        Returns exactly one opportunity per symbol — venue_long and
+        venue_short are the same exchange (spot vs perp), with the
+        spot/perp role determined by the variant:
+
+          * funding_apr >= 0  → variant="delta_neutral"
+            long-spot + short-perp; receives funding.
+          * funding_apr <  0  → variant="reverse_carry"
+            long-perp + short-spot; the negative funding now flows
+            TO the short side, so this side receives the carry.
+
+        Both variants flag the same depth_ok / oi_usd / spread_apr
+        fields; only `variant` (and the implied leg assignment)
+        differs. The reverse_carry path is OBSERVATION-ONLY until
+        Phase 2 wires the corresponding open()/_place() leg map —
+        FundingEngine.open() rejects non-delta_neutral variants as a
+        defence-in-depth guard so a flipped FUNDING_OBSERVATION_MODE
+        can't accidentally route the wrong leg pairing.
         """
         notional_target = float(settings.FUNDING_MAX_NOTIONAL_USD)
         min_required_oi = float(settings.FUNDING_MIN_OI_MULT) * notional_target
@@ -325,9 +348,10 @@ class FundingEngine:
         else:
             depth_ok = oi_usd >= min_required_oi
 
+        variant = "delta_neutral" if funding_apr >= 0 else "reverse_carry"
         return [FundingOpportunity(
             symbol=symbol,
-            variant="delta_neutral",
+            variant=variant,
             venue_long=venue,
             venue_short=venue,
             funding_apr=funding_apr,
@@ -338,10 +362,13 @@ class FundingEngine:
 
     @staticmethod
     def _filter(opps: list[FundingOpportunity]) -> list[FundingOpportunity]:
-        """Drop opps below the APR floor. depth_ok is propagated through —
-        callers can choose to treat a False as a soft skip via skip_reason."""
+        """Drop opps whose |funding_apr| is below FUNDING_MIN_APR. The check
+        is symmetric so both variants surface: positive APR → delta_neutral
+        (receive funding), negative APR → reverse_carry (receive funding on
+        the short leg). depth_ok is propagated through — callers can treat
+        a False as a soft skip via skip_reason."""
         floor = float(settings.FUNDING_MIN_APR)
-        return [o for o in opps if o.funding_apr >= floor]
+        return [o for o in opps if abs(o.funding_apr) >= floor]
 
     async def _place(self, pos: FundingPosition, leg: str) -> Optional[int]:
         """Route one leg through OrderRouter.
