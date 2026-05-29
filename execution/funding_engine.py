@@ -247,7 +247,16 @@ class FundingEngine:
         if ccxt is None:
             return None
         try:
-            self._exchange = ccxt.binance({"enableRateLimit": True})
+            # defaultType=future is REQUIRED — ccxt's binance.fetch_funding_rate
+            # raises NotSupported on spot ("supports linear and inverse contracts
+            # only"). Without this option every scan tick was silently dropping
+            # every symbol with a swallowed DEBUG log, leaving
+            # funding_arb_observations empty even with a fully widened universe.
+            # Verified via direct A/B test on 2026-05-29.
+            self._exchange = ccxt.binance({
+                "enableRateLimit": True,
+                "options": {"defaultType": "future"},
+            })
         except Exception as e:
             logger.debug(f"FundingEngine: binance() failed: {e}")
             self._exchange = None

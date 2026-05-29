@@ -196,6 +196,28 @@ async def test_filter_drops_subthreshold_negative(monkeypatch):
     assert opps == []
 
 
+def test_engine_binance_client_uses_future_market_type():
+    """Regression (2026-05-29): the engine was instantiating
+    ccxt.binance() with no defaultType, so it defaulted to spot — and
+    binance.fetch_funding_rate raises NotSupported on spot ("supports
+    linear and inverse contracts only"). Every scan tick silently
+    dropped every symbol via the engine's DEBUG-level try/except,
+    leaving funding_arb_observations empty. The constructor must pin
+    defaultType to a perp/futures market so funding endpoints route to
+    fapi.binance.com."""
+    # Skip if ccxt unavailable in this venv — the engine itself tolerates
+    # it (returns None from _get_exchange), but the test is meaningful
+    # only when a real client can be built.
+    pytest.importorskip("ccxt.async_support")
+    eng = FundingEngine()
+    client = eng._get_exchange()
+    assert client is not None, "engine couldn't build a binance client"
+    assert client.options.get("defaultType") == "future", (
+        f"expected defaultType=future, got {client.options.get('defaultType')!r} "
+        "— spot doesn't expose fetch_funding_rate, scans will all return None"
+    )
+
+
 @pytest.mark.asyncio
 async def test_open_refuses_reverse_carry_variant(monkeypatch):
     """Defence in depth: open() must refuse reverse_carry even if the agent
