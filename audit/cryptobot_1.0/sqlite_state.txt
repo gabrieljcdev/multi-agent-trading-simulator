@@ -1,0 +1,546 @@
+=== .schema ===
+CREATE TABLE candles (
+	id INTEGER NOT NULL, 
+	exchange VARCHAR(20) NOT NULL, 
+	pair VARCHAR(20) NOT NULL, 
+	timeframe VARCHAR(5) NOT NULL, 
+	timestamp DATETIME NOT NULL, 
+	open FLOAT NOT NULL, 
+	high FLOAT NOT NULL, 
+	low FLOAT NOT NULL, 
+	close FLOAT NOT NULL, 
+	volume FLOAT NOT NULL, 
+	num_trades INTEGER, 
+	rsi FLOAT, 
+	macd FLOAT, 
+	macd_signal FLOAT, 
+	macd_hist FLOAT, 
+	bb_upper FLOAT, 
+	bb_mid FLOAT, 
+	bb_lower FLOAT, 
+	ema_fast FLOAT, 
+	ema_slow FLOAT, 
+	volume_sma FLOAT, 
+	created_at DATETIME, 
+	PRIMARY KEY (id)
+);
+CREATE INDEX ix_candles_lookup ON candles (exchange, pair, timeframe, timestamp);
+CREATE TABLE signals (
+	id INTEGER NOT NULL, 
+	timestamp DATETIME NOT NULL, 
+	pair VARCHAR(20) NOT NULL, 
+	exchange VARCHAR(20), 
+	exchange_b VARCHAR(20), 
+	signal_type VARCHAR(20) NOT NULL, 
+	direction VARCHAR(5), 
+	score FLOAT NOT NULL, 
+	passed_gate BOOLEAN, 
+	rsi FLOAT, 
+	macd_hist FLOAT, 
+	bb_position FLOAT, 
+	volume_ratio FLOAT, 
+	arb_gap_pct FLOAT, 
+	sentiment_score FLOAT, 
+	sentiment_mod FLOAT, 
+	sentiment_velocity FLOAT, 
+	tf_5m_confirm BOOLEAN, 
+	tf_15m_confirm BOOLEAN, 
+	tf_1h_confirm BOOLEAN, 
+	indicators_json JSON, 
+	claude_reasoning TEXT, 
+	claude_suggested_entry FLOAT, 
+	claude_suggested_sl FLOAT, 
+	claude_suggested_tp FLOAT, 
+	claude_suggested_size FLOAT, 
+	claude_risk_reward FLOAT, 
+	claude_api_cost_usd FLOAT, 
+	user_action VARCHAR(10), 
+	user_action_at DATETIME, 
+	skip_reason TEXT, 
+	price_at_signal FLOAT, 
+	price_1h FLOAT, 
+	price_4h FLOAT, 
+	price_24h FLOAT, 
+	outcome VARCHAR(10), 
+	outcome_pnl_pct FLOAT, 
+	profile VARCHAR(30), 
+	strategy VARCHAR(30), 
+	PRIMARY KEY (id)
+);
+CREATE INDEX ix_signals_pair ON signals (pair);
+CREATE INDEX ix_signals_timestamp ON signals (timestamp);
+CREATE INDEX ix_signals_type ON signals (signal_type);
+CREATE TABLE sentiment (
+	id INTEGER NOT NULL, 
+	timestamp DATETIME NOT NULL, 
+	coin VARCHAR(10) NOT NULL, 
+	reddit_score FLOAT, 
+	telegram_score FLOAT, 
+	news_score FLOAT, 
+	fear_greed FLOAT, 
+	google_trends FLOAT, 
+	composite FLOAT, 
+	velocity FLOAT, 
+	post_count INTEGER, 
+	mention_count INTEGER, 
+	PRIMARY KEY (id)
+);
+CREATE INDEX ix_sentiment_lookup ON sentiment (coin, timestamp);
+CREATE TABLE sentiment_log (
+	id INTEGER NOT NULL, 
+	timestamp DATETIME NOT NULL, 
+	source_id VARCHAR(30) NOT NULL, 
+	score FLOAT, 
+	composite_score FLOAT, 
+	hard_block BOOLEAN, 
+	block_reason TEXT, 
+	confidence FLOAT, 
+	raw_data JSON, 
+	PRIMARY KEY (id)
+);
+CREATE INDEX ix_sentiment_log_lookup ON sentiment_log (source_id, timestamp);
+CREATE TABLE macro_log (
+	id INTEGER NOT NULL, 
+	timestamp DATETIME NOT NULL, 
+	scenario VARCHAR(25), 
+	macro_score FLOAT, 
+	dollar_strength VARCHAR(10), 
+	risk_appetite VARCHAR(10), 
+	rate_environment VARCHAR(12), 
+	vol_regime VARCHAR(10), 
+	dxy FLOAT, 
+	vix FLOAT, 
+	yield_10y FLOAT, 
+	yield_2y FLOAT, 
+	yield_curve FLOAT, 
+	fed_funds_rate FLOAT, 
+	cpi_yoy FLOAT, 
+	confidence FLOAT, 
+	raw_data JSON, 
+	PRIMARY KEY (id)
+);
+CREATE INDEX ix_macro_log_ts ON macro_log (timestamp);
+CREATE TABLE calendar_events (
+	id INTEGER NOT NULL, 
+	event_id VARCHAR(80) NOT NULL, 
+	title VARCHAR(120) NOT NULL, 
+	country VARCHAR(10), 
+	scheduled_utc DATETIME NOT NULL, 
+	impact VARCHAR(8), 
+	actual FLOAT, 
+	forecast FLOAT, 
+	previous FLOAT, 
+	source_id VARCHAR(30), 
+	fetched_at DATETIME, 
+	PRIMARY KEY (id), 
+	UNIQUE (event_id)
+);
+CREATE INDEX ix_calendar_events_lookup ON calendar_events (scheduled_utc, impact);
+CREATE TABLE scalp_observations (
+	id INTEGER NOT NULL, 
+	symbol VARCHAR(20) NOT NULL, 
+	exchange VARCHAR(20) NOT NULL, 
+	timestamp FLOAT NOT NULL, 
+	ofi_z FLOAT, 
+	direction VARCHAR(10), 
+	strength VARCHAR(10), 
+	tfi_confirms BOOLEAN, 
+	raw_tfi FLOAT, 
+	spread_bps FLOAT, 
+	regime VARCHAR(20), 
+	round_trip_cost_bps FLOAT, 
+	min_win_rate_required FLOAT, 
+	tp_bps FLOAT, 
+	sl_bps FLOAT, 
+	would_entry BOOLEAN, 
+	skip_reason VARCHAR(160), 
+	entry_price FLOAT, 
+	exit_price FLOAT, 
+	exit_time FLOAT, 
+	exit_reason VARCHAR(30), 
+	hold_sec FLOAT, 
+	pnl_bps FLOAT, 
+	pnl_usd FLOAT, 
+	observation_only BOOLEAN, 
+	price_30s FLOAT, 
+	price_1m FLOAT, 
+	price_3m FLOAT, 
+	price_5m FLOAT, 
+	confluence_score INTEGER, 
+	strength_label VARCHAR(16), 
+	cross_exchange_agrees BOOLEAN, 
+	btc_compatible BOOLEAN, 
+	adverse_selection_ok BOOLEAN, 
+	depth_ok BOOLEAN, 
+	vwap_aligned BOOLEAN, 
+	htf_aligned BOOLEAN, 
+	volume_adequate BOOLEAN, 
+	atr_bps FLOAT, 
+	atr_adjusted BOOLEAN, 
+	sl_clamped VARCHAR(8), 
+	rr_actual FLOAT, 
+	created_at DATETIME, 
+	PRIMARY KEY (id)
+);
+CREATE INDEX ix_scalp_observations_symbol ON scalp_observations (symbol);
+CREATE INDEX ix_scalp_observations_timestamp ON scalp_observations (timestamp);
+CREATE INDEX ix_scalp_observations_exchange ON scalp_observations (exchange);
+CREATE INDEX ix_scalp_obs_lookup ON scalp_observations (symbol, exchange, timestamp);
+CREATE INDEX ix_scalp_observations_would_entry ON scalp_observations (would_entry);
+CREATE TABLE data_log (
+	id INTEGER NOT NULL, 
+	timestamp DATETIME NOT NULL, 
+	source_id VARCHAR(30) NOT NULL, 
+	metric VARCHAR(40) NOT NULL, 
+	symbol VARCHAR(20), 
+	value FLOAT, 
+	raw_data JSON, 
+	error TEXT, 
+	PRIMARY KEY (id)
+);
+CREATE INDEX ix_data_log_lookup ON data_log (source_id, metric, symbol, timestamp);
+CREATE TABLE daily_stats (
+	id INTEGER NOT NULL, 
+	date VARCHAR(10) NOT NULL, 
+	total_signals INTEGER, 
+	signals_passed_gate INTEGER, 
+	signals_acted_on INTEGER, 
+	total_trades INTEGER, 
+	wins INTEGER, 
+	losses INTEGER, 
+	win_rate FLOAT, 
+	pnl_usd FLOAT, 
+	pnl_pct FLOAT, 
+	fees_usd FLOAT, 
+	best_trade_pnl_pct FLOAT, 
+	worst_trade_pnl_pct FLOAT, 
+	avg_hold_minutes FLOAT, 
+	best_signal_type VARCHAR(20), 
+	avg_score_winners FLOAT, 
+	avg_score_losers FLOAT, 
+	portfolio_value_usd FLOAT, 
+	portfolio_peak_usd FLOAT, 
+	claude_api_cost_usd FLOAT, 
+	sim_mode BOOLEAN, 
+	profile VARCHAR(30), 
+	strategy VARCHAR(30), 
+	PRIMARY KEY (id), 
+	UNIQUE (date)
+);
+CREATE TABLE arb_trades (
+	id INTEGER NOT NULL, 
+	timestamp DATETIME, 
+	symbol VARCHAR(20) NOT NULL, 
+	buy_exchange VARCHAR(20), 
+	sell_exchange VARCHAR(20), 
+	buy_price FLOAT, 
+	sell_price FLOAT, 
+	buy_fill FLOAT, 
+	sell_fill FLOAT, 
+	gross_gap_pct FLOAT, 
+	net_gap_pct FLOAT, 
+	size_usd FLOAT, 
+	gross_pnl_usd FLOAT, 
+	net_pnl_usd FLOAT, 
+	execution_ms FLOAT, 
+	status VARCHAR(20), 
+	slippage_buy_pct FLOAT, 
+	slippage_sell_pct FLOAT, 
+	sim_mode BOOLEAN, 
+	success BOOLEAN, 
+	error TEXT, 
+	PRIMARY KEY (id)
+);
+CREATE INDEX ix_arb_trades_lookup ON arb_trades (symbol, timestamp);
+CREATE TABLE funding_arb_trades (
+	id INTEGER NOT NULL, 
+	timestamp DATETIME, 
+	symbol VARCHAR(20) NOT NULL, 
+	buy_exchange VARCHAR(20), 
+	sell_exchange VARCHAR(20), 
+	buy_price FLOAT, 
+	sell_price FLOAT, 
+	buy_fill FLOAT, 
+	sell_fill FLOAT, 
+	gross_gap_pct FLOAT, 
+	net_gap_pct FLOAT, 
+	size_usd FLOAT, 
+	gross_pnl_usd FLOAT, 
+	net_pnl_usd FLOAT, 
+	execution_ms FLOAT, 
+	status VARCHAR(20), 
+	slippage_buy_pct FLOAT, 
+	slippage_sell_pct FLOAT, 
+	funding_rate_pct FLOAT, 
+	sim_mode BOOLEAN, 
+	success BOOLEAN, 
+	error TEXT, 
+	PRIMARY KEY (id)
+);
+CREATE INDEX ix_funding_arb_trades_lookup ON funding_arb_trades (symbol, timestamp);
+CREATE TABLE funding_arb_observations (
+	id INTEGER NOT NULL, 
+	timestamp FLOAT NOT NULL, 
+	symbol VARCHAR(20) NOT NULL, 
+	variant VARCHAR(20) NOT NULL, 
+	venue_long VARCHAR(20), 
+	venue_short VARCHAR(20), 
+	funding_apr FLOAT, 
+	spread_apr FLOAT, 
+	oi_usd FLOAT, 
+	depth_ok BOOLEAN, 
+	notional_usd FLOAT, 
+	margin_used FLOAT, 
+	basis_at_entry FLOAT, 
+	projected_funding_per_interval FLOAT, 
+	projected_fees FLOAT, 
+	projected_net_apr FLOAT, 
+	would_enter BOOLEAN, 
+	skip_reason VARCHAR(160), 
+	exit_time FLOAT, 
+	exit_reason VARCHAR(30), 
+	hold_sec FLOAT, 
+	funding_collected FLOAT, 
+	fees_paid FLOAT, 
+	pnl_usd FLOAT, 
+	observation_only BOOLEAN, 
+	created_at DATETIME, 
+	PRIMARY KEY (id)
+);
+CREATE INDEX ix_funding_arb_observations_timestamp ON funding_arb_observations (timestamp);
+CREATE INDEX ix_funding_arb_obs_lookup ON funding_arb_observations (symbol, timestamp);
+CREATE INDEX ix_funding_arb_observations_symbol ON funding_arb_observations (symbol);
+CREATE INDEX ix_funding_arb_observations_would_enter ON funding_arb_observations (would_enter);
+CREATE TABLE xchain_observations (
+	id INTEGER NOT NULL, 
+	timestamp DATETIME, 
+	symbol VARCHAR(20) NOT NULL, 
+	buy_chain VARCHAR(20) NOT NULL, 
+	sell_chain VARCHAR(20) NOT NULL, 
+	buy_venue VARCHAR(30), 
+	sell_venue VARCHAR(30), 
+	notional_usd FLOAT, 
+	spread_bps FLOAT, 
+	rt_fee_bps FLOAT, 
+	gas_bps FLOAT, 
+	slip_bps FLOAT, 
+	bridge_bps FLOAT, 
+	net_edge_bps FLOAT, 
+	gas_breakeven_usd FLOAT, 
+	would_entry BOOLEAN, 
+	skip_reason VARCHAR(160), 
+	observation_only BOOLEAN, 
+	PRIMARY KEY (id)
+);
+CREATE INDEX ix_xchain_obs_lookup ON xchain_observations (symbol, timestamp);
+CREATE INDEX ix_xchain_observations_timestamp ON xchain_observations (timestamp);
+CREATE INDEX ix_xchain_observations_would_entry ON xchain_observations (would_entry);
+CREATE INDEX ix_xchain_observations_symbol ON xchain_observations (symbol);
+CREATE TABLE portfolio_snapshots (
+	id INTEGER NOT NULL, 
+	timestamp DATETIME NOT NULL, 
+	total_equity FLOAT, 
+	total_daily_pnl FLOAT, 
+	total_exposure_pct FLOAT, 
+	agents_running INTEGER, 
+	portfolio_status VARCHAR(20), 
+	snapshot_json JSON, 
+	PRIMARY KEY (id)
+);
+CREATE INDEX ix_portfolio_snapshots_ts ON portfolio_snapshots (timestamp);
+CREATE TABLE agent_events (
+	id INTEGER NOT NULL, 
+	timestamp DATETIME, 
+	agent_id VARCHAR(30) NOT NULL, 
+	event_type VARCHAR(20), 
+	detail TEXT, 
+	PRIMARY KEY (id)
+);
+CREATE INDEX ix_agent_events_lookup ON agent_events (agent_id, timestamp);
+CREATE TABLE capital_movements (
+	id INTEGER NOT NULL, 
+	timestamp DATETIME NOT NULL, 
+	from_fund VARCHAR(30) NOT NULL, 
+	to_fund VARCHAR(30) NOT NULL, 
+	from_exchange VARCHAR(30), 
+	to_exchange VARCHAR(30), 
+	asset VARCHAR(10), 
+	amount_usd FLOAT NOT NULL, 
+	mode VARCHAR(8), 
+	state VARCHAR(12), 
+	initiated_by VARCHAR(30), 
+	note TEXT, 
+	rail_id VARCHAR(30), 
+	network VARCHAR(20), 
+	transfer_tx_hash VARCHAR(120), 
+	error TEXT, 
+	completed_at DATETIME, 
+	PRIMARY KEY (id)
+);
+CREATE INDEX ix_capital_movements_state ON capital_movements (state, timestamp);
+CREATE INDEX ix_capital_movements_lookup ON capital_movements (from_fund, to_fund, timestamp);
+CREATE TABLE fund_capital_efficiency (
+	id INTEGER NOT NULL, 
+	timestamp DATETIME NOT NULL, 
+	fund VARCHAR(30) NOT NULL, 
+	deployed_usd FLOAT, 
+	realised_return_usd FLOAT, 
+	return_on_deployed_pct FLOAT, 
+	starvation_event BOOLEAN, 
+	starvation_detail VARCHAR(200), 
+	PRIMARY KEY (id)
+);
+CREATE INDEX ix_fund_capital_efficiency_lookup ON fund_capital_efficiency (fund, timestamp);
+CREATE TABLE circuit_breaker_log (
+	id INTEGER NOT NULL, 
+	timestamp DATETIME, 
+	reason VARCHAR(50), 
+	detail TEXT, 
+	auto_resume_at DATETIME, 
+	manually_resolved BOOLEAN, 
+	PRIMARY KEY (id)
+);
+CREATE TABLE trades (
+	id INTEGER NOT NULL, 
+	signal_id INTEGER, 
+	timestamp_open DATETIME NOT NULL, 
+	timestamp_close DATETIME, 
+	pair VARCHAR(20) NOT NULL, 
+	exchange VARCHAR(20) NOT NULL, 
+	exchange_b VARCHAR(20), 
+	side VARCHAR(5) NOT NULL, 
+	signal_type VARCHAR(20), 
+	entry_price FLOAT NOT NULL, 
+	exit_price FLOAT, 
+	size_usd FLOAT NOT NULL, 
+	size_base FLOAT, 
+	stop_loss FLOAT, 
+	take_profit FLOAT, 
+	fees_usd FLOAT, 
+	pnl_usd FLOAT, 
+	pnl_pct FLOAT, 
+	hold_minutes FLOAT, 
+	exit_reason VARCHAR(20), 
+	claude_postmortem TEXT, 
+	sim_mode BOOLEAN NOT NULL, 
+	profile VARCHAR(30), 
+	strategy VARCHAR(30), 
+	order_id_open VARCHAR(80), 
+	order_id_close VARCHAR(80), 
+	PRIMARY KEY (id), 
+	FOREIGN KEY(signal_id) REFERENCES signals (id)
+);
+CREATE INDEX ix_trades_pair ON trades (pair);
+CREATE INDEX ix_trades_timestamp ON trades (timestamp_open);
+CREATE TABLE predictions (
+	id INTEGER NOT NULL, 
+	signal_id INTEGER, 
+	timestamp DATETIME, 
+	model_version VARCHAR(20), 
+	win_probability FLOAT, 
+	expected_pnl_pct FLOAT, 
+	confidence FLOAT, 
+	features_json JSON, 
+	correct BOOLEAN, 
+	PRIMARY KEY (id), 
+	FOREIGN KEY(signal_id) REFERENCES signals (id)
+);
+CREATE TABLE arb_opportunities (
+	id INTEGER NOT NULL, 
+	detected_at DATETIME, 
+	symbol VARCHAR(20) NOT NULL, 
+	buy_exchange VARCHAR(20), 
+	sell_exchange VARCHAR(20), 
+	gap_pct FLOAT, 
+	threshold_pct FLOAT, 
+	above_threshold BOOLEAN, 
+	depth_buy_usd FLOAT, 
+	depth_sell_usd FLOAT, 
+	executed BOOLEAN, 
+	arb_trade_id INTEGER, 
+	PRIMARY KEY (id), 
+	FOREIGN KEY(arb_trade_id) REFERENCES arb_trades (id)
+);
+CREATE INDEX ix_arb_opportunities_lookup ON arb_opportunities (symbol, detected_at);
+
+=== tables ===
+agent_events
+arb_opportunities
+arb_trades
+calendar_events
+candles
+capital_movements
+circuit_breaker_log
+daily_stats
+data_log
+fund_capital_efficiency
+funding_arb_observations
+funding_arb_trades
+macro_log
+portfolio_snapshots
+predictions
+scalp_observations
+sentiment
+sentiment_log
+signals
+trades
+xchain_observations
+
+=== indexes ===
+ix_agent_events_lookup|agent_events
+ix_arb_opportunities_lookup|arb_opportunities
+ix_arb_trades_lookup|arb_trades
+ix_calendar_events_lookup|calendar_events
+sqlite_autoindex_calendar_events_1|calendar_events
+ix_candles_lookup|candles
+ix_capital_movements_lookup|capital_movements
+ix_capital_movements_state|capital_movements
+sqlite_autoindex_daily_stats_1|daily_stats
+ix_data_log_lookup|data_log
+ix_fund_capital_efficiency_lookup|fund_capital_efficiency
+ix_funding_arb_obs_lookup|funding_arb_observations
+ix_funding_arb_observations_symbol|funding_arb_observations
+ix_funding_arb_observations_timestamp|funding_arb_observations
+ix_funding_arb_observations_would_enter|funding_arb_observations
+ix_funding_arb_trades_lookup|funding_arb_trades
+ix_macro_log_ts|macro_log
+ix_portfolio_snapshots_ts|portfolio_snapshots
+ix_scalp_obs_lookup|scalp_observations
+ix_scalp_observations_exchange|scalp_observations
+ix_scalp_observations_symbol|scalp_observations
+ix_scalp_observations_timestamp|scalp_observations
+ix_scalp_observations_would_entry|scalp_observations
+ix_sentiment_lookup|sentiment
+ix_sentiment_log_lookup|sentiment_log
+ix_signals_pair|signals
+ix_signals_timestamp|signals
+ix_signals_type|signals
+ix_trades_pair|trades
+ix_trades_timestamp|trades
+ix_xchain_obs_lookup|xchain_observations
+ix_xchain_observations_symbol|xchain_observations
+ix_xchain_observations_timestamp|xchain_observations
+ix_xchain_observations_would_entry|xchain_observations
+
+=== row counts ===
+agent_events                             125
+arb_opportunities                        0
+arb_trades                               290
+calendar_events                          11
+candles                                  0
+capital_movements                        31
+circuit_breaker_log                      317
+daily_stats                              0
+data_log                                 46923
+fund_capital_efficiency                  945
+funding_arb_observations                 110
+funding_arb_trades                       0
+macro_log                                66
+portfolio_snapshots                      563
+predictions                              0
+scalp_observations                       214570
+sentiment                                0
+sentiment_log                            228
+signals                                  120
+trades                                   110
+xchain_observations                      7374

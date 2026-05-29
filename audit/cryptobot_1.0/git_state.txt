@@ -1,0 +1,86 @@
+2026-05-29T10:54:47Z
+--- audit started ---
+
+=== git branch ===
+feat/web-ui-v2-agent-panels
+
+=== git SHA ===
+8e3efd1ae4c1f4b268e4ecfa7a4bdc9b9aca8b7f
+
+=== git status ===
+On branch feat/web-ui-v2-agent-panels
+Untracked files:
+  (use "git add <file>..." to include in what will be committed)
+	audit/
+	config/keys.env.pre-restore.20260528-211120
+	config/settings.py.backup
+	prompts/5kfund.md
+	prompts/balance_agent.md
+	prompts/build_balance_agent.md
+	prompts/build_crosschain_agent_v2.md
+	prompts/build_funding_arb.md
+	prompts/build_web_ui_refresh_v1.md
+	prompts/build_web_ui_v2_agent_panels.md
+	prompts/build_web_ui_v3_agent_pages.md
+	prompts/cryptobot_audit.md
+	prompts/fix_deisland_engines.md
+	prompts/fix_pre_soak.md
+	scripts/watch_scalp.sh
+
+nothing added to commit but untracked files present (use "git add" to track)
+
+=== git log -50 ===
+8e3efd1 fix(funding_engine): instantiate binance with defaultType=future — fixes silent fetch_funding_rate failures
+8fe5b9a feat(funding_arb): widen universe, symmetric APR floor, reverse_carry variant — fills observation table
+c7c5c63 fix(inventory_state): undersubscribed venues return physical − other_claims (match docstring) — unblocks arb engine
+57cc9db fix(scalping_agent): write Trade.pnl_pct as fraction (not percent) — stops phantom CB HALTs
+b73a7c9 fix(signals/arbitrage): coerce ccxt prices to float — stop ~48/30min ERROR floods on every scan
+44c3854 chore: re-allocate EXCHANGE_BALANCES to sum to 5000 (ring-fenced per fund)
+5d4f770 test(funds): track 5k-soak fund layout — add FUND_MEXC_ARB_CAPITAL, expand reserve assertion, xfail EXCHANGE_BALANCES ledger invariant
+0cdbb40 chore: reset to $5000 starting capital — soak allocation (arb 2000 / signal 1600 / mexc-scalp 500 / mexc-arb 500 / reserve 400; xchain + funding observation-only)
+904cb01 feat(xchain): wire 3 EVM connectors — pinned WETH-USDC pools + dotenv load order + web3 dep
+0dc67e7 feat(web-ui): v3 — per-agent click-through pages, dashboard compaction
+9bb7df3 fix(web-ui): sanitize non-finite floats before json.dumps — fixes silent blank dashboard
+d901e97 feat(web-ui): v2 dedicated agent panels + /action/rebalance three-action contract
+a99b7de fix: de-island FundingRateArbEngine (full allocation wiring) and CrossChainArbEngine (breaker-correctness; xchain rebalancing left to cross-chain rail)
+6885a63 fix: %-based loss breakers, true-P&L netting, settings-ize drift hint, correct Miller-Orr band half-width
+2e6c3af feat: funding-rate arb agent (phase 1 — observation mode, delta-neutral, binance)
+2fa2a97 feat: BalanceAgent — fund-aware inventory state, Kelly compounding, Miller-Orr transfer-minimising rebalance (sim-first, live stubbed)
+e281b8a feat: cross-chain arb agent — observation mode, venue-aware connectors, inventory targets
+36b9618 tweak(web-ui): drop of-bankroll suffix from Daily P&L percentage
+4495e78 feat: web UI refresh v1 — bankroll, agent pages, session pages, scalp feed persistence
+4d52a1a feat(scalp): activate sim at $500 + stale-feed entry guard
+bb03439 fix: clean SIGINT/SIGTERM shutdown + wire scalp OFIEngine to the book stream
+bade395 feat(market-data): stream the full scalp universe via sharded book connections
+d04faa1 fix(market-data): stream order books via ccxt.pro so OFI gets fed
+cc3a488 fix(market-data): same per-symbol fix for the candle streamer
+fa1696e fix(market-data): stop order-book streamer pinning the event loop at 100% CPU
+9095533 fix(session-pnl): fold arb trades into Session P&L
+3a7d6d5 feat(equity): reconstruct fund P&L from the ledger on startup
+420727c feat(web-ui): scalp/arb dashboard feeds + fees column + cls() fix
+cc9d9f9 docs(scalp-v2): RUNBOOK rollback section + GLOSSARY v2 terms
+44cc041 feat(scalp-v2): activation-readiness queries (v1+v2) + recalibration runner
+931bf36 feat(scalp-v2): wire confluence + ATR-aware TP/SL into ScalpingAgent
+77aabb2 feat(scalp-v2): extend scalp_observations with 13 nullable v2 columns + migration
+d78522c feat(scalp-v2): MarketData + OFIEngine accessors for the confluence/ATR gates
+ecffde7 feat(scalp-v2): settings + confluence/ATR modules + 41 tests
+0704d3b fix: connect Binance market data — skip signed currency fetch (-1021 under WSL clock skew)
+b592ef0 feat: web control panel — aiohttp server, WebSocket push, full browser dashboard
+e30cd41 feat: OFI engine — 10-level depth + volume-weighted TFI (Xu/Gould/Howison 2018)
+d589b4d fix: segregate signal-fund stats from scalp trades
+cefc3f8 feat: scalping agent sim execution enabled — SCALP_CAPITAL=100, _place_order sim mode
+25d0534 refactor: strip unused ArbEngine fund knobs
+bea361e refactor: fold MEXC-ARB into main ARB fund, fix equity total, 3-fund dashboard
+f5b46b1 fix: back funds with a $1,100 sim balance ledger; keep signal sizing ring-fenced
+357e735 feat: ring-fenced fund architecture — 4 independent funds, MEXC $200 ring-fenced, per-fund circuit breakers
+68194f0 fix: add POL/USDT to scalp pair coverage
+fe92bef feat: wire MEXC 4-key routing + verify pair coverage + update SCALP_PAIRS to 95 pairs
+eade019 feat: scalp feed dashboard panel — OFI strip, positions, closed observations, stats bar, 13 rows
+9514ccb feat: MEXC per-pair key router — one account, many pair-restricted keys, symbol-scoped routing in scalper
+199d850 feat: dashboard — arb opportunity panel + capital gate status surfaced
+5f393cb feat: data_sources module + Coinglass source — funding rate arb engine now live-wired
+3903888 feat: arb engine — capital verification, dynamic sizing, depth-aware slippage, opportunity logging, funding rate stub
+
+=== git diff --stat ===
+
+=== git diff (uncommitted) ===

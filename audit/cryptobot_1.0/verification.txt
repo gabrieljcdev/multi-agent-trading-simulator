@@ -1,0 +1,44 @@
+=== Verification pass ===
+
+--- 1. Every .py in source packages is mentioned somewhere in audit ---
+Result: 0 .py files not mentioned
+
+--- 2. No literal 'TODO: fill in' or unresolved tokens in master doc ---
+  OK
+
+--- 3. REGISTERED_* lists each have an inventory entry ---
+  OK   REGISTERED_AGENTS
+  OK   REGISTERED_CALENDAR_SOURCES
+  OK   REGISTERED_CONNECTORS
+  OK   REGISTERED_POLICIES
+  OK   REGISTERED_RAILS
+  OK   REGISTERED_SOURCES
+
+--- 4. Every table in database/models.py appears in DB audit ---
+  OK   agent_events
+  OK   arb_opportunities
+  OK   arb_trades
+  OK   calendar_events
+  OK   candles
+  OK   capital_movements
+  OK   circuit_breaker_log
+  OK   daily_stats
+  OK   data_log
+  OK   fund_capital_efficiency
+  OK   funding_arb_observations
+  OK   funding_arb_trades
+  OK   macro_log
+  OK   portfolio_snapshots
+  OK   predictions
+  OK   scalp_observations
+  OK   sentiment
+  OK   sentiment_log
+  OK   signals
+  OK   trades
+  OK   xchain_observations
+
+--- 5. Every settings.py constant appears in settings_audit.md ---
+Result: 0 / 443 settings constants not found in settings_audit.md
+
+--- 6. Master doc line count ---
+7157 audit/cryptobot_1.0/CRYPTOBOT_1.0_AUDIT.md
