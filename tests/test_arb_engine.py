@@ -728,8 +728,14 @@ def test_funding_arb_fund_claim_visible_to_balance_agent(monkeypatch):
     """FundingRateArbEngine lives inside the 'arb' fund. The BalanceAgent
     sees its capital through the same InventoryState.effective_balance
     lookup the rest of the arb fund uses — no separate claim is registered
-    for the funding engine (it's a sub-engine of the arb fund), so an arb
-    claim flips effective_balance for both ArbEngine and FundingRateArbEngine.
+    for the funding engine (it's a sub-engine of the arb fund), so the
+    arb fund's view of bybit is shared between ArbEngine and
+    FundingRateArbEngine.
+
+    Updated 2026-05-29 after the effective_balance under-subscribed fix:
+    a single fund claim no longer strands the venue's slack. To prove
+    "claim visibility" we register a competing fund's claim and check
+    that arb's effective balance correctly excludes it.
     """
     from agents.balance.inventory_state import inventory_state
     inventory_state.reset()
@@ -739,9 +745,16 @@ def test_funding_arb_fund_claim_visible_to_balance_agent(monkeypatch):
     # policy.compute_targets cycle.
     inventory_state.apply_allocation("arb", "bybit", "USDT", 400.0)
 
-    # Now effective_balance for the arb fund (which this engine is part of)
-    # reflects the registered claim.
-    assert inventory_state.effective_balance("arb", "bybit", "USDT") == 400.0
+    # Under-subscribed: arb gets its claim PLUS the unclaimed slack.
+    assert inventory_state.effective_balance("arb", "bybit", "USDT") == 1000.0
+
+    # A competing fund's claim is what actually narrows arb's view —
+    # this is the ring-fence guarantee the engine relies on.
+    inventory_state.apply_allocation("signal", "bybit", "USDT", 300.0)
+    # arb sees physical (1000) - signal's claim (300) = 700 (still its
+    # own 400 + the 300 of remaining slack).
+    assert inventory_state.effective_balance("arb", "bybit", "USDT") == 700.0
+
     # And the engine itself can carry that allocation on its own field too.
     engine = FundingRateArbEngine(sim_mode=True)
     engine.set_capital_allocation(400.0)

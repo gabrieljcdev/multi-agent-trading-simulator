@@ -211,9 +211,59 @@ class TestInventoryState:
         monkeypatch.setitem(settings.EXCHANGE_BALANCES, "kraken", 100.0)
         inventory_state.apply_allocation("signal", "kraken", "USDT", 40.0)
         inventory_state.apply_allocation("arb",    "kraken", "USDT", 60.0)
-        # arb sees its $60 claim, NOT the other fund's $40
+        # Fully subscribed (40 + 60 == 100): each fund sees its own claim
+        # only — `mine` and `physical - other_claims` agree at the boundary.
         assert inventory_state.effective_balance("arb", "kraken", "USDT") == 60.0
         assert inventory_state.effective_balance("signal", "kraken", "USDT") == 40.0
+
+    def test_undersubscribed_venue_returns_physical_minus_other_claims(self, monkeypatch):
+        """Regression (smoke 2026-05-29): when a venue is undersubscribed
+        (total claims < physical), each fund must see its claim PLUS the
+        unclaimed slack — i.e. `physical - other_claims`, matching the
+        method's docstring. Previously the code returned `mine` when
+        undersubscribed, stranding the slack and gating ArbEngine.can_arb
+        to the policy's per-venue Kelly-scaled target (e.g. $46 on a
+        $400 venue), well below ARB_BASE_POSITION_USD ($60). Every arb
+        opportunity then logged `balance_fail InventoryState.can_arb
+        blocked` despite hundreds of USDT sitting free on the venue."""
+        monkeypatch.setitem(settings.EXCHANGE_BALANCES, "bitget", 400.0)
+        # Only the arb fund claims bitget, and only $46 — exactly the
+        # Kelly-scaled policy target observed in the smoke test.
+        inventory_state.apply_allocation("arb", "bitget", "USDT", 46.0)
+        # arb gets its $46 + the $354 of unclaimed slack = $400.
+        assert inventory_state.effective_balance("arb", "bitget", "USDT") == 400.0
+        # A fund with no claim on this venue still sees the slack (no
+        # other fund has reserved it). This preserves the fail-open
+        # behaviour the arb engine has always relied on.
+        assert inventory_state.effective_balance("signal", "bitget", "USDT") == 354.0
+        # And the canonical fix: can_arb with size $60 now PASSES.
+        assert inventory_state.can_arb(
+            "ATOM/USDT", "buy", 60.0,
+            buy_exchange="mexc", sell_exchange="bitget", fund="arb",
+        ) is True
+
+    def test_partially_subscribed_two_funds_each_get_slack_plus_claim(self, monkeypatch):
+        """Two funds, each claiming a portion < physical → each sees its
+        own claim plus the still-unclaimed remainder. Ring-fencing still
+        holds: neither fund can take the *other's* claim, only the slack."""
+        monkeypatch.setitem(settings.EXCHANGE_BALANCES, "mexc", 1000.0)
+        inventory_state.apply_allocation("arb",        "mexc", "USDT",  46.0)
+        inventory_state.apply_allocation("mexc_scalp", "mexc", "USDT", 324.0)
+        # arb: physical (1000) - other_claims (324) = 676
+        assert inventory_state.effective_balance("arb", "mexc", "USDT") == 1000.0 - 324.0
+        # mexc_scalp: physical (1000) - other_claims (46) = 954
+        assert inventory_state.effective_balance("mexc_scalp", "mexc", "USDT") == 1000.0 - 46.0
+
+    def test_oversubscribed_venue_scales_proportionally(self, monkeypatch):
+        """Unchanged behaviour: when total_claim > physical, each fund's
+        effective scales by its claim share. Guards against regressing
+        the over-subscription branch while we change the under-sub one."""
+        monkeypatch.setitem(settings.EXCHANGE_BALANCES, "mexc", 100.0)
+        inventory_state.apply_allocation("arb",        "mexc", "USDT", 100.0)
+        inventory_state.apply_allocation("mexc_scalp", "mexc", "USDT", 100.0)
+        # total_claim = 200, physical = 100 → each gets 100 * (100/200) = 50
+        assert inventory_state.effective_balance("arb", "mexc", "USDT") == 50.0
+        assert inventory_state.effective_balance("mexc_scalp", "mexc", "USDT") == 50.0
 
     def test_pending_out_subtracts_from_source(self, monkeypatch):
         monkeypatch.setitem(settings.EXCHANGE_BALANCES, "kraken", 100.0)

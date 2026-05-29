@@ -142,13 +142,24 @@ class InventoryState:
             # the existing arb engine has always used.
             base = physical
         else:
-            # Respect claims: this fund's share, scaled by the claim
-            # ratio if claims overshoot the physical (oversubscribed
-            # venue → proportional).
+            # Respect claims (docstring): physical − OTHER funds' claims.
+            # The fund being queried gets its own claim plus the venue's
+            # unclaimed slack (== physical − other_claims). When the
+            # venue is oversubscribed (total_claim > physical), each
+            # fund scales down proportionally to its claim share.
+            #
+            # Note (2026-05-29 fix): the previous implementation returned
+            # `mine` in the undersubscribed branch, which stranded the
+            # venue's unclaimed slack and gated the arb engine to the
+            # policy's per-venue target (~$46) — well below
+            # ARB_BASE_POSITION_USD ($60), causing every arb to log
+            # `balance_fail … InventoryState.can_arb blocked`. The
+            # docstring above was already correct; only the code disagreed.
+            other_claims = total_claim - mine
             if total_claim > physical and total_claim > 0:
                 base = physical * (mine / total_claim)
             else:
-                base = mine
+                base = physical - other_claims
         return max(0.0, base - pending_out + pending_in)
 
     def get_allocation(self, fund: str, exchange: str) -> float:
