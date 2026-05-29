@@ -139,3 +139,44 @@ def test_get_signal_win_rate_excludes_strategy(temp_db):
     sig_wr = q.get_signal_win_rate(days=1, exclude_strategy="scalp")
     assert sig_wr["total"] == 1                                  # scalp excluded
     assert sig_wr["win_rate"] == 1.0                            # only the signal win
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# get_today_pnl_pct — fraction convention (regression: phantom CB HALT)
+# ─────────────────────────────────────────────────────────────────────────
+
+def test_get_today_pnl_pct_treats_trade_pnl_pct_as_fraction(temp_db):
+    """Trade.pnl_pct is a FRACTION (e.g. -0.012 = -1.2%), matching the
+    kill_switch + position_manager writers and the
+    execution/position_manager.py:68 CB threshold check
+    (`daily_pnl <= -threshold_pct / 100`).
+
+    Smoke test 2026-05-29 surfaced a phantom HALT after a -2.43 bps
+    scalp loss because agents/scalping_agent.py:1609 was writing
+    pnl_pct = pnl_usd/size_usd * 100 (percent), making a 0.0243% loss
+    read as a -2.43% daily PnL and trip the 2% daily-loss breaker.
+
+    Lock the convention in: a -2.43 bps loss stored as a fraction must
+    sum to a fraction and stay well above the -0.02 (2%) breaker."""
+    q = temp_db
+    trade_id = q.save_trade({
+        "pair": "ETH/USDT", "exchange": "mexc", "side": "long",
+        "signal_type": "scalp", "entry_price": 2015.6, "size_usd": 20.0,
+        "sim_mode": True, "strategy": "scalp",
+    })
+    # -2.43 bps = -0.0243% = -0.000243 as a fraction.
+    # Matches the smoke-test row that tripped the phantom HALT.
+    q.close_trade(
+        trade_id, exit_price=2015.110, exit_reason="sl",
+        pnl_usd=-0.00486, pnl_pct=-0.000243,
+    )
+
+    total = q.get_today_pnl_pct()
+    assert total == pytest.approx(-0.000243, abs=1e-9)
+
+    # The position_manager CB threshold is 2% expressed as a fraction:
+    threshold_fraction = -2.0 / 100.0  # mirrors position_manager.py:68
+    assert total > threshold_fraction, (
+        f"a 2.43 bps loss as a fraction ({total}) must NOT trip the 2% "
+        f"daily-loss breaker ({threshold_fraction})"
+    )

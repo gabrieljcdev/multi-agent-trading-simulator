@@ -1605,8 +1605,15 @@ class ScalpingAgent(BaseAgent):
         # Close the sim Trade row for a real (non-observation) fill so the
         # trades table carries the exit + P&L. Fund equity (SCALP_CAPITAL +
         # net daily P&L) is surfaced via get_stats.daily_pnl. Never raises.
+        # Trade.pnl_pct convention (see core.bot.CircuitBreakerState
+        # docstring): FRACTION, not percent — e.g. -0.012 = -1.2%. The
+        # position_manager CB check (execution/position_manager.py:68) and
+        # database/queries.get_today_pnl_pct both sum these as fractions.
+        # Smoke test 2026-05-29 caught a phantom HALT because this line
+        # used to multiply by 100, so a -2.43 bps scalp loss read as a
+        # -2.43% portfolio daily PnL.
         if not pos.observation_only and pos.trade_id is not None:
-            pnl_pct = (pnl_usd / pos.size_usd * 100.0) if pos.size_usd > 0 else 0.0
+            pnl_pct = (pnl_usd / pos.size_usd) if pos.size_usd > 0 else 0.0
             try:
                 await asyncio.to_thread(
                     db_queries.close_trade,
