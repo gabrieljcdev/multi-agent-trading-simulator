@@ -104,6 +104,11 @@ class CrossChainArbAgent(BaseAgent):
             )
             return
         self._engine = CrossChainArbEngine()
+        # Mirror any halt state set before the engine existed (Web UI v3.1).
+        try:
+            self._engine._manually_halted = bool(self._manually_halted)
+        except Exception:
+            pass
         self._status = RUNNING
         self._start_time = time.time()
         logger.info(
@@ -133,6 +138,29 @@ class CrossChainArbAgent(BaseAgent):
                 await self._engine.close_all_positions()
             except Exception as e:
                 logger.error(f"CrossChainArbAgent close_all: {e}")
+
+    # ── Operator-initiated halt (Web UI v3.1) ──────────────────────────
+    # Engine owns the scan loop; propagate the flag onto it so
+    # _scan_loop skips evaluation while halted. Observation mode has
+    # no positions to manage, so halt affects evaluation only.
+
+    def halt_manual(self) -> bool:
+        state = super().halt_manual()
+        if self._engine is not None:
+            try:
+                self._engine._manually_halted = True
+            except Exception as e:
+                logger.debug("CrossChainArbAgent halt_manual propagate: %s", e)
+        return state
+
+    def resume_manual(self) -> bool:
+        state = super().resume_manual()
+        if self._engine is not None:
+            try:
+                self._engine._manually_halted = False
+            except Exception as e:
+                logger.debug("CrossChainArbAgent resume_manual propagate: %s", e)
+        return state
 
     # ── Stats ───────────────────────────────────────────────────────────
 

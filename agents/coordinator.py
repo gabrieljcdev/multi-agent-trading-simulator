@@ -199,6 +199,50 @@ class Coordinator:
                 return a
         return None
 
+    # ── Per-agent halt/resume facade (Web UI v3.1) ─────────────────────
+    # The web layer calls these — never agent._manually_halted = ... directly.
+    # Idempotent: halting an already-halted agent is a no-op. Errors are
+    # caught and returned in the envelope; never raise to the caller.
+
+    def halt_agent(self, agent_id: str) -> dict:
+        """Operator-initiated halt for one agent. Returns
+        {"ok": True, "agent_id": <id>, "halted": True} on success or
+        {"ok": False, "error": "agent_not_found"} if the id is unknown."""
+        agent = self.get_agent(agent_id)
+        if agent is None:
+            return {"ok": False, "error": "agent_not_found"}
+        try:
+            state = agent.halt_manual()
+        except Exception as e:
+            logger.error("halt_agent(%s) failed: %s", agent_id, e, exc_info=True)
+            return {"ok": False, "error": str(e)}
+        self._log_event(agent_id, "HALT_MANUAL", "source=web_ui")
+        return {"ok": True, "agent_id": agent_id, "halted": bool(state)}
+
+    def resume_agent(self, agent_id: str) -> dict:
+        """Operator-initiated resume. Same envelope as halt_agent;
+        halted=False on success."""
+        agent = self.get_agent(agent_id)
+        if agent is None:
+            return {"ok": False, "error": "agent_not_found"}
+        try:
+            state = agent.resume_manual()
+        except Exception as e:
+            logger.error("resume_agent(%s) failed: %s", agent_id, e, exc_info=True)
+            return {"ok": False, "error": str(e)}
+        self._log_event(agent_id, "RESUME_MANUAL", "source=web_ui")
+        return {"ok": True, "agent_id": agent_id, "halted": bool(state)}
+
+    def is_agent_halted(self, agent_id: str) -> bool:
+        """Returns False for unknown agent_ids (never raises)."""
+        agent = self.get_agent(agent_id)
+        if agent is None:
+            return False
+        try:
+            return bool(agent.manually_halted)
+        except Exception:
+            return False
+
     def get_primary_bot(self):
         """Convenience for the dashboard: signal agent's CryptoBot if it
         exposes one, else None. Bot may not exist yet if signal_agent

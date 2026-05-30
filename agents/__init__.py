@@ -98,6 +98,12 @@ class SignalAgentWrapper(BaseAgent):
 
         kill_switch = KillSwitch(sim_mode=settings.SIM_MODE)
         self._bot = CryptoBot(kill_switch=kill_switch)
+        # Mirror any halt state set before the bot existed (Web UI v3.1) so
+        # the gate honours an early halt_manual() — see halt_manual override.
+        try:
+            self._bot._manually_halted = bool(self._manually_halted)
+        except Exception:
+            pass
         # Late-bind dashboard now that the bot's market_data exists
         if self._dashboard is not None:
             self.set_dashboard(self._dashboard)
@@ -121,6 +127,30 @@ class SignalAgentWrapper(BaseAgent):
                 await self._bot.trigger_kill_switch(reason="coordinator")
             except Exception as e:
                 logger.error(f"SignalAgent kill: {e}")
+
+    # ── Operator-initiated halt (Web UI v3.1) ──────────────────────────
+    # Propagate the BaseAgent halt flag into the bot's _cycle gate so the
+    # signal-engine scan is the part that gets skipped — _position_watcher_loop
+    # and _future_price_tracker_loop run on their own loops and keep managing
+    # open trades. Both idempotent + safe before the bot exists.
+
+    def halt_manual(self) -> bool:
+        state = super().halt_manual()
+        if self._bot is not None:
+            try:
+                self._bot._manually_halted = True
+            except Exception as e:
+                logger.debug("SignalAgent halt_manual propagate: %s", e)
+        return state
+
+    def resume_manual(self) -> bool:
+        state = super().resume_manual()
+        if self._bot is not None:
+            try:
+                self._bot._manually_halted = False
+            except Exception as e:
+                logger.debug("SignalAgent resume_manual propagate: %s", e)
+        return state
 
     # ── BalanceAgent compounding hooks ──────────────────────────────────
 
@@ -281,6 +311,11 @@ class ArbAgentWrapper(BaseAgent):
             exchanges=list(settings.STRATEGY_EXCHANGE_MAP.get("arb", [])),
         )
         self._reconstruct_engine_pnl(self._engine)
+        # Mirror any halt state set before the engine existed (Web UI v3.1).
+        try:
+            self._engine._manually_halted = bool(self._manually_halted)
+        except Exception:
+            pass
         import time as _time
         self._status = RUNNING
         self._start_time = _time.time()
@@ -311,6 +346,30 @@ class ArbAgentWrapper(BaseAgent):
                 await self._engine.close_all_positions()
             except Exception as e:
                 logger.error(f"ArbAgent close_all: {e}")
+
+    # ── Operator-initiated halt (Web UI v3.1) ──────────────────────────
+    # Engine owns the scan loop, so propagate the halt flag onto it; the
+    # engine's _scan_loop early-returns when the flag is set. Arb has no
+    # standing positions to "manage" — fills complete in milliseconds —
+    # so halting it is effectively a scan pause until resumed.
+
+    def halt_manual(self) -> bool:
+        state = super().halt_manual()
+        if self._engine is not None:
+            try:
+                self._engine._manually_halted = True
+            except Exception as e:
+                logger.debug("ArbAgent halt_manual propagate: %s", e)
+        return state
+
+    def resume_manual(self) -> bool:
+        state = super().resume_manual()
+        if self._engine is not None:
+            try:
+                self._engine._manually_halted = False
+            except Exception as e:
+                logger.debug("ArbAgent resume_manual propagate: %s", e)
+        return state
 
     # ── BalanceAgent compounding hooks ──────────────────────────────────
 

@@ -183,6 +183,8 @@ class WebServer:
             web.post("/action/set_mode",       self.handle_set_mode),
             web.post("/action/approve_window", self.handle_approve_window),
             web.post("/action/rebalance",      self.handle_rebalance),
+            web.post("/action/agent/{agent_id}/halt",   self.handle_agent_halt),
+            web.post("/action/agent/{agent_id}/resume", self.handle_agent_resume),
         ])
         return app
 
@@ -517,6 +519,43 @@ class WebServer:
             return web.json_response({"ok": True})
 
         return web.json_response({"ok": False, "error": "invalid_action"})
+
+    async def handle_agent_halt(self, request) -> web.Response:
+        """Web UI v3.1 — POST /action/agent/{agent_id}/halt.
+
+        Body: empty. Single-click (no arm/confirm). Halt is reversible —
+        the cost of a misclick is at most a single skipped scan cycle, so
+        the operator friction of an arm/confirm would defeat the point.
+        Always {ok:bool, ...}; agent exceptions are wrapped in the envelope.
+        """
+        return await self._handle_agent_halt_action(request, halt=True)
+
+    async def handle_agent_resume(self, request) -> web.Response:
+        """Web UI v3.1 — POST /action/agent/{agent_id}/resume.
+        Same shape as halt; halted=False on success."""
+        return await self._handle_agent_halt_action(request, halt=False)
+
+    async def _handle_agent_halt_action(self, request, *, halt: bool) -> web.Response:
+        coord = self._coordinator
+        agent_id = request.match_info.get("agent_id", "")
+        if coord is None:
+            return web.json_response({"ok": False, "error": "no coordinator"})
+        method_name = "halt_agent" if halt else "resume_agent"
+        method = getattr(coord, method_name, None)
+        if not callable(method):
+            return web.json_response(
+                {"ok": False, "error": f"coordinator has no {method_name}"})
+        try:
+            result = method(agent_id)
+        except Exception as e:
+            logger.error("%s(%s) failed: %s", method_name, agent_id, e,
+                         exc_info=True)
+            return web.json_response({"ok": False, "error": str(e)})
+        if (isinstance(result, dict)
+                and not result.get("ok")
+                and result.get("error") == "agent_not_found"):
+            return web.json_response(result, status=404)
+        return web.json_response(result)
 
     async def handle_approve_window(self, request) -> web.Response:
         bot = self._resolve_bot()
@@ -1173,15 +1212,29 @@ class WebServer:
 
     def _snap_agents(self) -> list:
         out = []
+        coord = self._coordinator
+        halted_check = getattr(coord, "is_agent_halted", None) if coord else None
         for a in (self._agents_cache or []):
             try:
+                agent_id = getattr(a, "agent_id", "?")
+                manually_halted = False
+                # Web UI v3.1 — orthogonal to `status` (the engine-state
+                # taxonomy). UI uses this to swap the per-agent Halt/Resume
+                # button label and show the HALTED badge. Defaults False
+                # when no coordinator is wired (tests with bot-only setups).
+                if callable(halted_check):
+                    try:
+                        manually_halted = bool(halted_check(agent_id))
+                    except Exception:
+                        manually_halted = False
                 out.append({
-                    "id":           getattr(a, "agent_id", "?"),
-                    "status":       getattr(a, "status", "OFFLINE"),
-                    "capital":      round(float(getattr(a, "capital_allocated", 0.0) or 0.0), 2),
-                    "daily_pnl":    round(float(getattr(a, "daily_pnl", 0.0) or 0.0), 2),
-                    "trades_today": int(getattr(a, "trades_today", 0) or 0),
-                    "win_rate":     round(float(getattr(a, "win_rate_today", 0.0) or 0.0) * 100, 1),
+                    "id":              agent_id,
+                    "status":          getattr(a, "status", "OFFLINE"),
+                    "capital":         round(float(getattr(a, "capital_allocated", 0.0) or 0.0), 2),
+                    "daily_pnl":       round(float(getattr(a, "daily_pnl", 0.0) or 0.0), 2),
+                    "trades_today":    int(getattr(a, "trades_today", 0) or 0),
+                    "win_rate":        round(float(getattr(a, "win_rate_today", 0.0) or 0.0) * 100, 1),
+                    "manually_halted": manually_halted,
                 })
             except Exception:
                 continue

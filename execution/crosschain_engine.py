@@ -297,6 +297,12 @@ class CrossChainArbEngine:
             getattr(settings, "XCHAIN_CAPITAL", 0.0) or 0.0
         )
 
+        # Web UI v3.1 — operator-initiated halt mirror. CrossChainArbAgent
+        # writes this when the operator toggles per-agent halt; the scan
+        # loop skips evaluation passes while set. Observation mode means
+        # there are no positions to manage — halt affects evaluation only.
+        self._manually_halted: bool = False
+
     # ── Public API ──────────────────────────────────────────────────────
 
     async def start(self) -> None:
@@ -398,6 +404,13 @@ class CrossChainArbEngine:
                             self.cb.halt_reason,
                         )
                     self._status = STATUS_HALTED
+                    await asyncio.sleep(interval)
+                    continue
+
+                # Web UI v3.1 — operator halt skips per-symbol evaluation.
+                # No positions to manage in observation mode, so the whole
+                # scan body is the entry / evaluation path.
+                if self._manually_halted:
                     await asyncio.sleep(interval)
                     continue
 

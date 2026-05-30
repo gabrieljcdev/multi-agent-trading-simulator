@@ -223,6 +223,12 @@ class CryptoBot:
         # `p` toggles this; _cycle short-circuits when set so the user
         # can pause scanning without halting the bot outright.
         self._paused: bool = False
+        # Web UI v3.1 — operator-initiated per-agent halt. SignalAgentWrapper
+        # mirrors its BaseAgent _manually_halted into this flag; _cycle
+        # short-circuits when True so no new signals are evaluated, but
+        # _position_watcher_loop and _future_price_tracker_loop keep
+        # running so open trades still get SL/TP/trailing exits.
+        self._manually_halted: bool = False
 
         # Wire SignalEngine callback to our handler
         self._signal_engine.on_signal(self._on_signal)
@@ -469,6 +475,12 @@ class CryptoBot:
         """One pass: pause → dead-zone → CB → sentiment session-floor → scan."""
         if self._paused:
             logger.debug("Paused — cycle skipped")
+            return
+        # Web UI v3.1 — operator-initiated halt (set by SignalAgentWrapper.
+        # halt_manual). Entry-creation paths only; the position watcher and
+        # future-price tracker run on their own loops and keep firing exits.
+        if self._manually_halted:
+            logger.debug("Manually halted — cycle skipped")
             return
         self._cb_state.reset_if_new_day()
 

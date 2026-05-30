@@ -205,24 +205,28 @@ class FundingArbAgent(BaseAgent):
                 await asyncio.sleep(interval)
                 if self._halted:
                     continue
-                opps = await self._engine.scan() or []
-                self._last_opps = list(opps)
-                # Top N opportunities — sorted by APR descending so the
-                # best carry wins when concurrency is constrained.
-                opps.sort(key=lambda o: o.funding_apr, reverse=True)
-                top = opps[: int(settings.FUNDING_MAX_CONCURRENT)]
+                # Web UI v3.1: operator-initiated halt skips entry scan but
+                # _manage_open_positions still runs so SL/TP/funding-collected
+                # exits keep firing on whatever positions are still open.
+                if not self._manually_halted:
+                    opps = await self._engine.scan() or []
+                    self._last_opps = list(opps)
+                    # Top N opportunities — sorted by APR descending so the
+                    # best carry wins when concurrency is constrained.
+                    opps.sort(key=lambda o: o.funding_apr, reverse=True)
+                    top = opps[: int(settings.FUNDING_MAX_CONCURRENT)]
 
-                for opp in top:
-                    if self.observation_mode:
-                        await self._log_observation(opp)
-                        # ROUTE NO ORDERS. The agent stays in observation
-                        # mode until FUNDING_OBSERVATION_MODE is flipped.
-                        continue
-                    # Phase 1 should never reach this branch — gate enforced
-                    # both at the agent level and in engine.open().
-                    if opp.symbol in self._positions:
-                        continue
-                    await self._engine.open(opp)
+                    for opp in top:
+                        if self.observation_mode:
+                            await self._log_observation(opp)
+                            # ROUTE NO ORDERS. The agent stays in observation
+                            # mode until FUNDING_OBSERVATION_MODE is flipped.
+                            continue
+                        # Phase 1 should never reach this branch — gate enforced
+                        # both at the agent level and in engine.open().
+                        if opp.symbol in self._positions:
+                            continue
+                        await self._engine.open(opp)
 
                 await self._manage_open_positions()
                 self._check_daily_reset()

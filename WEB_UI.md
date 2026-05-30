@@ -32,7 +32,7 @@ Top-level keys, in order:
 | `paused` | bool | bot._paused |
 | `approval_mode` | `"per_trade"\|"window"\|"autonomous"` | `settings.APPROVAL_MODE` |
 | `portfolio` | dict | `_snap_portfolio()` — bankroll, daily P&L, exposure, win rate |
-| `agents` | list[dict] | coordinator.get_agent_stats(), one row per registered agent |
+| `agents` | list[dict] | coordinator.get_agent_stats(), one row per registered agent (each row carries `manually_halted: bool` — Web UI v3.1) |
 | `circuit_breakers` | dict | bot._cb_state + `settings.CIRCUIT_BREAKERS` |
 | `regime` | dict | `core.regime_detector` |
 | `sentiment` | dict | bot._sentiment latest |
@@ -281,6 +281,8 @@ the error string. Never raises to the aiohttp layer.
 | `/action/approve_window` | `{minutes?}` | `bot.approve_window(minutes)` |
 | `/action/kill` | `{}` | `coordinator.kill_all(reason="web")`; logs `KILL_WEB` |
 | `/action/rebalance` | see below | three-action arm/confirm/cancel |
+| `/action/agent/{agent_id}/halt`   | `{}` | `coordinator.halt_agent(id)`; logs `HALT_MANUAL` (v3.1) |
+| `/action/agent/{agent_id}/resume` | `{}` | `coordinator.resume_agent(id)`; logs `RESUME_MANUAL` (v3.1) |
 
 ### `/action/kill`
 
@@ -368,6 +370,60 @@ this internally.
 `_paused` flag, raised by `coordinator.kill_all()`), the UI disables
 the Arm / Confirm / Cancel buttons with a tooltip; on the server side
 `execute_proposal` returns `kill_blocked`.
+
+### `/action/agent/{agent_id}/halt` and `/resume` (v3.1)
+
+Per-agent halt toggle — distinct from the global Kill (closes all
+positions on every agent) and the global Pause (pauses the whole bot).
+Halting one agent skips its **entry-creation path only**; exit /
+management paths keep running so open positions are never abandoned. To
+force exits, use the global Kill switch.
+
+Single click, no arm/confirm — halt is reversible (the cost of a misclick
+is at most one skipped scan cycle), so the operator friction of an
+arm/confirm would defeat the purpose. Reserve arm/confirm for genuinely
+destructive actions (kill, rebalance).
+
+**Halt:**
+```
+POST /action/agent/{agent_id}/halt
+{}
+
+→ 200 {"ok": true,  "agent_id": "...", "halted": true}
+| 404 {"ok": false, "error": "agent_not_found"}
+| 200 {"ok": false, "error": "<reason>"}      # coordinator exception
+```
+
+**Resume:**
+```
+POST /action/agent/{agent_id}/resume
+{}
+
+→ 200 {"ok": true,  "agent_id": "...", "halted": false}
+| 404 {"ok": false, "error": "agent_not_found"}
+```
+
+Server calls `coordinator.halt_agent(id)` / `resume_agent(id)` — the
+coordinator is the only public seam. Each successful call logs a
+`HALT_MANUAL` / `RESUME_MANUAL` agent event with `source=web_ui`.
+
+The snapshot's `agents[<i>].manually_halted` reflects the new state on
+the next push. The UI is snapshot-driven — the button disables on click
+and re-enables when the snapshot confirms the change; no optimistic
+update.
+
+**Interaction with global controls:**
+
+- When global Kill is engaged, every agent is effectively halted
+  regardless of its per-agent state. The per-agent button still works
+  and persists state — so when Kill releases, agents that were
+  individually halted **stay** halted, and agents that weren't resume.
+- Global Pause pauses the whole bot. When unpaused, individually halted
+  agents stay halted.
+
+**Persistence — known limitation:** halt state is in-memory only
+(`BaseAgent._manually_halted`). A bot restart resets every agent to
+unhalted. Persisting halt state across restarts is a follow-up build.
 
 ---
 

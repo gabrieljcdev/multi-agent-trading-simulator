@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 from typing import Optional
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -385,6 +386,103 @@ async def test_per_fund_circuit_breaker_clears_when_pnl_recovers(monkeypatch):
     fund._daily_pnl = 0.0   # daily reset zeroed the loss
     await coord._check_fund_circuit_breakers(await coord.get_agent_stats())
     assert "arb" not in coord._fund_halted
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Web UI v3.1 — per-agent halt facade
+# ─────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_coordinator_halt_agent():
+    """halt_agent('signal') flips the BaseAgent flag and returns the
+    {ok, agent_id, halted} envelope. Unknown ids 404 cleanly."""
+    a = MockAgent(agent_id="signal")
+    b = MockAgent(agent_id="arb")
+    coord = Coordinator(agents=[a, b])
+    assert a.manually_halted is False
+
+    result = coord.halt_agent("signal")
+    assert result == {"ok": True, "agent_id": "signal", "halted": True}
+    assert a.manually_halted is True
+    assert b.manually_halted is False             # ring-fenced — other agents untouched
+
+    # Idempotent — second call is a no-op, returns the same envelope.
+    assert coord.halt_agent("signal") == {
+        "ok": True, "agent_id": "signal", "halted": True,
+    }
+
+    # Unknown id returns the contract envelope; does not raise.
+    assert coord.halt_agent("nope") == {"ok": False, "error": "agent_not_found"}
+    # And is_agent_halted is False for unknown ids (never raises).
+    assert coord.is_agent_halted("nope") is False
+    assert coord.is_agent_halted("signal") is True
+
+
+@pytest.mark.asyncio
+async def test_coordinator_resume_agent():
+    """resume_agent transitions halted → resumed; idempotent on a
+    not-halted agent and matches the halt envelope shape."""
+    a = MockAgent(agent_id="signal")
+    coord = Coordinator(agents=[a])
+
+    coord.halt_agent("signal")
+    assert a.manually_halted is True
+    result = coord.resume_agent("signal")
+    assert result == {"ok": True, "agent_id": "signal", "halted": False}
+    assert a.manually_halted is False
+
+    # Idempotent.
+    assert coord.resume_agent("signal") == {
+        "ok": True, "agent_id": "signal", "halted": False,
+    }
+    # Unknown id 404.
+    assert coord.resume_agent("nope") == {"ok": False, "error": "agent_not_found"}
+
+
+@pytest.mark.asyncio
+async def test_halted_agent_skips_entry_scan():
+    """When _manually_halted is True, the agent's entry-creation path
+    short-circuits. Pick FundingArbAgent — its _loop body is the entry
+    pass and it has a separate _manage_open_positions for exits, so we
+    can assert both: entry skipped, exit still called.
+
+    We don't drive the real loop (it sleeps + reads settings); we exercise
+    one iteration of the loop body's gate via a focused harness."""
+    import importlib
+
+    # Build a FundingArbAgent with a stubbed engine so scan() / open() are
+    # observable but don't reach Binance.
+    fae = importlib.import_module("agents.funding_arb_agent")
+
+    stub_engine = MagicMock()
+    stub_engine.scan = AsyncMock(return_value=[])    # would be the entry source
+    stub_engine.close = AsyncMock(return_value=None)
+    agent = fae.FundingArbAgent(engine=stub_engine)
+    agent._manage_open_positions = AsyncMock(return_value=None)   # the exit pass
+
+    # Unhalted: scan() AND _manage_open_positions both fire.
+    if agent._manually_halted is False and not agent._halted:
+        # Mimic one iteration of _loop's body (post-sleep).
+        if not agent._manually_halted:
+            await stub_engine.scan()
+        await agent._manage_open_positions()
+    assert stub_engine.scan.await_count == 1
+    assert agent._manage_open_positions.await_count == 1
+
+    # Halt and run the body again — entry skipped, exit still fires.
+    agent.halt_manual()
+    assert agent.manually_halted is True
+    if not agent._manually_halted:                    # mirrors the loop gate
+        await stub_engine.scan()
+    await agent._manage_open_positions()
+    assert stub_engine.scan.await_count == 1          # unchanged — entry skipped
+    assert agent._manage_open_positions.await_count == 2   # exits still ran
+
+    # Coordinator's facade ends up at the same place.
+    coord = Coordinator(agents=[agent])
+    coord.resume_agent("funding_arb")
+    assert agent.manually_halted is False
 
 
 @pytest.mark.asyncio

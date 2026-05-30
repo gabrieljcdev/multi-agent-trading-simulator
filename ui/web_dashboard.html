@@ -61,6 +61,10 @@
   .agent .id{font-weight:bold;text-transform:capitalize}
   .st{font-size:11px;padding:1px 6px;border-radius:3px;background:var(--bg2)}
   .st.RUNNING{color:var(--pos)} .st.HALTED,.st.ERROR{color:var(--neg)} .st.PAUSED{color:var(--warn)}
+  /* Web UI v3.1 — operator-initiated halt badge. Amber so it reads distinct
+     from the red engine-state HALTED (which is for circuit-breaker trips);
+     same .st sizing/padding so it sits flush next to the status badge. */
+  .st.MANUAL_HALT{color:var(--warn);background:var(--bg2);font-weight:bold}
   table{width:100%;border-collapse:collapse;font-size:12px}
   th,td{text-align:left;padding:4px 6px;border-bottom:1px solid var(--line)}
   th{color:var(--tx1);font-weight:normal}
@@ -200,11 +204,20 @@
           <button id="backToDashboardBtn">← Dashboard</button>
           <span id="ad-name" class="pagetitle">—</span>
           <span id="ad-status" class="st">—</span>
+          <!-- Web UI v3.1 — manual halt badge (HALTED, amber) and global
+               KILL badge live alongside status. KILL is only shown when
+               coordinator.kill_all has fired (a planned follow-up surfaces
+               it on the snapshot; the badge slot is already here). -->
+          <span id="ad-halted-badge" class="st MANUAL_HALT" hidden>HALTED</span>
+          <span id="ad-kill-badge"   class="st HALTED"      hidden>KILL</span>
           <span class="dim">cap</span><span id="ad-cap">—</span>
           <span class="dim">daily</span><span id="ad-pnl">—</span>
           <span id="ad-trades" class="dim">—</span>
           <span class="dim">WR</span><span id="ad-wr">—</span>
+          <span class="spacer"></span>
+          <button id="adHaltBtn">Halt Agent</button>
         </div>
+        <div id="ad-error" class="livebanner" style="margin-bottom:8px"></div>
         <div id="ad-body"></div>
       </div>
     </div>
@@ -357,6 +370,37 @@ wireKill($("killBtn")); wireKill($("killBtn2"));
 $("backToDashboardBtn").onclick = () => {
   activeAgentId = null;
   if(STATE && STATE.ts) updateUI(STATE);   // repaint immediately
+};
+
+/* Web UI v3.1 — per-agent Halt/Resume toggle.
+   Single-click (no arm/confirm). The button is disabled the instant the
+   operator presses it; the next snapshot push from the server flips
+   manually_halted, setDetailHeader re-enables and re-labels. No optimistic
+   update — the UI always reflects server truth.
+   Bound once at startup, outside safeRender, so even if the body render
+   throws the operator can still toggle halt/resume. */
+let adErrorTimer = null;
+function showAdError(msg){
+  const el = $("ad-error");
+  if(!el) return;
+  el.textContent = msg;
+  el.classList.add("show");
+  if(adErrorTimer) clearTimeout(adErrorTimer);
+  adErrorTimer = setTimeout(() => { el.classList.remove("show"); el.textContent = ""; }, 4000);
+}
+$("adHaltBtn").onclick = async () => {
+  if(!activeAgentId) return;
+  const agent = (STATE && STATE.agents || []).find(a => a.id === activeAgentId);
+  const halted = !!(agent && agent.manually_halted);
+  const path = `/action/agent/${encodeURIComponent(activeAgentId)}/` + (halted ? "resume" : "halt");
+  $("adHaltBtn").disabled = true;            // re-enabled by setDetailHeader on next snapshot
+  const r = await postAction(path);
+  if(!r || r.ok === false){
+    $("adHaltBtn").disabled = false;
+    showAdError("agent " + (halted ? "resume" : "halt") + " failed: " + ((r && r.error) || "unknown"));
+  }
+  // On success we deliberately do nothing — let the next snapshot push
+  // (≤ WEB_UI_PUSH_INTERVAL_S, default 0.5s) refresh the badge + button.
 };
 
 /* Rebalance — Web UI v2 three-action arm → confirm → cancel flow.
@@ -1047,6 +1091,19 @@ function setDetailHeader(agent, agentId){
     `<span class="${cls(agent.daily_pnl)}">${fmtUsd(agent.daily_pnl)}</span>`;
   $("ad-trades").textContent = "· " + (agent.trades_today||0) + " tr";
   $("ad-wr").textContent = (agent.win_rate||0).toFixed(1) + "%";
+  // Web UI v3.1 — HALTED badge + Halt/Resume button label, snapshot-driven.
+  // HALTED here is "operator manually halted"; engine-state HALTED uses the
+  // st HALTED class on #ad-status (same colour, different concept). The two
+  // can both be visible at once for an agent whose engine breaker tripped
+  // AND was then manually halted by the operator.
+  const halted = !!agent.manually_halted;
+  const haltedBadge = $("ad-halted-badge");
+  if(haltedBadge) haltedBadge.hidden = !halted;
+  const btn = $("adHaltBtn");
+  if(btn){
+    btn.textContent = halted ? "Resume Agent" : "Halt Agent";
+    btn.disabled = false;
+  }
 }
 
 function renderAgentDetail(state, id){

@@ -454,11 +454,15 @@ class BalanceAgent(BaseAgent):
 
     async def _scan_once(self) -> None:
         # Always-on Job #1 + #2: compound realised P&L into each fund.
-        # No transfers, no cost, runs every scan regardless of paused state.
+        # No transfers, no cost, runs every scan regardless of paused state
+        # or operator halt — compounding is a bookkeeping pass, not an entry.
         equity = self._compound_realised_into_funds()
         self._last_plan_at = time.time()
 
-        if self._paused:
+        # Web UI v3.1: operator-initiated halt skips policy + planning (the
+        # "entry" path for this agent — proposing capital moves) while the
+        # compounding pass above keeps running. Same shape as _paused.
+        if self._paused or self._manually_halted:
             return
 
         # Active policy — first available, fail-closed.

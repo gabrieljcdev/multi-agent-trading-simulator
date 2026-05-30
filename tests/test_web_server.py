@@ -1025,3 +1025,169 @@ async def test_rebalance_confirm_replan_mismatch(monkeypatch):
         assert d["error"] == "plan_changed"
     finally:
         await client.close()
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Web UI v3.1 — per-agent halt toggle
+#
+# Snapshot field + the two new endpoints. The coordinator is the public seam:
+# tests drive a stub that mirrors Coordinator.halt_agent / resume_agent /
+# is_agent_halted, so we don't need the real BaseAgent here.
+# ════════════════════════════════════════════════════════════════════════════
+
+
+def _halt_coordinator(*, agents=("signal", "arb", "scalp")):
+    """Coordinator stub with in-memory halt state across `agents` ids.
+
+    Exposes get_agent_stats so _snap_agents has rows to project halt onto.
+    halt_agent/resume_agent mirror the real Coordinator envelope shape; the
+    snapshot read goes through is_agent_halted, also defined here."""
+    halted: dict[str, bool] = {a: False for a in agents}
+    log: list = []
+
+    def _halt(agent_id):
+        if agent_id not in halted:
+            return {"ok": False, "error": "agent_not_found"}
+        halted[agent_id] = True
+        log.append(("HALT_MANUAL", agent_id))
+        return {"ok": True, "agent_id": agent_id, "halted": True}
+
+    def _resume(agent_id):
+        if agent_id not in halted:
+            return {"ok": False, "error": "agent_not_found"}
+        halted[agent_id] = False
+        log.append(("RESUME_MANUAL", agent_id))
+        return {"ok": True, "agent_id": agent_id, "halted": False}
+
+    rows = [
+        SimpleNamespace(agent_id=a, status="RUNNING", capital_allocated=100.0,
+                        daily_pnl=0.0, trades_today=0, win_rate_today=0.0)
+        for a in agents
+    ]
+    coord = SimpleNamespace(
+        get_agent=lambda aid: None,
+        get_primary_bot=lambda: None,
+        get_portfolio_stats=AsyncMock(return_value={}),
+        get_agent_stats=AsyncMock(return_value=rows),
+        halt_agent=_halt,
+        resume_agent=_resume,
+        is_agent_halted=lambda aid: bool(halted.get(aid, False)),
+    )
+    coord._halt_log = log   # exposed for the log-event assertion
+    return coord
+
+
+# ── Snapshot ───────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_snapshot_includes_manually_halted_per_agent():
+    coord = _halt_coordinator()
+    ws = WebServer(coordinator=coord, bot=None)
+    await ws._refresh_coordinator()
+    agents = ws._build_snapshot()["agents"]
+    # Every agent row carries the new field; default False.
+    assert agents, "expected at least one agent row"
+    for a in agents:
+        assert "manually_halted" in a, f"missing manually_halted on {a['id']}"
+        assert a["manually_halted"] is False
+
+
+# ── Halt / resume endpoints — happy paths ─────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_halt_endpoint_sets_state():
+    coord = _halt_coordinator()
+    ws = WebServer(coordinator=coord, bot=None)
+    client = await _client(ws)
+    try:
+        r = await client.post("/action/agent/signal/halt")
+        assert r.status == 200
+        d = await r.json()
+        assert d == {"ok": True, "agent_id": "signal", "halted": True}
+        # Subsequent snapshot reflects the new state for that agent only.
+        await ws._refresh_coordinator()
+        snap_agents = {a["id"]: a for a in ws._build_snapshot()["agents"]}
+        assert snap_agents["signal"]["manually_halted"] is True
+        assert snap_agents["arb"]["manually_halted"]    is False
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_resume_endpoint_clears_state():
+    coord = _halt_coordinator()
+    ws = WebServer(coordinator=coord, bot=None)
+    client = await _client(ws)
+    try:
+        await client.post("/action/agent/signal/halt")
+        r = await client.post("/action/agent/signal/resume")
+        assert r.status == 200
+        d = await r.json()
+        assert d == {"ok": True, "agent_id": "signal", "halted": False}
+        await ws._refresh_coordinator()
+        snap_agents = {a["id"]: a for a in ws._build_snapshot()["agents"]}
+        assert snap_agents["signal"]["manually_halted"] is False
+    finally:
+        await client.close()
+
+
+# ── Unknown agent ─────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_halt_endpoint_unknown_agent_returns_404():
+    coord = _halt_coordinator()
+    ws = WebServer(coordinator=coord, bot=None)
+    client = await _client(ws)
+    try:
+        r = await client.post("/action/agent/nope/halt")
+        assert r.status == 404
+        d = await r.json()
+        assert d == {"ok": False, "error": "agent_not_found"}
+        # Same shape on resume.
+        r2 = await client.post("/action/agent/nope/resume")
+        assert r2.status == 404
+        assert (await r2.json())["error"] == "agent_not_found"
+    finally:
+        await client.close()
+
+
+# ── Idempotency ───────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_halt_endpoint_idempotent():
+    coord = _halt_coordinator()
+    ws = WebServer(coordinator=coord, bot=None)
+    client = await _client(ws)
+    try:
+        first  = await (await client.post("/action/agent/arb/halt")).json()
+        second = await (await client.post("/action/agent/arb/halt")).json()
+        assert first  == {"ok": True, "agent_id": "arb", "halted": True}
+        assert second == {"ok": True, "agent_id": "arb", "halted": True}
+        # Same for resume.
+        r1 = await (await client.post("/action/agent/arb/resume")).json()
+        r2 = await (await client.post("/action/agent/arb/resume")).json()
+        assert r1 == {"ok": True, "agent_id": "arb", "halted": False}
+        assert r2 == {"ok": True, "agent_id": "arb", "halted": False}
+    finally:
+        await client.close()
+
+
+# ── Event logging on halt ─────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_halt_logs_event(monkeypatch):
+    """The coordinator (which the web handler delegates to) logs a
+    HALT_MANUAL event with the agent id. Match the kill/rebalance pattern
+    where source=web_ui is in the detail string; this test asserts the
+    coordinator's _halt_log captured the call when the endpoint fired.
+    The full coordinator → db_queries.log_agent_event linkage is covered
+    in tests/test_coordinator.py."""
+    coord = _halt_coordinator()
+    ws = WebServer(coordinator=coord, bot=None)
+    client = await _client(ws)
+    try:
+        r = await client.post("/action/agent/scalp/halt")
+        assert r.status == 200
+        assert ("HALT_MANUAL", "scalp") in coord._halt_log
+    finally:
+        await client.close()

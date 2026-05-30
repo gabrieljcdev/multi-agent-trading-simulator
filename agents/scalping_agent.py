@@ -1153,6 +1153,11 @@ class ScalpingAgent(BaseAgent):
     # ── Entry gate ──────────────────────────────────────────────────────
 
     async def _evaluate_entry(self, symbol: str, exchange: str) -> None:
+        # Web UI v3.1: operator-initiated halt skips new entries silently.
+        # _manage_position is on a separate path (driven by self._loop) and
+        # keeps running so SL/TP/exit logic still fires for open positions.
+        if self._manually_halted:
+            return
         approved = settings.STRATEGY_EXCHANGE_MAP.get("scalp", [])
         now = time.time()
 

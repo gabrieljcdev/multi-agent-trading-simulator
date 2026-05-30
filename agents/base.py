@@ -82,6 +82,11 @@ class BaseAgent(ABC):
         self._status:     str             = OFFLINE
         self._start_time: Optional[float] = None
         self._error:      Optional[str]   = None
+        # Operator-initiated halt (Web UI v3.1). Distinct from lifecycle
+        # status — flipping this skips entry-creation paths only; exit /
+        # management paths keep running so open positions stay tracked.
+        # In-memory only; resets to False on restart.
+        self._manually_halted: bool       = False
 
     # ── Public API ──────────────────────────────────────────────────────
 
@@ -164,6 +169,30 @@ class BaseAgent(ABC):
         allocation below this number.
         """
         return 0.0
+
+    # ── Operator-initiated halt (Web UI v3.1) — do not override ─────────
+    # Subclasses MAY override to propagate the flag into a wrapped engine
+    # (see ArbAgentWrapper, CrossChainArbAgent), but they should call
+    # super().halt_manual()/resume_manual() to keep the canonical state on
+    # BaseAgent in sync. Both are idempotent and never raise.
+
+    def halt_manual(self) -> bool:
+        """Operator-initiated halt. Idempotent — halting an already-halted
+        agent is a no-op. Existing positions are NOT exited; agent stops
+        initiating new entries via its scan / entry path. Returns the
+        post-state (True)."""
+        self._manually_halted = True
+        return self._manually_halted
+
+    def resume_manual(self) -> bool:
+        """Operator-initiated resume. Idempotent. Returns the post-state
+        (False)."""
+        self._manually_halted = False
+        return self._manually_halted
+
+    @property
+    def manually_halted(self) -> bool:
+        return self._manually_halted
 
     # ── Standard lifecycle — do not override ────────────────────────────
 

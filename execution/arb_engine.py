@@ -230,6 +230,12 @@ class ArbEngine:
         # Track in-flight count manually — asyncio.Semaphore has no public counter
         self._active_arbs: int = 0
 
+        # Web UI v3.1 — operator-initiated halt mirror. ArbAgentWrapper
+        # writes this when the operator toggles per-agent halt; the scan
+        # loop skips opportunity discovery while set. Arb has no standing
+        # positions to manage — the flag affects entry only.
+        self._manually_halted: bool = False
+
     # ── Public API ──────────────────────────────────────────────────────
 
     async def start(self) -> None:
@@ -313,6 +319,12 @@ class ArbEngine:
                     if self._status != STATUS_HALTED:
                         logger.warning("ArbEngine: circuit breaker triggered — HALTED")
                     self._status = STATUS_HALTED
+                    await asyncio.sleep(interval)
+                    continue
+                # Web UI v3.1 — operator halt skips opportunity discovery.
+                # No standing positions to manage on the arb fund, so the
+                # whole loop body is the entry path.
+                if self._manually_halted:
                     await asyncio.sleep(interval)
                     continue
                 if self._active_arbs >= settings.ARB_MAX_CONCURRENT:
