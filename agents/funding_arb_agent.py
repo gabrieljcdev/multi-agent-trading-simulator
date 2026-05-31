@@ -373,6 +373,16 @@ class FundingArbAgent(BaseAgent):
             self._last_reset_date = today
             log.info("[FundingArbAgent] daily counters reset at UTC midnight")
 
+    def clear_circuit_breakers(self) -> None:
+        """Web UI v3.1 — Resume operator-override. Wipe _halted + the
+        daily-loss / consecutive-loss counters so the next loop tick
+        re-scans cleanly. get_stats() derives status from self._halted
+        so this also clears the HALTED label."""
+        self._halted        = False
+        self._halt_reason   = ""
+        self._daily_loss    = 0.0
+        self._consec_losses = 0
+
     def _check_circuit_breakers(self) -> None:
         """Halt the loop if either circuit breaker trips.
 

@@ -144,6 +144,9 @@ class SignalAgentWrapper(BaseAgent):
         return state
 
     def resume_manual(self) -> bool:
+        # super().resume_manual() also invokes clear_circuit_breakers()
+        # below, which wipes _cb_state's halted flag + the counters that
+        # would otherwise re-trip on the next cycle.
         state = super().resume_manual()
         if self._bot is not None:
             try:
@@ -151,6 +154,29 @@ class SignalAgentWrapper(BaseAgent):
             except Exception as e:
                 logger.debug("SignalAgent resume_manual propagate: %s", e)
         return state
+
+    def clear_circuit_breakers(self) -> None:
+        """Resume operator-override: wipe the bot's CB halt + the
+        counters that drive it. The peak-equity baseline is also reset
+        to current equity so the drawdown gate starts fresh — otherwise
+        a deep prior drawdown would re-trip on the next cycle even
+        though the operator cleared it."""
+        if self._bot is None:
+            return
+        cb = getattr(self._bot, "_cb_state", None)
+        if cb is None:
+            return
+        cb.halted              = False
+        cb.halt_reason         = None
+        cb.halt_at             = None
+        cb.consecutive_losses  = 0
+        cb.daily_pnl_pct       = 0.0
+        # Re-baseline the drawdown high-water so it doesn't re-fire on
+        # the previous peak the moment the gate runs again.
+        try:
+            cb.daily_peak_equity = float(getattr(cb, "current_equity", 0.0) or 0.0)
+        except Exception:
+            pass
 
     # ── BalanceAgent compounding hooks ──────────────────────────────────
 
@@ -363,6 +389,9 @@ class ArbAgentWrapper(BaseAgent):
         return state
 
     def resume_manual(self) -> bool:
+        # super().resume_manual() invokes clear_circuit_breakers() too,
+        # which resets the engine's daily-loss + consecutive-loss counters
+        # so _cb_triggered() returns False on the next scan tick.
         state = super().resume_manual()
         if self._engine is not None:
             try:
@@ -370,6 +399,21 @@ class ArbAgentWrapper(BaseAgent):
             except Exception as e:
                 logger.debug("ArbAgent resume_manual propagate: %s", e)
         return state
+
+    def clear_circuit_breakers(self) -> None:
+        """Resume operator-override: zero the daily-loss + consecutive-loss
+        counters that drive ArbEngine._cb_triggered, and flip the engine's
+        status back to RUNNING so the dashboard stops painting it HALTED."""
+        if self._engine is None:
+            return
+        try:
+            from execution.arb_engine import STATUS_RUNNING
+            self._engine._daily_pnl_usd      = 0.0
+            self._engine._consecutive_losses = 0
+            if getattr(self._engine, "_status", None) == "HALTED":
+                self._engine._status = STATUS_RUNNING
+        except Exception as e:
+            logger.debug("ArbAgent clear_circuit_breakers: %s", e)
 
     # ── BalanceAgent compounding hooks ──────────────────────────────────
 

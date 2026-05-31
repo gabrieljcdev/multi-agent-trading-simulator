@@ -1642,6 +1642,16 @@ class ScalpingAgent(BaseAgent):
         self._halt_reason = reason
         log.warning("[ScalpingAgent] HALTED — %s", reason)
 
+    def clear_circuit_breakers(self) -> None:
+        """Web UI v3.1 — Resume operator-override. Wipe _halted + the
+        daily-loss / consecutive-loss counters that drive future trips
+        so the next scan tick can place orders. get_stats() derives
+        status from self._halted so this also clears the HALTED label."""
+        self._halted        = False
+        self._halt_reason   = ""
+        self._daily_loss    = 0.0
+        self._consec_losses = 0
+
     def _check_daily_reset(self) -> None:
         today = datetime.utcnow().date()
         if today > self._last_reset_date:

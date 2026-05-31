@@ -486,6 +486,75 @@ async def test_halted_agent_skips_entry_scan():
 
 
 @pytest.mark.asyncio
+async def test_resume_agent_overrides_circuit_breakers():
+    """Web UI v3.1 — Resume is an explicit operator override of every CB
+    that affects the agent.
+
+    Scenario: the per-fund CB tripped on `scalp`, AND the portfolio CB
+    tripped too. Resume on scalp must clear both:
+      • _fund_halted no longer contains 'scalp'
+      • _halted_by_portfolio_cb flips back to False
+      • the agent's own _manually_halted is False
+      • clear_circuit_breakers() ran (we observe via a counter)
+    """
+    class _CBAgent(MockAgent):
+        cb_clears = 0
+        def clear_circuit_breakers(self) -> None:
+            type(self).cb_clears += 1
+
+    a = _CBAgent(agent_id="scalp", capital=100.0)
+    b = _CBAgent(agent_id="signal", capital=400.0)
+    coord = Coordinator(agents=[a, b])
+
+    # Simulate a fund halt + portfolio halt landing on us.
+    coord._fund_halted.add("scalp")
+    coord._halted_by_portfolio_cb = True
+
+    coord.halt_agent("scalp")
+    assert a.manually_halted is True
+
+    before = _CBAgent.cb_clears
+    result = coord.resume_agent("scalp")
+    assert result == {"ok": True, "agent_id": "scalp", "halted": False}
+    assert a.manually_halted is False
+    assert "scalp" not in coord._fund_halted
+    assert coord._halted_by_portfolio_cb is False        # operator override
+    assert _CBAgent.cb_clears == before + 1               # CB clear fired
+
+
+@pytest.mark.asyncio
+async def test_resume_clears_scalp_halted_flag():
+    """The real ScalpingAgent has _halted set by its daily-loss CB;
+    Resume must wipe it so the entry gate stops short-circuiting.
+    Same shape for FundingArbAgent (_halted lives on the agent itself)."""
+    from agents.scalping_agent import ScalpingAgent
+    from agents.funding_arb_agent import FundingArbAgent
+
+    s = ScalpingAgent()
+    s._halted = True
+    s._halt_reason = "daily_loss"
+    s._daily_loss = 999.0
+    s._consec_losses = 7
+    s.halt_manual()
+    s.resume_manual()
+    assert s._halted is False
+    assert s._halt_reason == ""
+    assert s._daily_loss == 0.0
+    assert s._consec_losses == 0
+    assert s.manually_halted is False
+
+    f = FundingArbAgent(engine=MagicMock())
+    f._halted = True
+    f._halt_reason = "consecutive_loss"
+    f._daily_loss = 50.0
+    f._consec_losses = 4
+    f.halt_manual()
+    f.resume_manual()
+    assert f._halted is False
+    assert f._consec_losses == 0
+
+
+@pytest.mark.asyncio
 async def test_total_equity_is_dynamic_sum_of_fund_equities():
     """Portfolio total_equity = sum of each fund's (allocation + daily P&L),
     so it tracks P&L dynamically rather than pinning to a starting constant."""

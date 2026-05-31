@@ -154,6 +154,9 @@ class CrossChainArbAgent(BaseAgent):
         return state
 
     def resume_manual(self) -> bool:
+        # super().resume_manual() also invokes clear_circuit_breakers()
+        # below, which wipes engine.cb so the next _cb_triggered() pass
+        # returns False even if the underlying counters were tripped.
         state = super().resume_manual()
         if self._engine is not None:
             try:
@@ -161,6 +164,25 @@ class CrossChainArbAgent(BaseAgent):
             except Exception as e:
                 logger.debug("CrossChainArbAgent resume_manual propagate: %s", e)
         return state
+
+    def clear_circuit_breakers(self) -> None:
+        """Resume operator-override: zero engine.cb so the next scan tick
+        evaluates clean. Status flips back to RUNNING so the dashboard
+        stops showing HALTED."""
+        if self._engine is None:
+            return
+        try:
+            from execution.crosschain_engine import STATUS_RUNNING
+            cb = getattr(self._engine, "cb", None)
+            if cb is not None:
+                cb.halted              = False
+                cb.halt_reason         = ""
+                cb.daily_pnl_usd       = 0.0
+                cb.consecutive_losses  = 0
+            if getattr(self._engine, "_status", None) == "HALTED":
+                self._engine._status = STATUS_RUNNING
+        except Exception as e:
+            logger.debug("CrossChainArbAgent clear_circuit_breakers: %s", e)
 
     # ── Stats ───────────────────────────────────────────────────────────
 

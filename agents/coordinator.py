@@ -221,7 +221,17 @@ class Coordinator:
 
     def resume_agent(self, agent_id: str) -> dict:
         """Operator-initiated resume. Same envelope as halt_agent;
-        halted=False on success."""
+        halted=False on success.
+
+        Also overrides every CB that affects this agent:
+          1. agent.resume_manual() → agent.clear_circuit_breakers()
+             wipes the per-agent CB halt + counters.
+          2. _fund_halted.discard(agent_id) drops the per-fund tracker
+             so the next monitor pass doesn't re-pause the agent.
+          3. _halted_by_portfolio_cb is cleared — if the portfolio CB
+             tripped earlier, one explicit Resume re-arms the world.
+             The monitor loop will re-evaluate and re-trip immediately
+             if the condition still holds, so this is safe to clear."""
         agent = self.get_agent(agent_id)
         if agent is None:
             return {"ok": False, "error": "agent_not_found"}
@@ -230,6 +240,13 @@ class Coordinator:
         except Exception as e:
             logger.error("resume_agent(%s) failed: %s", agent_id, e, exc_info=True)
             return {"ok": False, "error": str(e)}
+        self._fund_halted.discard(agent_id)
+        if self._halted_by_portfolio_cb:
+            self._halted_by_portfolio_cb = False
+            logger.info(
+                "Portfolio CB cleared by operator Resume on %s — monitor "
+                "loop will re-evaluate", agent_id,
+            )
         self._log_event(agent_id, "RESUME_MANUAL", "source=web_ui")
         return {"ok": True, "agent_id": agent_id, "halted": bool(state)}
 

@@ -186,9 +186,31 @@ class BaseAgent(ABC):
 
     def resume_manual(self) -> bool:
         """Operator-initiated resume. Idempotent. Returns the post-state
-        (False)."""
+        (False).
+
+        Also clears any circuit-breaker halt on this agent — the operator
+        clicking Resume is an explicit override of every CB, since
+        otherwise an agent that was halted *because* a CB tripped would
+        stay blocked even with _manually_halted False. Subclasses with CB
+        state override clear_circuit_breakers() to wipe it; the base
+        default also restores _status from PAUSED → RUNNING so the
+        dashboard stops showing the previous portfolio-CB pause."""
         self._manually_halted = False
+        try:
+            self.clear_circuit_breakers()
+        except Exception as e:
+            logger.debug("clear_circuit_breakers failed for %s: %s",
+                         getattr(self, "agent_id", "?"), e)
+        if self._status == PAUSED:
+            self._status = RUNNING
         return self._manually_halted
+
+    def clear_circuit_breakers(self) -> None:
+        """Wipe every per-agent CB halt + the counters that drive future
+        trips. Default no-op for agents without CB state (e.g. balance,
+        placeholders). Subclasses override to clear their specific shape
+        of CB state. Never raises — best-effort, defensive."""
+        pass
 
     @property
     def manually_halted(self) -> bool:
