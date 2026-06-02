@@ -588,6 +588,19 @@ class FundingArbObservationModel(Base):
     fees_paid         = Column(Float,  default=0.0)
     pnl_usd           = Column(Float,  default=0.0)   # realised net
     observation_only  = Column(Boolean, default=True)
+    # ── Funding-frontier columns (cross-venue + long-tail/HIP-3 + openness) ──
+    # All nullable / defaulted so a pre-frontier database migrates cleanly via
+    # scripts/migrate_funding_frontier.py and old rows read sensibly.
+    legs                     = Column(String(12), default="single")  # single | cross_venue
+    funding_interval_sec     = Column(Float)                          # carry funding cadence
+    taker_fee_bps            = Column(Float)
+    maker_fee_bps            = Column(Float)
+    is_long_tail             = Column(Boolean, default=False)         # not in curated FUNDING_SYMBOLS
+    is_hip3                  = Column(Boolean)                        # builder-deployed; null=unknown
+    pair_age_days            = Column(Float)                          # venue listing age (richness window)
+    spread_decay_bps_per_day = Column(Float)                          # +ve = compressing
+    oi_growth_pct_24h        = Column(Float)
+    crowding_verdict         = Column(String(12))                     # OPEN|COMPRESSING|CROWDED|UNKNOWN
     created_at        = Column(DateTime, default=datetime.utcnow)
 
     __table_args__ = (

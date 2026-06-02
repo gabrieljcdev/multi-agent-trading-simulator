@@ -1209,6 +1209,10 @@ def save_funding_observations(rows: list) -> None:
         "exit_time", "exit_reason", "hold_sec",
         "funding_collected", "fees_paid", "pnl_usd",
         "observation_only",
+        # Funding-frontier columns (Phase 2-4):
+        "legs", "funding_interval_sec", "taker_fee_bps", "maker_fee_bps",
+        "is_long_tail", "is_hip3", "pair_age_days",
+        "spread_decay_bps_per_day", "oi_growth_pct_24h", "crowding_verdict",
     }
     with get_session() as s:
         for r in rows:
@@ -1249,6 +1253,16 @@ def get_funding_summary(days: int = 7) -> dict:
         "mean_net_apr_realized": 0.0,
         "mean_hold_hours":       0.0,
         "exit_reason":           {},
+        # ── Funding-frontier rollups ──────────────────────────────────
+        "n_cross_venue":         0,
+        "n_long_tail":           0,
+        "n_hip3":                0,
+        "pct_crowding_OPEN":         0.0,
+        "pct_crowding_COMPRESSING":  0.0,
+        "pct_crowding_CROWDED":      0.0,
+        "pct_crowding_UNKNOWN":      0.0,
+        "best_projected_net_apr_open": 0.0,
+        "best_projected_net_apr":      0.0,
     }
     with get_session() as s:
         rows = (
@@ -1287,6 +1301,33 @@ def get_funding_summary(days: int = 7) -> dict:
             (r.exit_reason or "unknown") for r in closed
         )
         out["exit_reason"] = dict(reasons)
+
+    # ── Funding-frontier rollups ──────────────────────────────────────────
+    out["n_cross_venue"] = sum(1 for r in rows if (r.legs or "single") == "cross_venue")
+    out["n_long_tail"]   = sum(1 for r in rows if bool(r.is_long_tail))
+    out["n_hip3"]        = sum(1 for r in rows if r.is_hip3 is True)
+
+    # Crowding mix — % across rows that carry a verdict (UNKNOWN included).
+    verdicts = [r.crowding_verdict for r in rows if r.crowding_verdict]
+    if verdicts:
+        from collections import Counter as _Counter
+        vc = _Counter(verdicts)
+        n_v = len(verdicts)
+        for label in ("OPEN", "COMPRESSING", "CROWDED", "UNKNOWN"):
+            out[f"pct_crowding_{label}"] = vc.get(label, 0) / n_v * 100.0
+
+    # Gate-relevant headline: best net APR among OPEN-verdict pairs only.
+    open_aprs = [
+        float(r.projected_net_apr or 0.0)
+        for r in rows
+        if r.crowding_verdict == "OPEN"
+    ]
+    if open_aprs:
+        out["best_projected_net_apr_open"] = max(open_aprs)
+
+    all_aprs = [r.projected_net_apr for r in rows if r.projected_net_apr is not None]
+    if all_aprs:
+        out["best_projected_net_apr"] = max(float(a) for a in all_aprs)
 
     return out
 
@@ -1337,6 +1378,16 @@ def get_funding_observations(
             "fees_paid":         r.fees_paid,
             "pnl_usd":           r.pnl_usd,
             "observation_only":  r.observation_only,
+            "legs":                     r.legs,
+            "funding_interval_sec":     r.funding_interval_sec,
+            "taker_fee_bps":            r.taker_fee_bps,
+            "maker_fee_bps":            r.maker_fee_bps,
+            "is_long_tail":             r.is_long_tail,
+            "is_hip3":                  r.is_hip3,
+            "pair_age_days":            r.pair_age_days,
+            "spread_decay_bps_per_day": r.spread_decay_bps_per_day,
+            "oi_growth_pct_24h":        r.oi_growth_pct_24h,
+            "crowding_verdict":         r.crowding_verdict,
         }
         for r in rows
     ]

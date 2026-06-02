@@ -1486,6 +1486,15 @@ class Dashboard:
         snap["daily_pnl"]  = float(getattr(agent, "_daily_pnl",  0.0) or 0.0)
         snap["daily_loss"] = float(getattr(agent, "_daily_loss", 0.0) or 0.0)
 
+        # Active venues come from the engine's plugin list (Binance,
+        # Hyperliquid, …) — falls back to the single-venue default.
+        try:
+            venues = [v.venue_id for v in getattr(agent._engine, "_venues", []) or []]
+            if venues:
+                snap["venues"] = venues
+        except Exception:
+            pass
+
         # Top 5 live opportunities by net APR. Pulled from the agent's
         # in-memory _last_opps cache so we don't poll the engine again.
         try:
@@ -1499,6 +1508,13 @@ class Dashboard:
                     "funding_apr": float(getattr(o, "funding_apr", 0.0)),
                     "oi_usd":      float(getattr(o, "oi_usd", 0.0)),
                     "depth_ok":    bool(getattr(o, "depth_ok", False)),
+                    "legs":        getattr(o, "legs", "single"),
+                    "is_long_tail": bool(getattr(o, "is_long_tail", False)),
+                    "is_hip3":     getattr(o, "is_hip3", None),
+                    "net_apr":     (float(o.projected_net_apr)
+                                    if getattr(o, "projected_net_apr", None) is not None
+                                    else None),
+                    "crowding":    getattr(o, "crowding_verdict", None),
                 }
                 for o in opps[:5]
             ]
@@ -1583,23 +1599,42 @@ class Dashboard:
         opps_table.add_column("APR",    justify="right")
         opps_table.add_column("OI USD", justify="right")
         opps_table.add_column("Depth")
+        opps_table.add_column("Crowd")
         live_opps = snap.get("live_opps") or []
         if not live_opps:
             opps_table.add_row("[dim]No opportunities yet[/dim]",
-                               "", "", "", "", "")
+                               "", "", "", "", "", "")
         else:
             for o in live_opps:
                 depth_cell = (
                     "[bright_green]ok[/bright_green]" if o["depth_ok"]
                     else "[red]thin[/red]"
                 )
+                crowd = o.get("crowding") or "—"
+                # Tint an OPEN-verdict cross-venue carry distinctly (the
+                # observation-layer convention for would-enter candidates).
+                crowd_col = {
+                    "OPEN": "bright_green bold", "COMPRESSING": "yellow",
+                    "CROWDED": "red", "UNKNOWN": "dim",
+                }.get(crowd, "dim")
+                # Mark long-tail / HIP-3 pairs with a sigil after the symbol.
+                tags = ""
+                if o.get("is_long_tail"):
+                    tags += " [magenta]·lt[/magenta]"
+                if o.get("is_hip3") is True:
+                    tags += " [cyan]·h3[/cyan]"
+                sym_cell = o["symbol"] + tags
+                if crowd == "OPEN":
+                    sym_cell = f"[bright_green]{o['symbol']}[/bright_green]" + tags
+                apr_val = o["net_apr"] if o.get("net_apr") is not None else o["funding_apr"]
                 opps_table.add_row(
-                    o["symbol"],
+                    sym_cell,
                     f"[dim]{o['venue_long']}[/dim]",
                     f"[dim]{o['venue_short']}[/dim]",
-                    f"{o['funding_apr']*100:+.2f}%",
+                    f"{apr_val*100:+.2f}%",
                     f"{o['oi_usd']:,.0f}" if o["oi_usd"] > 0 else "—",
                     depth_cell,
+                    f"[{crowd_col}]{crowd}[/{crowd_col}]",
                 )
 
         # ── 3. Open positions ──────────────────────────────────────────
@@ -1668,8 +1703,37 @@ class Dashboard:
         stats_bar.append("daily-loss ",  style="dim")
         stats_bar.append(f"${daily_loss:.2f}", style=loss_col)
 
+        # ── Frontier rollups: pairs mix, best-open, crowding distribution ──
+        n_cross   = int(stats.get("n_cross_venue", 0) or 0)
+        n_lt      = int(stats.get("n_long_tail", 0) or 0)
+        n_h3      = int(stats.get("n_hip3", 0) or 0)
+        best_open = float(stats.get("best_projected_net_apr_open", 0.0) or 0.0)
+        best_all  = float(stats.get("best_projected_net_apr", 0.0) or 0.0)
+        pct_open  = float(stats.get("pct_crowding_OPEN", 0.0) or 0.0)
+        pct_comp  = float(stats.get("pct_crowding_COMPRESSING", 0.0) or 0.0)
+        pct_crowd = float(stats.get("pct_crowding_CROWDED", 0.0) or 0.0)
+
+        frontier_bar = Text()
+        frontier_bar.append("cross ", style="dim"); frontier_bar.append(f"{n_cross}", style="white")
+        frontier_bar.append("  long-tail ", style="dim"); frontier_bar.append(f"{n_lt}", style="magenta")
+        frontier_bar.append("  hip3 ", style="dim"); frontier_bar.append(f"{n_h3}", style="cyan")
+        frontier_bar.append("  │  ", style="dim")
+        frontier_bar.append("best-net ", style="dim")
+        frontier_bar.append(f"{best_all*100:+.1f}%", style=_pnl_colour(best_all))
+        frontier_bar.append("  best-OPEN ", style="dim")
+        frontier_bar.append(f"{best_open*100:+.1f}%", style="bright_green bold")
+
+        crowd_bar = Text()
+        crowd_bar.append("crowding  ", style="dim")
+        crowd_bar.append(f"OPEN {pct_open:.0f}%", style="bright_green")
+        crowd_bar.append(" · ", style="dim")
+        crowd_bar.append(f"COMPRESSING {pct_comp:.0f}%", style="yellow")
+        crowd_bar.append(" · ", style="dim")
+        crowd_bar.append(f"CROWDED {pct_crowd:.0f}%", style="red")
+
         return Panel(
-            self._stack(header, opps_table, pos_table, closed_table, stats_bar),
+            self._stack(header, opps_table, pos_table, closed_table,
+                        stats_bar, frontier_bar, crowd_bar),
             title=title, border_style="cyan",
         )
 
