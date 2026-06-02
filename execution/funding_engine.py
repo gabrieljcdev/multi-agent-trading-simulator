@@ -34,13 +34,14 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
 
-try:
-    import ccxt.async_support as ccxt           # public endpoints only in Phase 1
-except Exception:                               # pragma: no cover — venv carries ccxt
-    ccxt = None                                 # type: ignore
-
 from config import settings
 from database import queries as db_queries
+from execution.funding_venues import (
+    REGISTERED_FUNDING_VENUES,
+    BaseFundingVenue,
+    BinanceFundingVenue,
+    FundingQuote,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -96,7 +97,7 @@ class FundingEngine:
     ccxt.async_support.binance().
     """
 
-    def __init__(self, ccxt_factory=None):
+    def __init__(self, ccxt_factory=None, venues: Optional[list[BaseFundingVenue]] = None):
         # Per-symbol re-entry locks — exactly like ArbEngine._symbol_locks.
         self._symbol_locks: dict[str, asyncio.Lock] = {
             sym: asyncio.Lock() for sym in settings.FUNDING_SYMBOLS
@@ -107,29 +108,68 @@ class FundingEngine:
         # Optional injection: tests can supply a callable returning a stub
         # binance client. None → build a real ccxt.async_support.binance().
         self._ccxt_factory = ccxt_factory
-        # Reused public client — we hold one binance instance and close it
-        # on shutdown rather than re-instantiating per scan.
-        self._exchange = None
+
+        # ── Funding-venue plugin layer ──────────────────────────────────
+        # The engine iterates a list of BaseFundingVenue plugins instead of
+        # reaching into ccxt directly. Resolution order:
+        #   * explicit venues=        → use them (chains-engine-style injection)
+        #   * ccxt_factory= (legacy)  → binance-only with the injected stub,
+        #     so the single-venue observation output is BYTE-IDENTICAL to
+        #     Phase 1 (the existing test suite pins this).
+        #   * neither (production)    → REGISTERED_FUNDING_VENUES, filtered by
+        #     settings.FUNDING_VENUES_ENABLED and is_available().
+        if venues is not None:
+            self._venues: list[BaseFundingVenue] = list(venues)
+        elif ccxt_factory is not None:
+            self._venues = [BinanceFundingVenue(ccxt_factory=ccxt_factory)]
+        else:
+            enabled = set(
+                getattr(settings, "FUNDING_VENUES_ENABLED", ["binance"]) or ["binance"]
+            )
+            self._venues = [
+                v for v in REGISTERED_FUNDING_VENUES
+                if v.venue_id in enabled and v.is_available()
+            ]
+
+        # Most recent scan's raw quotes, keyed by (venue_id, symbol) — kept
+        # so Phase 2 can build cross-venue carry from the same snapshot
+        # without re-fetching. Refreshed every scan().
+        self._last_quotes: dict[tuple[str, str], FundingQuote] = {}
+
         # Sim/health flag the venue-health exit checks against. Cleared by
-        # a successful scan, set by a fetch_funding_rate failure.
+        # a successful scan, set when no venue returned a usable quote.
         self._venue_healthy: bool = True
 
     # ── Public API ──────────────────────────────────────────────────────
 
     async def scan(self) -> list[FundingOpportunity]:
-        """Build one delta-neutral opportunity per symbol, filtered by APR.
+        """Build one single-venue carry opportunity per (venue, symbol),
+        filtered by |APR|.
 
-        Reads funding via CCXT Binance public fetch_funding_rate (no keys).
-        On network/CCXT failure, returns an empty list — the agent loop
-        treats that as 'nothing to do this tick' rather than halting.
+        Iterates every registered funding venue (Binance, Hyperliquid, …)
+        through the plugin layer — a venue/pair that errors or isn't listed
+        is skipped with no crash. The raw quotes are cached in
+        self._last_quotes so the cross-venue pass (Phase 2) reuses the same
+        snapshot. On total failure returns [] — the agent loop treats that
+        as 'nothing to do this tick' rather than halting.
         """
-        venue = "binance"
         opps: list[FundingOpportunity] = []
-        for symbol in settings.FUNDING_SYMBOLS:
-            funding_apr, oi_usd = await self._fetch_native_funding(venue, symbol)
-            if funding_apr is None:
-                continue
-            opps.extend(self._build_opportunities(symbol, venue, funding_apr, oi_usd))
+        self._last_quotes = {}
+        any_success = False
+        for venue in self._venues:
+            for symbol in settings.FUNDING_SYMBOLS:
+                quote = await venue.fetch_funding(symbol)
+                if quote.error is not None or quote.funding_apr is None:
+                    continue
+                any_success = True
+                self._last_quotes[(venue.venue_id, symbol)] = quote
+                opps.extend(self._build_opportunities(
+                    symbol, venue.venue_id, quote.funding_apr, quote.oi_usd,
+                ))
+        # venue_health reflects whether ANY venue produced a usable quote
+        # this scan — drives the venue_health exit reason. (Matches the old
+        # single-venue semantics: success → healthy, total failure → not.)
+        self._venue_healthy = any_success or not self._venues
         return self._filter(opps)
 
     async def open(self, opp: FundingOpportunity) -> None:
@@ -220,110 +260,47 @@ class FundingEngine:
         return None
 
     async def close(self) -> None:
-        """Close the held CCXT client. Called from the agent's stop()."""
-        ex = self._exchange
-        if ex is None:
-            return
-        try:
-            close = getattr(ex, "close", None)
-            if close is None:
-                return
-            res = close()
-            if asyncio.iscoroutine(res):
-                await res
-        except Exception as e:
-            logger.debug(f"FundingEngine close: {e}")
+        """Close every venue's held client. Called from the agent's stop()."""
+        for venue in self._venues:
+            try:
+                await venue.close()
+            except Exception as e:
+                logger.debug(f"FundingEngine close {venue.venue_id}: {e}")
 
     # ── Internal helpers ────────────────────────────────────────────────
 
     def _get_exchange(self):
-        """Return a cached binance ccxt client (built lazily so the engine
-        can be instantiated without ccxt at import time)."""
-        if self._exchange is not None:
-            return self._exchange
-        if self._ccxt_factory is not None:
-            self._exchange = self._ccxt_factory()
-            return self._exchange
-        if ccxt is None:
-            return None
-        try:
-            # defaultType=future is REQUIRED — ccxt's binance.fetch_funding_rate
-            # raises NotSupported on spot ("supports linear and inverse contracts
-            # only"). Without this option every scan tick was silently dropping
-            # every symbol with a swallowed DEBUG log, leaving
-            # funding_arb_observations empty even with a fully widened universe.
-            # Verified via direct A/B test on 2026-05-29.
-            self._exchange = ccxt.binance({
-                "enableRateLimit": True,
-                "options": {"defaultType": "future"},
-            })
-        except Exception as e:
-            logger.debug(f"FundingEngine: binance() failed: {e}")
-            self._exchange = None
-        return self._exchange
+        """Return the binance venue's cached ccxt client (built lazily).
+
+        Kept on the engine surface for backward compatibility — the binance
+        funding venue now owns the client. Returns None when no binance
+        venue is active.
+        """
+        for venue in self._venues:
+            if getattr(venue, "venue_id", None) == "binance":
+                return venue._get_exchange()
+        return None
 
     async def _fetch_native_funding(
         self, venue: str, symbol: str,
     ) -> tuple[Optional[float], float]:
-        """Return (funding_apr, oi_usd) from CCXT Binance public endpoints.
+        """Return (funding_apr, oi_usd) for one (venue, symbol) via the
+        plugin layer — a thin shim over BaseFundingVenue.fetch_funding.
 
-        On any error returns (None, 0.0) — the caller drops the symbol for
-        this scan tick. _venue_healthy is flipped to False so the exit
-        check picks up persistently stale feeds.
+        On any error returns (None, 0.0) so legacy callers drop the symbol
+        for this scan tick. Resolution by venue_id; an unknown venue id
+        returns (None, 0.0).
         """
-        ex = self._get_exchange()
-        if ex is None:
+        plugin = next((v for v in self._venues if v.venue_id == venue), None)
+        if plugin is None:
             self._venue_healthy = False
             return None, 0.0
-
-        try:
-            payload = await ex.fetch_funding_rate(symbol)
-        except Exception as e:
-            logger.debug(f"FundingEngine fetch_funding_rate {symbol}: {e}")
+        quote = await plugin.fetch_funding(symbol)
+        if quote.error is not None or quote.funding_apr is None:
             self._venue_healthy = False
             return None, 0.0
-
-        # CCXT shapes 'fundingRate' as a fractional 8h rate (e.g. 0.0001).
-        # Be defensive: fall through to the nested 'info' block if the
-        # top-level field is None.
-        rate_8h = payload.get("fundingRate")
-        if rate_8h is None:
-            info = payload.get("info") or {}
-            rate_8h = info.get("lastFundingRate") or info.get("fundingRate")
-        try:
-            rate_8h = float(rate_8h) if rate_8h is not None else None
-        except (TypeError, ValueError):
-            rate_8h = None
-        if rate_8h is None:
-            self._venue_healthy = False
-            return None, 0.0
-
-        # Binance funds every 8h → 3 fundings/day × 365 = 1095. The spec
-        # pins this constant; tests assert on it directly.
-        funding_apr = rate_8h * 1095.0
-
-        # Open interest is optional in Phase 1: when CCXT exposes it we
-        # honour the OI gate; when it doesn't, depth_ok defaults to True
-        # (per spec) and we record OI as 0.0 so downstream sizing still
-        # caps off FUNDING_MAX_NOTIONAL_USD.
-        oi_usd = 0.0
-        try:
-            fetch_oi = getattr(ex, "fetch_open_interest", None)
-            if callable(fetch_oi):
-                oi_payload = await fetch_oi(symbol)
-                if oi_payload is not None:
-                    raw = (oi_payload.get("openInterestAmount")
-                           or oi_payload.get("openInterestValue")
-                           or oi_payload.get("openInterest"))
-                    try:
-                        oi_usd = float(raw or 0.0)
-                    except (TypeError, ValueError):
-                        oi_usd = 0.0
-        except Exception as e:
-            logger.debug(f"FundingEngine fetch_open_interest {symbol}: {e}")
-
         self._venue_healthy = True
-        return funding_apr, oi_usd
+        return quote.funding_apr, quote.oi_usd
 
     def _build_opportunities(
         self, symbol: str, venue: str, funding_apr: float, oi_usd: float,

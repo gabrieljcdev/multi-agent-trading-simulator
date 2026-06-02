@@ -302,6 +302,26 @@ FUNDING_SIM_SLIPPAGE_PCT       = 0.0002     # test: 0.0001-0.001
 FUNDING_DAILY_LOSS_HALT_PCT    = 2.0        # test: 1-5    (% of FUNDING_CAPITAL_USD; 0-alloc → no-op)
 FUNDING_CONSECUTIVE_LOSS_HALT  = 4          # test: 3-6
 
+# ── Funding frontier (observation; extends the Phase-1 funding observer) ──
+# Adds funding venues (Hyperliquid + room for more), cross-venue carry
+# observation, and a long-tail / HIP-3 discovery + openness signal. STILL
+# OBSERVATION ONLY: FUNDING_OBSERVATION_MODE stays True, FUNDING_CAPITAL_USD
+# stays 0.0, no venue can place an order. These tune what is OBSERVED, never
+# whether anything trades.
+FUNDING_VENUES_ENABLED            = ["binance", "hyperliquid"]  # test: ["binance"] first, then add hyperliquid
+FUNDING_HL_BULK_TTL_SEC           = 30     # test: 10, 30, 60  (Hyperliquid bulk-fetch cache TTL; rate-limit transport detail)
+
+FUNDING_CROSS_VENUE_ENABLED       = True   # test: True, False
+FUNDING_FUNDING_INTERVAL_RISK_BPS = 1.5    # test: 0.5, 1.0, 1.5, 3.0  (buffer per interval for funding-flip risk)
+FUNDING_REQUIRE_MAKER_FEES        = True   # test: True, False  (use maker fee in break-even; flag if only taker available)
+
+FUNDING_LONGTAIL_ENABLED          = True   # test: True, False
+FUNDING_MAX_DISCOVERED_PAIRS      = 40     # test: 10, 25, 40, 80
+FUNDING_DECAY_WINDOW_HOURS        = 48     # test: 24, 48, 96  (rolling window for spread-decay slope)
+FUNDING_CROWDED_DECAY_BPS_DAY     = 8.0    # test: 4, 8, 15    (>= this daily compression → CROWDED)
+FUNDING_OPEN_MAX_DECAY_BPS_DAY    = 2.0    # test: 1, 2, 4     (<= this → OPEN, if age/OI agree)
+FUNDING_YOUNG_PAIR_MAX_AGE_DAYS   = 21     # test: 14, 21, 30  (the richness-window age cutoff)
+
 # Pairs the arb engine watches. Distinct from signal-track FALLBACK_PAIRS.
 ARB_WATCH_PAIRS = [
     "BTC/USDT",  "ETH/USDT",  "SOL/USDT",  "BNB/USDT",
