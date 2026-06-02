@@ -35,6 +35,19 @@ from typing import Optional
 SECONDS_PER_YEAR = 365 * 24 * 3600          # 31_536_000
 
 
+def base_symbol(symbol: str) -> str:
+    """Extract the base coin from a unified symbol, upper-cased.
+
+    "BTC/USDT" -> "BTC"; "BTC/USDC:USDC" -> "BTC"; "kPEPE/USDC:USDC" -> "KPEPE".
+    Lets the same asset line up across venues whose quote/settle differ, and
+    lets discovery tell a curated pair from a long-tail one by base coin.
+    """
+    if not symbol:
+        return ""
+    head = symbol.split(":", 1)[0]          # drop settle suffix
+    return head.split("/", 1)[0].strip().upper()
+
+
 def annualise_funding(rate_per_interval: float, interval_sec: float) -> float:
     """Annualise a per-interval funding rate.
 
@@ -137,6 +150,20 @@ class BaseFundingVenue(ABC):
             return True
         return bool(os.getenv(self.key_env_var))
 
+    async def get_market_meta(self, symbol: str) -> dict:
+        """Best-effort discovery metadata for `symbol` on this venue.
+
+        Returns a dict with (all optional, None when not determinable):
+          * is_hip3        — bool, True when the market is a HIP-3 / builder-
+            deployed market. None when the venue can't tell — never guessed.
+          * pair_age_days  — float, venue listing age in days (the "2-4 week
+            richness window" signal). None when unknown.
+
+        Default: nothing known. ccxt-backed venues override and read from
+        their cached market metadata (no extra network call).
+        """
+        return {"is_hip3": None, "pair_age_days": None}
+
     async def close(self) -> None:
         """Release any held client. Default no-op; ccxt-backed venues override."""
         return None
@@ -146,5 +173,6 @@ __all__ = [
     "FundingQuote",
     "BaseFundingVenue",
     "annualise_funding",
+    "base_symbol",
     "SECONDS_PER_YEAR",
 ]

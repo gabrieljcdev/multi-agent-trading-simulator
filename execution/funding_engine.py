@@ -42,6 +42,8 @@ from execution.funding_venues import (
     BinanceFundingVenue,
     FundingQuote,
 )
+from execution.funding_venues.base_funding import base_symbol
+from execution.funding_openness import OpennessTracker
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +85,13 @@ class FundingOpportunity:
     maker_fee_bps:        float           = 0.0
     funding_apr_long:     Optional[float] = None     # the long leg's annualised funding
     funding_apr_short:    Optional[float] = None     # the short leg's annualised funding
+    # ── discovery + openness (Phase 3) ──────────────────────────────────
+    is_long_tail:             bool            = False   # not in curated FUNDING_SYMBOLS
+    is_hip3:                  Optional[bool]  = None    # builder-deployed market; None=unknown
+    pair_age_days:            Optional[float] = None    # venue listing age (richness window)
+    spread_decay_bps_per_day: Optional[float] = None    # +ve = compressing
+    oi_growth_pct_24h:        Optional[float] = None
+    crowding_verdict:         Optional[str]   = None    # OPEN|COMPRESSING|CROWDED|UNKNOWN
 
 
 @dataclass
@@ -153,6 +162,14 @@ class FundingEngine:
         # without re-fetching. Refreshed every scan().
         self._last_quotes: dict[tuple[str, str], FundingQuote] = {}
 
+        # Per-symbol market metadata (is_hip3 / pair_age_days) gathered during
+        # discovery, keyed by symbol — reused by the openness tagging pass.
+        self._meta: dict[str, dict] = {}
+
+        # Rolling openness/decay history (Phase 3) — persists across scans on
+        # the singleton so spread compression is measured over the window.
+        self._openness = OpennessTracker()
+
         # Sim/health flag the venue-health exit checks against. Cleared by
         # a successful scan, set when no venue returned a usable quote.
         self._venue_healthy: bool = True
@@ -172,17 +189,40 @@ class FundingEngine:
         """
         opps: list[FundingOpportunity] = []
         self._last_quotes = {}
+        self._meta = {}
         any_success = False
+
+        curated = list(settings.FUNDING_SYMBOLS)
+        curated_bases = {base_symbol(s) for s in curated}
+
         for venue in self._venues:
-            for symbol in settings.FUNDING_SYMBOLS:
+            # Discovery (Phase 3): scan curated symbols on every venue, plus
+            # this venue's long-tail perps (base not in the curated set),
+            # capped at FUNDING_MAX_DISCOVERED_PAIRS.
+            discovered = await self._discover(venue, curated_bases)
+            for symbol in curated + discovered:
                 quote = await venue.fetch_funding(symbol)
                 if quote.error is not None or quote.funding_apr is None:
                     continue
                 any_success = True
                 self._last_quotes[(venue.venue_id, symbol)] = quote
-                opps.extend(self._build_opportunities(
+                is_long_tail = base_symbol(symbol) not in curated_bases
+                if is_long_tail and symbol not in self._meta:
+                    # Pull HIP-3 / age metadata once per long-tail symbol.
+                    try:
+                        self._meta[symbol] = await venue.get_market_meta(symbol)
+                    except Exception as e:
+                        logger.debug("get_market_meta %s/%s: %s", venue.venue_id, symbol, e)
+                        self._meta[symbol] = {"is_hip3": None, "pair_age_days": None}
+                built = self._build_opportunities(
                     symbol, venue.venue_id, quote.funding_apr, quote.oi_usd,
-                ))
+                )
+                meta = self._meta.get(symbol, {})
+                for o in built:
+                    o.is_long_tail  = is_long_tail
+                    o.is_hip3       = meta.get("is_hip3")
+                    o.pair_age_days = meta.get("pair_age_days")
+                opps.extend(built)
         # venue_health reflects whether ANY venue produced a usable quote
         # this scan — drives the venue_health exit reason. (Matches the old
         # single-venue semantics: success → healthy, total failure → not.)
@@ -196,7 +236,75 @@ class FundingEngine:
             if getattr(settings, "FUNDING_CROSS_VENUE_ENABLED", False)
             else []
         )
-        return single + cross
+        result = single + cross
+        # Phase 3 — openness/decay tagging across the full result set.
+        self._tag_openness(result)
+        return result
+
+    # ── Discovery (Phase 3) ─────────────────────────────────────────────
+
+    async def _discover(
+        self, venue: BaseFundingVenue, curated_bases: set[str],
+    ) -> list[str]:
+        """This venue's long-tail perps — listed symbols whose base coin is
+        NOT in the curated set — capped at FUNDING_MAX_DISCOVERED_PAIRS.
+
+        Returns [] when long-tail discovery is disabled or the venue lists
+        nothing. Never raises — a venue whose list_perps() fails contributes
+        no discovered pairs rather than breaking the scan.
+        """
+        if not getattr(settings, "FUNDING_LONGTAIL_ENABLED", False):
+            return []
+        try:
+            perps = await venue.list_perps() or []
+        except Exception as e:
+            logger.debug("list_perps %s: %s", venue.venue_id, e)
+            return []
+        cap = int(getattr(settings, "FUNDING_MAX_DISCOVERED_PAIRS", 40))
+        out: list[str] = []
+        for s in perps:
+            if base_symbol(s) in curated_bases:
+                continue
+            out.append(s)
+            if len(out) >= cap:
+                break
+        return out
+
+    # ── Openness / decay tagging (Phase 3) ──────────────────────────────
+
+    def _tag_openness(self, opps: list[FundingOpportunity]) -> None:
+        """Record one openness sample per symbol from this scan and stamp the
+        crowding verdict back onto every opp for that symbol.
+
+        The per-symbol net signal prefers a cross-venue projected_net_apr
+        (the gate-relevant carry); when only single-venue rows exist it uses
+        the richest single funding_apr. OI is the max observed for the symbol.
+        Crowding is a per-PAIR property, so all of a symbol's rows (single +
+        cross) carry the same verdict.
+        """
+        if not opps:
+            return
+        now = time.time()
+        # Group by symbol; choose the representative net + OI + age.
+        by_symbol: dict[str, list[FundingOpportunity]] = {}
+        for o in opps:
+            by_symbol.setdefault(o.symbol, []).append(o)
+
+        for symbol, group in by_symbol.items():
+            cross = [o for o in group if o.legs == "cross_venue"]
+            if cross:
+                net = max(float(o.projected_net_apr or 0.0) for o in cross)
+            else:
+                net = max(float(o.funding_apr or 0.0) for o in group)
+            oi = max(float(o.oi_usd or 0.0) for o in group)
+            age = next((o.pair_age_days for o in group if o.pair_age_days is not None), None)
+
+            self._openness.record(symbol, now, net, oi)
+            snap = self._openness.snapshot(symbol, pair_age_days=age)
+            for o in group:
+                o.spread_decay_bps_per_day = snap.spread_decay_bps_per_day
+                o.oi_growth_pct_24h        = snap.oi_growth_pct_24h
+                o.crowding_verdict         = snap.crowding_verdict
 
     # ── Cross-venue carry (Phase 2) ─────────────────────────────────────
 
@@ -231,6 +339,8 @@ class FundingEngine:
 
             spread_apr = short_q.funding_apr - long_q.funding_apr
             net_apr    = self._cross_net_apr(spread_apr, long_q, short_q)
+            meta       = self._meta.get(symbol, {})
+            curated_bases = {base_symbol(s) for s in settings.FUNDING_SYMBOLS}
 
             out.append(FundingOpportunity(
                 symbol=symbol,
@@ -250,6 +360,9 @@ class FundingEngine:
                 maker_fee_bps=short_q.maker_fee_bps + long_q.maker_fee_bps,
                 funding_apr_long=long_q.funding_apr,
                 funding_apr_short=short_q.funding_apr,
+                is_long_tail=base_symbol(symbol) not in curated_bases,
+                is_hip3=meta.get("is_hip3"),
+                pair_age_days=meta.get("pair_age_days"),
             ))
         return out
 

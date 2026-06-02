@@ -31,7 +31,7 @@ except Exception:                               # pragma: no cover — venv carr
 
 from config import settings
 from execution.funding_venues.base_funding import (
-    BaseFundingVenue, FundingQuote, annualise_funding,
+    BaseFundingVenue, FundingQuote, annualise_funding, base_symbol as _base_of,
 )
 
 logger = logging.getLogger(__name__)
@@ -42,17 +42,11 @@ logger = logging.getLogger(__name__)
 # cross-venue diff normalises Binance-8h against Hyperliquid-1h correctly.
 _HL_FUNDING_INTERVAL_SEC = 3600
 
-
-def _base_of(symbol: str) -> str:
-    """Extract the base coin from a unified symbol.
-
-    "BTC/USDT" -> "BTC"; "BTC/USDC:USDC" -> "BTC"; "kPEPE/USDC:USDC" -> "kPEPE".
-    Used to line up the same asset across venues with different quote/settle.
-    """
-    if not symbol:
-        return ""
-    head = symbol.split(":", 1)[0]          # drop settle suffix
-    return head.split("/", 1)[0].strip().upper()
+# Market-metadata fields that, when present + truthy, mark a builder-deployed
+# (HIP-3) market. ccxt surfaces the raw venue payload under market['info'].
+_HIP3_INFO_KEYS    = ("isHip3", "hip3", "builder", "builderName", "dex", "deployer")
+# Listing-time fields (epoch seconds or ms) for the pair-age signal.
+_LISTING_INFO_KEYS = ("listingTime", "onboardedAt", "onboardDate", "created", "createdAt")
 
 
 class HyperliquidFundingVenue(BaseFundingVenue):
@@ -268,6 +262,44 @@ class HyperliquidFundingVenue(BaseFundingVenue):
                     if _safe_get(m, "swap")]
         # Fall back to whatever funding keys we have if markets didn't load.
         return list(self._funding_cache.keys())
+
+    async def get_market_meta(self, symbol: str) -> dict:
+        """HIP-3 + pair-age from the cached market metadata. Never guesses:
+        is_hip3 / pair_age_days stay None when the venue doesn't expose them."""
+        await self._refresh_bulk()
+        hl_symbol = self._resolve(symbol)
+        market = self._markets.get(hl_symbol) if hl_symbol else None
+        if not market:
+            return {"is_hip3": None, "pair_age_days": None}
+        info = market.get("info") if isinstance(market, dict) else None
+        info = info if isinstance(info, dict) else {}
+
+        # HIP-3: True only when an explicit builder/dex marker is present and
+        # truthy. Absence is "unknown" (None), not "core" — we don't guess.
+        is_hip3 = None
+        for k in _HIP3_INFO_KEYS:
+            if k in info:
+                is_hip3 = bool(info.get(k))
+                break
+
+        # Pair age: listing epoch (s or ms) → days. None when no field present.
+        pair_age_days = None
+        for k in _LISTING_INFO_KEYS:
+            raw = info.get(k)
+            if raw in (None, "", 0):
+                continue
+            try:
+                ts = float(raw)
+            except (TypeError, ValueError):
+                continue
+            if ts > 1e12:        # milliseconds → seconds
+                ts /= 1000.0
+            age = (time.time() - ts) / 86400.0
+            if age >= 0:
+                pair_age_days = age
+            break
+
+        return {"is_hip3": is_hip3, "pair_age_days": pair_age_days}
 
     async def close(self) -> None:
         ex = self._exchange

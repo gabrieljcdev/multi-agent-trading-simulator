@@ -363,6 +363,14 @@ class FundingArbAgent(BaseAgent):
             "would_enter":  bool(opp.depth_ok),
             "skip_reason":  skip_reason,
             "observation_only": True,
+            # Phase-3/4 columns (filtered until the migration adds them):
+            "legs":                     getattr(opp, "legs", "single"),
+            "is_long_tail":             bool(getattr(opp, "is_long_tail", False)),
+            "is_hip3":                  getattr(opp, "is_hip3", None),
+            "pair_age_days":            getattr(opp, "pair_age_days", None),
+            "spread_decay_bps_per_day": getattr(opp, "spread_decay_bps_per_day", None),
+            "oi_growth_pct_24h":        getattr(opp, "oi_growth_pct_24h", None),
+            "crowding_verdict":         getattr(opp, "crowding_verdict", None),
         }
         try:
             await asyncio.to_thread(db_queries.save_funding_observations, [row])
@@ -425,10 +433,16 @@ class FundingArbAgent(BaseAgent):
             "skip_reason":  skip_reason,
             "observation_only": True,
             # Phase-4 columns (filtered until the migration adds them):
-            "legs":                 "cross_venue",
-            "funding_interval_sec": opp.funding_interval_sec,
-            "taker_fee_bps":        opp.taker_fee_bps,
-            "maker_fee_bps":        opp.maker_fee_bps,
+            "legs":                     "cross_venue",
+            "funding_interval_sec":     opp.funding_interval_sec,
+            "taker_fee_bps":            opp.taker_fee_bps,
+            "maker_fee_bps":            opp.maker_fee_bps,
+            "is_long_tail":             bool(getattr(opp, "is_long_tail", False)),
+            "is_hip3":                  getattr(opp, "is_hip3", None),
+            "pair_age_days":            getattr(opp, "pair_age_days", None),
+            "spread_decay_bps_per_day": getattr(opp, "spread_decay_bps_per_day", None),
+            "oi_growth_pct_24h":        getattr(opp, "oi_growth_pct_24h", None),
+            "crowding_verdict":         getattr(opp, "crowding_verdict", None),
         }
         try:
             await asyncio.to_thread(db_queries.save_funding_observations, [row])
