@@ -318,6 +318,15 @@ class FundingArbAgent(BaseAgent):
         else:
             notional = notional_target
 
+        # Cross-venue carry (Phase 2): the engine already computed the
+        # interval-normalised spread and the net APR (fees + interval-risk
+        # buffer). would_enter applies the existing FUNDING_MIN_APR floor to
+        # projected_net_apr — |apr| >= floor, same semantics as single-venue
+        # filtering — and still requires both legs' depth. NOTHING is routed.
+        if getattr(opp, "legs", "single") == "cross_venue":
+            await self._log_cross_venue_observation(opp, notional)
+            return
+
         rate_8h         = opp.funding_apr / 1095.0
         interval_sec    = max(1.0, float(settings.FUNDING_SCAN_INTERVAL_SEC))
         intervals_per_8h = (8.0 * 3600.0) / interval_sec
@@ -359,6 +368,72 @@ class FundingArbAgent(BaseAgent):
             await asyncio.to_thread(db_queries.save_funding_observations, [row])
         except Exception as e:
             log.debug(f"[FundingArbAgent] save observation failed: {e}")
+
+    async def _log_cross_venue_observation(
+        self, opp: FundingOpportunity, notional: float,
+    ) -> None:
+        """Persist a cross-venue carry observation. OBSERVATION ONLY.
+
+        The engine pre-computed spread_apr (interval-normalised) and
+        projected_net_apr (net of round-trip fees + interval-risk buffer).
+        would_enter applies the FUNDING_MIN_APR floor to |projected_net_apr|
+        and still requires both legs' depth. The new columns (legs,
+        funding_interval_sec, fee bps) are filtered out by
+        save_funding_observations until the Phase-4 schema lands; the row
+        is still distinguishable now via venue_long != venue_short.
+        """
+        net_apr = float(opp.projected_net_apr or 0.0)
+        floor   = float(settings.FUNDING_MIN_APR)
+        would   = (abs(net_apr) >= floor) and bool(opp.depth_ok)
+
+        # Per-interval projected funding off the spread, mirroring the
+        # single-venue model so the SQL view stays self-consistent.
+        interval_sec     = max(1.0, float(settings.FUNDING_SCAN_INTERVAL_SEC))
+        intervals_per_8h = (8.0 * 3600.0) / interval_sec
+        rate_8h_equiv    = opp.spread_apr / 1095.0
+        per_interval     = notional * rate_8h_equiv / max(intervals_per_8h, 1e-9)
+
+        # Round-trip fee USD for the row, mirroring the engine's per-leg fee
+        # selection (maker preferred when required + available, else taker),
+        # entry+exit on both legs. opp.{maker,taker}_fee_bps are already the
+        # sum across the two legs.
+        use_maker     = bool(getattr(settings, "FUNDING_REQUIRE_MAKER_FEES", True))
+        leg_fee_sum   = opp.maker_fee_bps if (use_maker and opp.maker_fee_bps > 0) else opp.taker_fee_bps
+        projected_fees = notional * (2.0 * leg_fee_sum / 1e4)
+
+        skip_reason = "" if would else (
+            "depth_below_oi_mult" if not opp.depth_ok else "below_net_apr_floor"
+        )
+
+        row = {
+            "timestamp":    time.time(),
+            "symbol":       opp.symbol,
+            "variant":      opp.variant,
+            "venue_long":   opp.venue_long,
+            "venue_short":  opp.venue_short,
+            "funding_apr":  opp.spread_apr,        # the carry's effective funding
+            "spread_apr":   opp.spread_apr,
+            "oi_usd":       opp.oi_usd,
+            "depth_ok":     bool(opp.depth_ok),
+            "notional_usd": notional,
+            "margin_used":  notional / max(float(settings.FUNDING_TARGET_LEVERAGE), 1e-9),
+            "basis_at_entry": 0.0,
+            "projected_funding_per_interval": per_interval,
+            "projected_fees":                 projected_fees,
+            "projected_net_apr":              net_apr,
+            "would_enter":  would,
+            "skip_reason":  skip_reason,
+            "observation_only": True,
+            # Phase-4 columns (filtered until the migration adds them):
+            "legs":                 "cross_venue",
+            "funding_interval_sec": opp.funding_interval_sec,
+            "taker_fee_bps":        opp.taker_fee_bps,
+            "maker_fee_bps":        opp.maker_fee_bps,
+        }
+        try:
+            await asyncio.to_thread(db_queries.save_funding_observations, [row])
+        except Exception as e:
+            log.debug(f"[FundingArbAgent] save cross-venue observation failed: {e}")
 
     # ── Lifecycle housekeeping ──────────────────────────────────────────
 

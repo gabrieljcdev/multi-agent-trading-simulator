@@ -52,20 +52,37 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class FundingOpportunity:
-    """One funding-rate carry opportunity, scoped to a single (symbol, variant).
+    """One funding-rate carry opportunity.
 
-    Phase 1: variant is always "delta_neutral" and both venues are
-    "binance" (spot leg long, perp leg short). Phase 2 lifts this so
-    venue_long != venue_short opens the cross-venue cash-and-carry path.
+    Two shapes share this struct, distinguished by `legs`:
+
+      * legs="single"      — one venue's funding (the Phase-1 shape).
+        venue_long == venue_short; funding_apr is that venue's annualised
+        rate; spread_apr is the bid-ask leg cost (usually 0).
+      * legs="cross_venue" — Phase-2 delta-neutral carry across two venues
+        for the SAME symbol. venue_short is the richer-funding leg (short to
+        collect), venue_long the cheaper leg (long to stay delta-neutral).
+        funding_apr carries the spread (for sorting/coarse view), spread_apr
+        is funding_apr(short) − funding_apr(long) (annualised, so already
+        interval-normalised), and projected_net_apr nets out round-trip fees
+        + the interval-risk buffer. Nothing is placed on either leg.
     """
     symbol:      str
     variant:     str
     venue_long:  str
     venue_short: str
-    funding_apr: float          # annualised (rate_8h * 1095)
-    spread_apr: float           # bid-ask cost annualised (Phase 1: usually 0)
+    funding_apr: float          # single: venue rate; cross: spread (annualised)
+    spread_apr: float           # cross-venue funding spread (annualised)
     oi_usd:     float
     depth_ok:   bool
+    # ── cross-venue extensions (defaults keep the single-venue shape) ────
+    legs:                 str             = "single"
+    projected_net_apr:    Optional[float] = None    # spread − fees − interval-risk
+    funding_interval_sec: Optional[float] = None
+    taker_fee_bps:        float           = 0.0
+    maker_fee_bps:        float           = 0.0
+    funding_apr_long:     Optional[float] = None     # the long leg's annualised funding
+    funding_apr_short:    Optional[float] = None     # the short leg's annualised funding
 
 
 @dataclass
@@ -170,7 +187,103 @@ class FundingEngine:
         # this scan — drives the venue_health exit reason. (Matches the old
         # single-venue semantics: success → healthy, total failure → not.)
         self._venue_healthy = any_success or not self._venues
-        return self._filter(opps)
+
+        single = self._filter(opps)
+        # Phase 2 — cross-venue carry. Built from the SAME snapshot
+        # (self._last_quotes) so no extra fetch; observation-only.
+        cross = (
+            self._build_cross_venue()
+            if getattr(settings, "FUNDING_CROSS_VENUE_ENABLED", False)
+            else []
+        )
+        return single + cross
+
+    # ── Cross-venue carry (Phase 2) ─────────────────────────────────────
+
+    def _build_cross_venue(self) -> list[FundingOpportunity]:
+        """Build a delta-neutral cross-venue carry per symbol present on ≥2
+        available venues, from this scan's cached quotes.
+
+        Legs: short the richer-funding venue (collect funding), long the
+        cheaper one (stay delta-neutral). spread_apr differences the two
+        ANNUALISED funding rates — which is interval-normalised by
+        construction, because each quote was annualised through its own
+        funding_interval_sec (Binance 8h vs Hyperliquid 1h) before landing
+        here. projected_net_apr then nets fees + the interval-risk buffer.
+
+        OBSERVATION ONLY — this returns opportunities to log; nothing is
+        placed. The cross-venue open() leg map is a separate, gated build.
+        """
+        # symbol -> {venue_id: quote}
+        by_symbol: dict[str, dict[str, FundingQuote]] = {}
+        for (venue_id, symbol), q in self._last_quotes.items():
+            by_symbol.setdefault(symbol, {})[venue_id] = q
+
+        out: list[FundingOpportunity] = []
+        for symbol, venue_quotes in by_symbol.items():
+            if len(venue_quotes) < 2:
+                continue
+            items = list(venue_quotes.items())          # [(venue_id, quote)]
+            short_vid, short_q = max(items, key=lambda kv: kv[1].funding_apr)
+            long_vid,  long_q  = min(items, key=lambda kv: kv[1].funding_apr)
+            if short_vid == long_vid:
+                continue
+
+            spread_apr = short_q.funding_apr - long_q.funding_apr
+            net_apr    = self._cross_net_apr(spread_apr, long_q, short_q)
+
+            out.append(FundingOpportunity(
+                symbol=symbol,
+                variant="delta_neutral",
+                venue_long=long_vid,
+                venue_short=short_vid,
+                funding_apr=spread_apr,          # spread drives sort/coarse view
+                spread_apr=spread_apr,
+                oi_usd=min(long_q.oi_usd, short_q.oi_usd),   # the tighter leg caps size
+                depth_ok=(bool(short_q.depth_ok) and bool(long_q.depth_ok)),
+                legs="cross_venue",
+                projected_net_apr=net_apr,
+                funding_interval_sec=min(
+                    long_q.funding_interval_sec, short_q.funding_interval_sec,
+                ),
+                taker_fee_bps=short_q.taker_fee_bps + long_q.taker_fee_bps,
+                maker_fee_bps=short_q.maker_fee_bps + long_q.maker_fee_bps,
+                funding_apr_long=long_q.funding_apr,
+                funding_apr_short=short_q.funding_apr,
+            ))
+        return out
+
+    @staticmethod
+    def _cross_net_apr(
+        spread_apr: float, long_q: FundingQuote, short_q: FundingQuote,
+    ) -> float:
+        """projected_net_apr = spread_apr − round_trip_fees_apr − interval_risk.
+
+        round-trip fees = entry + exit on BOTH legs (4 fills). Maker fees are
+        preferred when FUNDING_REQUIRE_MAKER_FEES is set and a maker tier is
+        available (the documented ~1.3 bps/8h break-even assumes maker fills);
+        a leg with only a taker tier falls back to taker. Both the fee drag
+        and the interval-risk buffer are annualised over the assumed hold
+        (FUNDING_MAX_HOLD_SEC) — a per-hold haircut, consistent with the
+        single-venue fee model. funding_interval_sec is persisted so a future
+        calibration can switch the buffer to a per-interval accrual if the
+        soak data warrants; this stays the calibration seam.
+        """
+        use_maker = bool(getattr(settings, "FUNDING_REQUIRE_MAKER_FEES", True))
+
+        def _leg_fee(q: FundingQuote) -> float:
+            if use_maker and q.maker_fee_bps > 0:
+                return q.maker_fee_bps
+            return q.taker_fee_bps
+
+        rt_fee_bps = 2.0 * (_leg_fee(long_q) + _leg_fee(short_q))
+        hold = max(1.0, float(settings.FUNDING_MAX_HOLD_SEC))
+        year = 365.0 * 86400.0
+        rt_fees_apr = (rt_fee_bps / 1e4) * (year / hold)
+        buffer_apr  = (
+            float(settings.FUNDING_FUNDING_INTERVAL_RISK_BPS) / 1e4
+        ) * (year / hold)
+        return spread_apr - rt_fees_apr - buffer_apr
 
     async def open(self, opp: FundingOpportunity) -> None:
         """Open both legs of a delta-neutral carry concurrently.
