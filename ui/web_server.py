@@ -1157,7 +1157,35 @@ class WebServer:
             "live_trades":   self._snap_scalp_live(bot),
             "closed_trades": self._safe(
                 lambda: db_queries.get_scalp_trade_history(limit), []),
+            "fee_viability": self._snap_scalp_fee_viability(),
+            # Which fee leg gate 4 prices the round trip on — the taker-to-maker
+            # pivot. "maker" → round trip uses the 0% maker fee, so MEXC stays
+            # viable; "taker" would stand down at the real 5 bps.
+            "fee_basis":     "maker" if getattr(
+                settings, "SCALP_USE_MAKER_EXECUTION", False) else "taker",
         }
+
+    def _snap_scalp_fee_viability(self) -> dict:
+        """Per-venue maker-aware fee viability for the scalp page — the same
+        `fee_viability` block the entry gate (gate 4 / ScalpingAgent
+        ._fee_viability) and the Rich dashboard use, via the agent's
+        get_observation_summary(). {} when the scalp agent isn't reachable."""
+        coord = self._coordinator
+        agent = None
+        if coord is not None:
+            getter = getattr(coord, "get_agent", None)
+            if callable(getter):
+                try:
+                    agent = getter("scalp")
+                except Exception:
+                    agent = None
+        if agent is None:
+            return {}
+        try:
+            summary = agent.get_observation_summary() or {}
+            return summary.get("fee_viability", {}) or {}
+        except Exception:
+            return {}
 
     def _snap_scalp_live(self, bot) -> list:
         """Open scalp positions from the scalp agent's in-memory book, each with

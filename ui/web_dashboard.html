@@ -685,6 +685,23 @@ function scalpFeedHtml(scalp){
   scalp = scalp || {};
   const live = scalp.live_trades || [];
   const closed = scalp.closed_trades || [];
+  const fv = scalp.fee_viability || {};
+  const basis = scalp.fee_basis || "?";
+  const fvRows = Object.keys(fv).map(ex => {
+    const v = fv[ex] || {};
+    const ok = !!v.viable;
+    const wr = (v.breakeven_wr!=null) ? (v.breakeven_wr*100).toFixed(1)+"%" : "—";
+    const rt = (v.rt_bps!=null) ? v.rt_bps.toFixed(1) : "—";
+    const tp = (v.tp_bps!=null) ? v.tp_bps.toFixed(1) : "—";
+    const sl = (v.sl_bps!=null) ? v.sl_bps.toFixed(1) : "—";
+    return `<tr><td class="dim">${esc(ex)}</td>
+      <td><span class="tag ${ok?'win':'loss'}">${ok?'viable':'blocked'}</span></td>
+      <td>${rt}</td><td>${wr}</td><td class="dim">${tp}/${sl}</td></tr>`;
+  }).join("") || `<tr><td colspan="5" class="muted">no fee data yet</td></tr>`;
+  const viabCard = `<div class="card" style="margin-bottom:10px">
+      <h2>Fee Viability <span class="dim">(${esc(basis)} basis)</span></h2>
+      <div class="scroll"><table><thead><tr><th>ex</th><th>status</th><th>rt bps</th><th>breakeven WR</th><th>tp/sl bps</th></tr></thead>
+      <tbody>${fvRows}</tbody></table></div></div>`;
   const liveRows = live.map(x =>
     `<tr><td class="dim">${esc(x.exchange)}</td><td>${esc(x.symbol)}</td><td>${esc(x.direction)}</td>
      <td>${x.entry_price}</td><td class="${cls(x.unrealised_bps)}">${fmtBps(x.unrealised_bps)}</td>
@@ -698,7 +715,7 @@ function scalpFeedHtml(scalp){
       <td class="${cls(x.net_bps)}">${fmtBps(x.net_bps)}</td>
       <td class="dim">${esc(x.exit_reason)}</td><td class="${holdCls}">${x.hold_sec}s</td></tr>`;
   }).join("") || `<tr><td colspan="7" class="muted">no closed scalp trades yet</td></tr>`;
-  return `<div class="card" style="margin-bottom:10px"><h2>Live (${live.length})</h2>
+  return viabCard + `<div class="card" style="margin-bottom:10px"><h2>Live (${live.length})</h2>
       <div class="scroll"><table><thead><tr><th>ex</th><th>sym</th><th>dir</th><th>entry</th><th>unreal</th><th>hold</th></tr></thead>
       <tbody>${liveRows}</tbody></table></div></div>
     <div class="card"><h2>History (last ${closed.length})</h2>
