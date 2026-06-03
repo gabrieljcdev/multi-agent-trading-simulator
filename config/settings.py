@@ -347,7 +347,7 @@ ARB_FEE_MAP = {
     "gateio":   0.0020,
     "bitfinex": 0.0020,
     "bybit":    0.0010,
-    "mexc":     0.0000,    # 0% spot — confirmed standard rate (see SCALP_FEE_OVERRIDES)
+    "mexc":     0.0005,    # 0.05% taker — verified (scripts/mexc_fee_check.py); arb takes liquidity so taker applies, not the 0% maker
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
