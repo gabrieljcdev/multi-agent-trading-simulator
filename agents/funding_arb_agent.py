@@ -211,22 +211,7 @@ class FundingArbAgent(BaseAgent):
                 if not self._manually_halted:
                     opps = await self._engine.scan() or []
                     self._last_opps = list(opps)
-                    # Top N opportunities — sorted by APR descending so the
-                    # best carry wins when concurrency is constrained.
-                    opps.sort(key=lambda o: o.funding_apr, reverse=True)
-                    top = opps[: int(settings.FUNDING_MAX_CONCURRENT)]
-
-                    for opp in top:
-                        if self.observation_mode:
-                            await self._log_observation(opp)
-                            # ROUTE NO ORDERS. The agent stays in observation
-                            # mode until FUNDING_OBSERVATION_MODE is flipped.
-                            continue
-                        # Phase 1 should never reach this branch — gate enforced
-                        # both at the agent level and in engine.open().
-                        if opp.symbol in self._positions:
-                            continue
-                        await self._engine.open(opp)
+                    await self._dispatch_opps(opps)
 
                 await self._manage_open_positions()
                 self._check_daily_reset()
@@ -235,6 +220,44 @@ class FundingArbAgent(BaseAgent):
                 break
             except Exception as e:
                 log.exception(f"[FundingArbAgent] loop error: {e}")
+
+    async def _dispatch_opps(self, opps: list[FundingOpportunity]) -> None:
+        """Process one scan's opportunities: observe them (observation mode)
+        or open the top-FUNDING_MAX_CONCURRENT (live mode).
+
+        Sorted by APR descending so the best carry comes first — that
+        ordering decides both which pairs the live open-concurrency slice
+        takes and, under the observed cap, which rows survive truncation.
+
+        Observation mode persists the WHOLE discovered frontier this tick,
+        bounded only by FUNDING_MAX_OBSERVED_PER_SCAN — NOT the
+        FUNDING_MAX_CONCURRENT open-concurrency cap. The two are different
+        concerns: FUNDING_MAX_CONCURRENT bounds in-flight live opens, while
+        the observation layer needs every discovered pair logged so long-tail
+        / HIP-3 pairs accumulate the repeat per-pair samples their
+        crowding_verdict requires to leave UNKNOWN. Reusing the open cap here
+        starved them (only the top 2 pairs by APR were ever recorded).
+        ROUTE NO ORDERS in observation mode.
+        """
+        opps = sorted(opps, key=lambda o: o.funding_apr, reverse=True)
+
+        if self.observation_mode:
+            cap = int(settings.FUNDING_MAX_OBSERVED_PER_SCAN)
+            observed = opps[:cap] if cap > 0 else opps
+            for opp in observed:
+                await self._log_observation(opp)
+                # ROUTE NO ORDERS. The agent stays in observation mode until
+                # FUNDING_OBSERVATION_MODE is flipped.
+            return
+
+        # Live: the open-concurrency cap stays FUNDING_MAX_CONCURRENT — it
+        # bounds simultaneous opens, not what we observe. Phase 1 never
+        # reaches this branch (gate enforced both here and in engine.open()).
+        top = opps[: int(settings.FUNDING_MAX_CONCURRENT)]
+        for opp in top:
+            if opp.symbol in self._positions:
+                continue
+            await self._engine.open(opp)
 
     async def _manage_open_positions(self) -> None:
         """Sweep open positions and exit any that match a reason."""

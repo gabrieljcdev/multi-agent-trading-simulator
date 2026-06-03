@@ -497,6 +497,100 @@ async def test_observation_mode_zero_routing(monkeypatch, _force_observation):
 
 
 # ─────────────────────────────────────────────────────────────────────────
+# 14b. Observation logs the WHOLE frontier, not just FUNDING_MAX_CONCURRENT
+# ─────────────────────────────────────────────────────────────────────────
+# Regression: the loop reused FUNDING_MAX_CONCURRENT (the open-concurrency
+# cap, =2) to slice what it persisted, so only the top-2 pairs by APR were
+# ever written to funding_arb_observations — starving every long-tail/HIP-3
+# pair of the repeat samples its crowding_verdict needs to leave UNKNOWN.
+# _dispatch_opps now decouples the observation-write count
+# (FUNDING_MAX_OBSERVED_PER_SCAN) from the open cap.
+
+@pytest.mark.asyncio
+async def test_observation_logs_full_frontier_not_concurrency_cap(
+    monkeypatch, _force_observation,
+):
+    """Observation mode persists every discovered pair (up to
+    FUNDING_MAX_OBSERVED_PER_SCAN), not just top-FUNDING_MAX_CONCURRENT."""
+    monkeypatch.setattr(settings, "FUNDING_MAX_CONCURRENT", 2)
+    monkeypatch.setattr(settings, "FUNDING_MAX_OBSERVED_PER_SCAN", 100)
+
+    captured: list = []
+    monkeypatch.setattr(
+        "agents.funding_arb_agent.db_queries.save_funding_observations",
+        lambda rows: captured.extend(rows),
+    )
+    agent = FundingArbAgent(engine=_engine_with())
+    opps = [_opp(symbol=f"T{i}/USDT", funding_apr=0.10 + i * 0.001) for i in range(10)]
+    await agent._dispatch_opps(opps)
+
+    # All 10 logged — not capped at FUNDING_MAX_CONCURRENT (2).
+    assert len(captured) == 10
+    assert {r["symbol"] for r in captured} == {f"T{i}/USDT" for i in range(10)}
+
+
+@pytest.mark.asyncio
+async def test_observed_per_scan_cap_bounds_writes_to_best_apr(
+    monkeypatch, _force_observation,
+):
+    """FUNDING_MAX_OBSERVED_PER_SCAN bounds one tick's writes, keeping the
+    highest-APR pairs when it truncates."""
+    monkeypatch.setattr(settings, "FUNDING_MAX_OBSERVED_PER_SCAN", 3)
+    captured: list = []
+    monkeypatch.setattr(
+        "agents.funding_arb_agent.db_queries.save_funding_observations",
+        lambda rows: captured.extend(rows),
+    )
+    agent = FundingArbAgent(engine=_engine_with())
+    opps = [_opp(symbol=f"T{i}/USDT", funding_apr=0.10 + i * 0.001) for i in range(10)]
+    await agent._dispatch_opps(opps)
+
+    assert len(captured) == 3
+    # Sorted by APR desc → the three richest (T9, T8, T7) survive the cap.
+    assert {r["symbol"] for r in captured} == {"T9/USDT", "T8/USDT", "T7/USDT"}
+
+
+@pytest.mark.asyncio
+async def test_observed_per_scan_zero_means_unlimited(
+    monkeypatch, _force_observation,
+):
+    """A 0 cap means 'log every opp the scan returned'."""
+    monkeypatch.setattr(settings, "FUNDING_MAX_OBSERVED_PER_SCAN", 0)
+    captured: list = []
+    monkeypatch.setattr(
+        "agents.funding_arb_agent.db_queries.save_funding_observations",
+        lambda rows: captured.extend(rows),
+    )
+    agent = FundingArbAgent(engine=_engine_with())
+    opps = [_opp(symbol=f"T{i}/USDT", funding_apr=0.10 + i * 0.001) for i in range(25)]
+    await agent._dispatch_opps(opps)
+    assert len(captured) == 25
+
+
+@pytest.mark.asyncio
+async def test_live_mode_still_caps_opens_at_concurrency(monkeypatch):
+    """Decoupling observation writes must NOT widen the live open path —
+    live mode still opens only top-FUNDING_MAX_CONCURRENT by APR."""
+    monkeypatch.setattr(settings, "FUNDING_OBSERVATION_MODE", False)
+    monkeypatch.setattr(settings, "SIM_MODE", True)
+    monkeypatch.setattr(settings, "FUNDING_MAX_CONCURRENT", 2)
+
+    agent = FundingArbAgent(engine=_engine_with())
+    opened: list = []
+
+    async def _fake_open(opp):
+        opened.append(opp.symbol)
+
+    monkeypatch.setattr(agent._engine, "open", _fake_open)
+    opps = [_opp(symbol=f"T{i}/USDT", funding_apr=0.10 + i * 0.001) for i in range(10)]
+    await agent._dispatch_opps(opps)
+
+    # Only the top-2 by APR are opened, even though 10 were scanned.
+    assert len(opened) == 2
+    assert set(opened) == {"T9/USDT", "T8/USDT"}
+
+
+# ─────────────────────────────────────────────────────────────────────────
 # 15. daily-loss circuit breaker halts the loop
 # ─────────────────────────────────────────────────────────────────────────
 

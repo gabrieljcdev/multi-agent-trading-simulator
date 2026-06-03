@@ -291,7 +291,15 @@ FUNDING_SCAN_INTERVAL_SEC      = 60         # test: 30-300
 FUNDING_MIN_APR                = 0.06       # test: 0.03-0.30 (now |apr| >= floor)
 FUNDING_MIN_OI_MULT            = 10.0       # test: 5-50
 FUNDING_MAX_NOTIONAL_USD       = 250.0      # test: 100-5000
-FUNDING_MAX_CONCURRENT         = 2          # test: 1-5
+FUNDING_MAX_CONCURRENT         = 2          # test: 1-5  (open-concurrency cap; live only)
+# How many of a scan's opportunities the OBSERVATION loop persists per tick.
+# Decoupled from FUNDING_MAX_CONCURRENT (which bounds in-flight live opens):
+# the observation layer must log the WHOLE discovered frontier so long-tail /
+# HIP-3 pairs accumulate the repeat per-pair samples their crowding_verdict
+# needs to leave UNKNOWN. Discovery is already bounded by
+# FUNDING_MAX_DISCOVERED_PAIRS; this is the DB-write safety cap on top. 0 =
+# unlimited (log every opp the scan returns).
+FUNDING_MAX_OBSERVED_PER_SCAN  = 100        # test: 0, 25, 50, 100, 200  (0 = unlimited)
 FUNDING_MAX_OI_FRACTION        = 0.001      # test: 0.0005-0.01
 FUNDING_TARGET_LEVERAGE        = 2.0        # test: 1.5-3.0
 FUNDING_FLIP_EXIT_APR          = 0.0        # test: -0.05-0.03
