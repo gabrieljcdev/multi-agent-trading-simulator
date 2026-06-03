@@ -850,7 +850,12 @@ SCALP_MAX_BREAKEVEN_WIN_RATE = 0.65  # test: 0.55-0.75 (block if math needs >65%
 # Fee management
 SCALP_FEE_DEFAULT_BPS     = 10.0   # fallback if CCXT lookup fails (conservative)
 SCALP_FEE_OVERRIDES       = {      # overrides CCXT data where known to be wrong
-    "mexc":   {"maker": 0.0,  "taker": 0.0},    # 0% confirmed standard rate
+    # MEXC spot is 0% MAKER / 5 bps TAKER — verified via the live private
+    # fetch_trading_fee endpoint (scripts/mexc_fee_check.py, 2026-06-03), not
+    # 0/0. Scalping is only viable here on MAKER fills (SCALP_USE_MAKER_EXECUTION
+    # = True): gate 4 (_fee_viability) prices the round trip at the maker fee, so
+    # it stays viable; taker execution correctly stands down at this fee.
+    "mexc":   {"maker": 0.0,  "taker": 5.0},    # 0% maker / 0.05% taker (verified)
     "bitget": {"maker": 1.0,  "taker": 1.0},    # 0.01% confirmed
 }
 

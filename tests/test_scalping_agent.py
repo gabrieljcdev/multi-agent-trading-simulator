@@ -156,21 +156,20 @@ def test_ofi_uses_available_levels_when_book_shorter():
 def test_fee_manager_override_mexc():
     fm = FeeManager(settings.SCALP_FEE_OVERRIDES)
     fees = fm.get_fees("mexc", "BTC/USDT")
+    # Verified rate: 0% maker / 5 bps taker (scripts/mexc_fee_check.py).
     assert fees["maker_bps"] == 0.0
-    assert fees["taker_bps"] == 0.0
+    assert fees["taker_bps"] == 5.0
     assert fees["source"] == "override"
 
 
 def test_fee_manager_dynamic_tp_sl_mexc():
     fm = FeeManager(settings.SCALP_FEE_OVERRIDES)
     tp, sl = fm.compute_tp_sl("mexc", "BTC/USDT")
-    # MEXC = 0 bps round trip → tp = SCALP_NET_PROFIT_TARGET_BPS exactly,
-    # sl = tp / SCALP_RR_RATIO.
-    assert tp == pytest.approx(settings.SCALP_NET_PROFIT_TARGET_BPS)
-    assert sl == pytest.approx(
-        settings.SCALP_NET_PROFIT_TARGET_BPS / settings.SCALP_RR_RATIO,
-        rel=0.01,
-    )
+    # FeeManager is taker-based: MEXC 5 bps taker → 10 bps round trip →
+    # tp = round_trip + net_target. (Maker execution is handled in the agent.)
+    expected_tp = 10.0 + settings.SCALP_NET_PROFIT_TARGET_BPS
+    assert tp == pytest.approx(expected_tp)
+    assert sl == pytest.approx(expected_tp / settings.SCALP_RR_RATIO, rel=0.01)
 
 
 def test_fee_manager_dynamic_tp_sl_bitget():
@@ -182,11 +181,16 @@ def test_fee_manager_dynamic_tp_sl_bitget():
     assert sl == pytest.approx(expected_tp / settings.SCALP_RR_RATIO, rel=0.01)
 
 
-def test_fee_manager_viability_mexc_passes():
+def test_fee_manager_viability_mexc_taker_not_viable():
+    """FeeManager is taker-based: at MEXC's real 5 bps taker the 10 bps round
+    trip pushes breakeven WR past the cap, so the TAKER basis is not viable.
+    Maker execution is what keeps scalping viable on MEXC — see the agent's
+    maker-aware gate-4 tests (test_gate4_fee_viability_maker_vs_taker)."""
     fm = FeeManager(settings.SCALP_FEE_OVERRIDES)
     viable, reason = fm.is_viable("mexc", "BTC/USDT")
-    assert viable is True
-    assert reason == ""
+    assert viable is False
+    assert "mexc" in reason
+    assert "%" in reason
 
 
 def test_fee_manager_viability_high_fee_fails():
