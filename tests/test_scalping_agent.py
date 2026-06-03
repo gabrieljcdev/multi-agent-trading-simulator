@@ -871,3 +871,150 @@ async def test_micro_price_tracker_backfills_30s():
     assert obs.price_5m  == 0.0
     # Updated obs queued for flush.
     assert obs in agent._pending_flush
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# V3 — maker execution + microprice (gate 14) + toxicity (gate 15)
+# ─────────────────────────────────────────────────────────────────────────
+
+def _arm_ofi(agent, key: str = "BTC/USDT:mexc", direction: str = "LONG") -> None:
+    """Force the OFI engine into a fire-ready state for `direction` so the
+    entry path reaches the v3 gates (mirrors the inline setup other tests use)."""
+    eng = agent._ofi_engine
+    z = settings.SCALP_OFI_Z_ENTRY + 0.5
+    eng._last_z[key] = z if direction == "LONG" else -z
+    eng._last_tfi[key] = 1.0 if direction == "LONG" else -1.0
+    eng._last_bucket_close[key] = time.time()
+    eng._persist[key] = settings.SCALP_OFI_PERSIST_TICKS
+
+
+def test_maker_execution_prices_round_trip_at_maker_fee(monkeypatch):
+    """SCALP_USE_MAKER_EXECUTION prices the round trip at the MAKER fee
+    (maker_bps*2); with it off, the taker-based FeeManager value is used.
+    FeeManager itself is untouched — only the agent's fee basis pivots."""
+    agent = _agent_with_capital(0.0)
+    # Inject a fee where maker != taker so the source is unambiguous.
+    agent._fee_manager._cache["mexc"] = {
+        "BTC/USDT": {"maker_bps": 0.0, "taker_bps": 5.0, "source": "ccxt"},
+    }
+    monkeypatch.setattr(settings, "SCALP_USE_MAKER_EXECUTION", True)
+    assert agent._round_trip_bps("mexc", "BTC/USDT") == 0.0    # 0 maker * 2
+    monkeypatch.setattr(settings, "SCALP_USE_MAKER_EXECUTION", False)
+    assert agent._round_trip_bps("mexc", "BTC/USDT") == 10.0   # 5 taker * 2
+
+
+@pytest.mark.asyncio
+async def test_microprice_gate_passes_agreement(monkeypatch):
+    """Top-of-book imbalance agrees with OFI LONG (bid size > ask size →
+    microprice > mid) → gate 14 passes and the entry is logged."""
+    monkeypatch.setattr(settings, "SCALP_SESSION_START_UTC", 0)
+    monkeypatch.setattr(settings, "SCALP_SESSION_END_UTC", 24)
+    monkeypatch.setattr(settings, "SCALP_USE_CONFLUENCE", False)
+    monkeypatch.setattr(settings, "SCALP_USE_MICROPRICE_GATE", True)
+    monkeypatch.setattr(settings, "SCALP_USE_TOXICITY_GATE", False)
+    agent = _agent_with_capital(0.0)
+    agent._get_mid_price  = AsyncMock(return_value=50_000.0)
+    agent._get_spread_bps = AsyncMock(return_value=1.0)
+    agent._get_regime     = AsyncMock(return_value="TRENDING")
+    # bid_qty (9) >> ask_qty (1) → imbalance 0.9 → microprice above mid.
+    agent._ofi_engine.on_book("BTC/USDT", "mexc",
+                              [(49_999.0, 9.0)], [(50_001.0, 1.0)])
+    _arm_ofi(agent, direction="LONG")
+
+    await agent._evaluate_entry("BTC/USDT", "mexc")
+    obs = agent._observations[-1]
+    assert obs.would_entry is True
+
+
+@pytest.mark.asyncio
+async def test_microprice_gate_blocks_contradiction(monkeypatch):
+    """Ask size >> bid size → microprice < mid → contradicts OFI LONG →
+    gate 14 stands the entry down."""
+    monkeypatch.setattr(settings, "SCALP_SESSION_START_UTC", 0)
+    monkeypatch.setattr(settings, "SCALP_SESSION_END_UTC", 24)
+    monkeypatch.setattr(settings, "SCALP_USE_CONFLUENCE", False)
+    monkeypatch.setattr(settings, "SCALP_USE_MICROPRICE_GATE", True)
+    monkeypatch.setattr(settings, "SCALP_USE_TOXICITY_GATE", False)
+    agent = _agent_with_capital(0.0)
+    agent._get_mid_price  = AsyncMock(return_value=50_000.0)
+    agent._get_spread_bps = AsyncMock(return_value=1.0)
+    agent._get_regime     = AsyncMock(return_value="TRENDING")
+    # bid_qty (1) << ask_qty (9) → imbalance 0.1 → microprice below mid.
+    agent._ofi_engine.on_book("BTC/USDT", "mexc",
+                              [(49_999.0, 1.0)], [(50_001.0, 9.0)])
+    _arm_ofi(agent, direction="LONG")
+
+    await agent._evaluate_entry("BTC/USDT", "mexc")
+    obs = agent._observations[-1]
+    assert obs.would_entry is False
+    assert "Microprice" in obs.skip_reason
+    assert "BTC/USDT:mexc" not in agent._positions
+
+
+@pytest.mark.asyncio
+async def test_toxicity_gate_blocks_spread_spike(monkeypatch):
+    """Spread under the hard gate-9 cap but over SCALP_TOXICITY_SPREAD_BPS →
+    gate 15 stands down ('spread spike')."""
+    monkeypatch.setattr(settings, "SCALP_SESSION_START_UTC", 0)
+    monkeypatch.setattr(settings, "SCALP_SESSION_END_UTC", 24)
+    monkeypatch.setattr(settings, "SCALP_USE_CONFLUENCE", False)
+    monkeypatch.setattr(settings, "SCALP_USE_MICROPRICE_GATE", False)
+    monkeypatch.setattr(settings, "SCALP_USE_TOXICITY_GATE", True)
+    monkeypatch.setattr(settings, "SCALP_MAX_SPREAD_BPS", 100.0)     # gate 9 passes
+    monkeypatch.setattr(settings, "SCALP_TOXICITY_SPREAD_BPS", 5.0)
+    agent = _agent_with_capital(0.0)
+    agent._get_mid_price       = AsyncMock(return_value=50_000.0)
+    agent._get_spread_bps      = AsyncMock(return_value=20.0)        # > 5, < 100
+    agent._get_regime          = AsyncMock(return_value="TRENDING")
+    agent._get_symbol_move_bps = AsyncMock(return_value=0.0)         # vol normal
+    _arm_ofi(agent, direction="LONG")
+
+    await agent._evaluate_entry("BTC/USDT", "mexc")
+    obs = agent._observations[-1]
+    assert obs.would_entry is False
+    assert "spread spike" in obs.skip_reason
+
+
+@pytest.mark.asyncio
+async def test_toxicity_gate_blocks_vol_spike(monkeypatch):
+    """|1m mid move| over SCALP_TOXICITY_VOL_BPS → gate 15 stands down
+    ('volatility spike'). Uses BTC/USDT so gate 13's BTC guard is skipped."""
+    monkeypatch.setattr(settings, "SCALP_SESSION_START_UTC", 0)
+    monkeypatch.setattr(settings, "SCALP_SESSION_END_UTC", 24)
+    monkeypatch.setattr(settings, "SCALP_USE_CONFLUENCE", False)
+    monkeypatch.setattr(settings, "SCALP_USE_MICROPRICE_GATE", False)
+    monkeypatch.setattr(settings, "SCALP_USE_TOXICITY_GATE", True)
+    monkeypatch.setattr(settings, "SCALP_TOXICITY_VOL_BPS", 40.0)
+    agent = _agent_with_capital(0.0)
+    agent._get_mid_price       = AsyncMock(return_value=50_000.0)
+    agent._get_spread_bps      = AsyncMock(return_value=1.0)         # spread normal
+    agent._get_regime          = AsyncMock(return_value="TRENDING")
+    agent._get_symbol_move_bps = AsyncMock(return_value=80.0)        # > 40
+    _arm_ofi(agent, direction="LONG")
+
+    await agent._evaluate_entry("BTC/USDT", "mexc")
+    obs = agent._observations[-1]
+    assert obs.would_entry is False
+    assert "volatility spike" in obs.skip_reason
+
+
+@pytest.mark.asyncio
+async def test_toxicity_gate_passes_normal_conditions(monkeypatch):
+    """Normal spread + normal vol → gate 15 passes and the entry is logged."""
+    monkeypatch.setattr(settings, "SCALP_SESSION_START_UTC", 0)
+    monkeypatch.setattr(settings, "SCALP_SESSION_END_UTC", 24)
+    monkeypatch.setattr(settings, "SCALP_USE_CONFLUENCE", False)
+    monkeypatch.setattr(settings, "SCALP_USE_MICROPRICE_GATE", False)
+    monkeypatch.setattr(settings, "SCALP_USE_TOXICITY_GATE", True)
+    monkeypatch.setattr(settings, "SCALP_TOXICITY_SPREAD_BPS", 5.0)
+    monkeypatch.setattr(settings, "SCALP_TOXICITY_VOL_BPS", 40.0)
+    agent = _agent_with_capital(0.0)
+    agent._get_mid_price       = AsyncMock(return_value=50_000.0)
+    agent._get_spread_bps      = AsyncMock(return_value=1.0)         # < 5
+    agent._get_regime          = AsyncMock(return_value="TRENDING")
+    agent._get_symbol_move_bps = AsyncMock(return_value=5.0)         # < 40
+    _arm_ofi(agent, direction="LONG")
+
+    await agent._evaluate_entry("BTC/USDT", "mexc")
+    obs = agent._observations[-1]
+    assert obs.would_entry is True

@@ -953,6 +953,29 @@ SCALP_ATR_SL_MULTIPLIER  = 0.3    # test: 0.2-0.5
 SCALP_ATR_SL_FLOOR_BPS   = 1.5    # test: 1.0-3.0   (never tighter than this)
 SCALP_ATR_SL_CEILING_BPS = 8.0    # test: 6-12      (never wider than this)
 
+# ── Scalp v3: maker execution + microprice (gate 14) + toxicity (gate 15) ──
+# Taker-to-maker pivot. MEXC is 0% maker / 5 bps taker (verified by
+# scripts/mexc_fee_check.py), so executing as maker is what actually keeps the
+# round trip near zero — the 0/0 fee override only looks free if fills are
+# maker. These add an execution style + two confirmation gates ON TOP of gates
+# 1-13; the OFI math, the FeeManager, and gates 1-13 are unchanged. All
+# default-on, each individually toggleable.
+SCALP_USE_MAKER_EXECUTION = True   # test: True/False  (place limit/maker orders; price the round trip at the maker fee, not taker)
+
+# Gate 14 — Stoikov microprice fair-value filter. microprice = mid +
+# (imbalance - 0.5) * spread must sit on the OFI direction's side of mid
+# (LONG → above, SHORT → below); confirms resting size backs the move.
+SCALP_USE_MICROPRICE_GATE = True   # test: True/False
+
+# Gate 15 — toxicity stand-down. Adverse-selection risk spikes when the spread
+# blows out or the mid moves fast; stand down on either. Absolute thresholds,
+# fail-open on missing data. SCALP_TOXICITY_SPREAD_BPS is a softer ceiling than
+# the hard gate-9 cap (SCALP_MAX_SPREAD_BPS) and the vol arm also covers BTC
+# itself, which gate 13's BTC guard skips.
+SCALP_USE_TOXICITY_GATE   = True   # test: True/False
+SCALP_TOXICITY_SPREAD_BPS = 2.5    # test: 1.5-6.0  (stand down if top-of-book spread exceeds this)
+SCALP_TOXICITY_VOL_BPS    = 40.0   # test: 20-80    (stand down if |1m mid move| exceeds this, in bps)
+
 # Activation criteria — v1 (original) and v2 (tighter). Both readiness checks
 # read these; see database/queries.get_scalp_activation_readiness[_v2].
 SCALP_MIN_OBSERVATIONS_FOR_LIVE = 200

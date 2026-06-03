@@ -139,6 +139,10 @@ class ScalpPosition:
     # Sim Trade row id (set by _place_order when observation_only is False)
     # so _exit_position can close the same row. None in observation mode.
     trade_id:            Optional[int] = None
+    # Execution style — "maker" (limit) under SCALP_USE_MAKER_EXECUTION, else
+    # "taker". Drives the round-trip fee basis (round_trip_cost_bps above) and
+    # the order tag; "taker" default keeps every existing construction valid.
+    execution_style:     str = "taker"
 
 
 @dataclass
@@ -568,6 +572,20 @@ class OFIEngine:
         cross-exchange OFI gate discover other venues."""
         prefix = f"{symbol}:"
         return [k.split(":", 1)[1] for k in self._last_book if k.startswith(prefix)]
+
+    def top_of_book(self, symbol: str, exchange: str):
+        """Best (bid_price, bid_qty, ask_price, ask_qty) from the last book
+        snap for (symbol, exchange), or None if no book has been seen yet.
+
+        Read-only — does not touch OFI accumulation. Consumed by the
+        microprice fair-value gate (gate 14)."""
+        key = self._key(symbol, exchange)
+        snap = self._last_book.get(key)
+        if snap is None or not snap.bids or not snap.asks:
+            return None
+        bid_p, bid_q = snap.bids[0]
+        ask_p, ask_q = snap.asks[0]
+        return float(bid_p), float(bid_q), float(ask_p), float(ask_q)
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -1009,6 +1027,75 @@ class ScalpingAgent(BaseAgent):
                 return float(change)
         return 0.0
 
+    # ── v3: maker execution + microprice + toxicity helpers ─────────────
+
+    def _round_trip_bps(self, exchange: str, symbol: str) -> float:
+        """Round-trip fee bps used to size TP/SL and stamp the position's
+        round_trip_cost_bps.
+
+        The taker-to-maker pivot: under SCALP_USE_MAKER_EXECUTION both legs are
+        priced at the MAKER fee (limit fills pay maker), via the FeeManager's
+        cached fees — the FeeManager itself is unchanged (we only read it). With
+        maker execution off this is exactly the FeeManager's taker-based
+        round_trip_bps, so behaviour is identical when the flag is disabled.
+
+        NB: gate 4's fee-viability check (FeeManager.is_viable) is part of gates
+        1-13 and stays taker-based by contract; only the sizing/observation fee
+        basis pivots here."""
+        if getattr(settings, "SCALP_USE_MAKER_EXECUTION", False):
+            fees = self._fee_manager.get_fees(exchange, symbol)
+            return float(fees["maker_bps"]) * 2.0
+        return self._fee_manager.round_trip_bps(exchange, symbol)
+
+    async def _get_symbol_move_bps(self, symbol: str, exchange: str) -> float:
+        """|1-minute mid move| for (symbol, exchange) in bps — the toxicity
+        gate's volatility arm. Unlike gate 13 (BTC only, for alts) this reads
+        the symbol's OWN move, so it also stands down on a BTC vol spike.
+
+        0.0 when market_data is missing or has < 60s of history — fail-open, so
+        a cold feed never spuriously stands the agent down (mirrors
+        _get_btc_1m_change's permissive cold-start)."""
+        md = self._resolve_market_data()
+        if md is None or not hasattr(md, "get_change_pct"):
+            return 0.0
+        try:
+            change_pct = md.get_change_pct(exchange, symbol, 60)
+        except Exception as e:
+            log.debug("[ScalpingAgent] _get_symbol_move_bps failed: %s", e)
+            return 0.0
+        if change_pct is None:
+            return 0.0
+        return abs(float(change_pct)) * 100.0      # 1% = 100 bps
+
+    def _microprice_agrees(
+        self, symbol: str, exchange: str, direction: str,
+    ) -> tuple[bool, Optional[float], Optional[float]]:
+        """Stoikov microprice fair-value check for gate 14.
+
+            imbalance  = bid_size / (bid_size + ask_size)
+            microprice = mid + (imbalance - 0.5) * spread   (linear v1 approx)
+
+        Returns (agrees, microprice, mid). LONG requires microprice > mid (fair
+        value above mid confirms upward pressure), SHORT requires microprice <
+        mid. Fail-open (True, None, None) when no book / zero size / non-positive
+        spread is available, so a cold book doesn't block — consistent with the
+        gate's other permissive defaults."""
+        tob = self._ofi_engine.top_of_book(symbol, exchange)
+        if tob is None:
+            return True, None, None
+        bid_p, bid_q, ask_p, ask_q = tob
+        total = bid_q + ask_q
+        if total <= 0 or bid_p <= 0 or ask_p <= bid_p:
+            return True, None, None
+        mid    = (bid_p + ask_p) / 2.0
+        spread = ask_p - bid_p
+        microprice = mid + (bid_q / total - 0.5) * spread
+        if direction == "LONG":
+            return microprice > mid, microprice, mid
+        if direction == "SHORT":
+            return microprice < mid, microprice, mid
+        return True, microprice, mid
+
     async def _place_order(self, pos: "ScalpPosition") -> Optional[int]:
         """Execute a scalp entry.
 
@@ -1022,8 +1109,9 @@ class ScalpingAgent(BaseAgent):
         """
         if not settings.SIM_MODE:
             log.info(
-                "[ScalpingAgent] _place_order LIVE stub %s:%s %s $%.2f @ %.4f",
-                pos.symbol, pos.exchange, pos.direction, pos.size_usd, pos.entry_price,
+                "[ScalpingAgent] _place_order LIVE stub %s:%s %s [%s] $%.2f @ %.4f",
+                pos.symbol, pos.exchange, pos.direction, pos.execution_style,
+                pos.size_usd, pos.entry_price,
             )
             return None
 
@@ -1201,7 +1289,10 @@ class ScalpingAgent(BaseAgent):
         if ofi["direction"] not in ("LONG", "SHORT"):
             return
 
-        rt_bps = self._fee_manager.round_trip_bps(exchange, symbol)
+        # Maker-aware round trip (taker-to-maker pivot) — used for sizing and
+        # the recorded fee context. Identical to the FeeManager's taker value
+        # when SCALP_USE_MAKER_EXECUTION is off.
+        rt_bps = self._round_trip_bps(exchange, symbol)
 
         # 4. Fee viability
         viable, reason = self._fee_manager.is_viable(exchange, symbol)
@@ -1311,7 +1402,44 @@ class ScalpingAgent(BaseAgent):
                                spread_bps=spread_bps, regime=regime)
                 return
 
-        # ── Passed gates 1–13 ─────────────────────────────────────────
+        # 14. Microprice fair-value filter — the size-weighted Stoikov
+        # microprice must sit on the OFI direction's side of mid, confirming
+        # there's resting depth behind the move rather than transient flow.
+        # Fail-open when the book/spread isn't available yet (cold start).
+        if settings.SCALP_USE_MICROPRICE_GATE:
+            agrees, _micro, _mid = self._microprice_agrees(
+                symbol, exchange, ofi["direction"],
+            )
+            if not agrees:
+                self._log_skip(symbol, exchange, now, ofi=ofi,
+                               reason="Microprice contradicts OFI direction",
+                               rt_bps=rt_bps, min_wr=1.0,
+                               spread_bps=spread_bps, regime=regime)
+                return
+
+        # 15. Toxicity stand-down — adverse-selection risk spikes when the
+        # spread blows out OR the mid is moving fast. Stand down on either;
+        # absolute thresholds, fail-open on missing data. (Gate 9 is the hard
+        # spread cap; this is the softer toxicity ceiling plus a volatility arm
+        # that also covers BTC itself.)
+        if settings.SCALP_USE_TOXICITY_GATE:
+            if spread_bps > settings.SCALP_TOXICITY_SPREAD_BPS:
+                self._log_skip(symbol, exchange, now, ofi=ofi,
+                               reason=(f"Toxic: spread spike {spread_bps:.1f}bps > "
+                                       f"{settings.SCALP_TOXICITY_SPREAD_BPS}bps"),
+                               rt_bps=rt_bps, min_wr=1.0,
+                               spread_bps=spread_bps, regime=regime)
+                return
+            move_bps = await self._get_symbol_move_bps(symbol, exchange)
+            if move_bps > settings.SCALP_TOXICITY_VOL_BPS:
+                self._log_skip(symbol, exchange, now, ofi=ofi,
+                               reason=(f"Toxic: volatility spike {move_bps:.1f}bps 1m > "
+                                       f"{settings.SCALP_TOXICITY_VOL_BPS}bps"),
+                               rt_bps=rt_bps, min_wr=1.0,
+                               spread_bps=spread_bps, regime=regime)
+                return
+
+        # ── Passed gates 1–15 ─────────────────────────────────────────
         entry_price = await self._get_mid_price(symbol, exchange)
         if entry_price == 0.0:
             return     # market_data unwired — silent skip, no observation
@@ -1346,7 +1474,7 @@ class ScalpingAgent(BaseAgent):
         # ── ATR-aware TP/SL (replaces fee_manager.compute_tp_sl on pass) ─
         tpsl = self.atr_calc.compute_tp_sl_v2(
             symbol=symbol, exchange=exchange,
-            round_trip_bps=self._fee_manager.round_trip_bps(exchange, symbol),
+            round_trip_bps=self._round_trip_bps(exchange, symbol),
         )
         tp_bps, sl_bps = tpsl.tp_bps, tpsl.sl_bps
         min_wr = self._fee_manager.breakeven_win_rate(exchange, symbol,
@@ -1388,6 +1516,9 @@ class ScalpingAgent(BaseAgent):
             tp_bps=tp_bps, sl_bps=sl_bps,
             round_trip_cost_bps=rt_bps,
             observation_only=observation_only,
+            execution_style=("maker"
+                             if getattr(settings, "SCALP_USE_MAKER_EXECUTION", False)
+                             else "taker"),
         )
         self._positions[self._pos_key(symbol, exchange)] = pos
         self._stats["entries_today"] += 1
@@ -1400,8 +1531,10 @@ class ScalpingAgent(BaseAgent):
         else:
             pos.trade_id = await self._place_order(pos)
             log.info(
-                "[ScalpingAgent] ENTRY (SIM) %s:%s %s @ %.4f tp=%.4f sl=%.4f size=$%.2f",
-                symbol, exchange, direction, entry_price, tp_price, sl_price, pos.size_usd,
+                "[ScalpingAgent] ENTRY (SIM) %s:%s %s [%s] @ %.4f tp=%.4f sl=%.4f "
+                "size=$%.2f rt=%.1fbps",
+                symbol, exchange, direction, pos.execution_style,
+                entry_price, tp_price, sl_price, pos.size_usd, pos.round_trip_cost_bps,
             )
 
     @staticmethod
