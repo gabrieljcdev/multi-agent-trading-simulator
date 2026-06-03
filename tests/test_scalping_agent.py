@@ -175,8 +175,9 @@ def test_fee_manager_dynamic_tp_sl_mexc():
 def test_fee_manager_dynamic_tp_sl_bitget():
     fm = FeeManager(settings.SCALP_FEE_OVERRIDES)
     tp, sl = fm.compute_tp_sl("bitget", "BTC/USDT")
-    # Bitget = 2 bps round trip → tp = round_trip + net_target.
-    expected_tp = 2.0 + settings.SCALP_NET_PROFIT_TARGET_BPS
+    # Bitget = 20 bps taker (verified standard rate) → 40 bps round trip →
+    # tp = round_trip + net_target. (The old 1 bps entry was wrong by 20x.)
+    expected_tp = 40.0 + settings.SCALP_NET_PROFIT_TARGET_BPS
     assert tp == pytest.approx(expected_tp)
     assert sl == pytest.approx(expected_tp / settings.SCALP_RR_RATIO, rel=0.01)
 

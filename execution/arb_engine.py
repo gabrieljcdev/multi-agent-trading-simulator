@@ -117,8 +117,14 @@ def net_gap_pct(
 
 
 def min_gap_threshold(buy_ex: str, sell_ex: str) -> float:
-    """Bitget's ultra-low fee unlocks tighter thresholds; everywhere else
-    falls back to the conservative cross-exchange threshold."""
+    """Bitget legs use the tighter ARB_MIN_GAP_PCT; everywhere else falls back
+    to the conservative cross-exchange threshold.
+
+    NB: the original rationale ("bitget's ultra-low fee") rested on a wrong
+    0.01% fee entry — bitget's real standard rate is 0.2%/leg (ARB_FEE_MAP,
+    verified 2026-06-03). The special case stays SAFE because the threshold
+    applies to the NET gap (fees already subtracted via ARB_FEE_MAP); it just
+    means bitget-leg arbs now need ~0.49%+ gross and will fire rarely."""
     if "bitget" in (buy_ex, sell_ex):
         return settings.ARB_MIN_GAP_PCT
     return settings.ARB_MIN_GAP_PCT_FALLBACK

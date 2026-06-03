@@ -338,10 +338,14 @@ ARB_WATCH_PAIRS = [
     "OP/USDT",   "SUI/USDT",  "ATOM/USDT", "ADA/USDT",
 ]
 
-# Maker+taker effective fee per exchange (fractional, not %). bitget's
-# ultra-low fee is the reason ARB_MIN_GAP_PCT can be set to 0.03%.
+# Taker fee per leg per exchange (fractional, not %) — arb takes liquidity.
+# NB (2026-06-03): bitget's public symbols endpoint reports 0.2% maker/taker on
+# majors (0.1% on some alts) — the old 0.01% "game changer" entry was wrong by
+# 20x (scripts/exchange_fee_check.py bitget). ARB_MIN_GAP_PCT needs no change:
+# it is a NET-of-fees floor and these per-leg fees are subtracted before it
+# applies — but bitget-leg arbs now correctly need ~0.49%+ gross to clear it.
 ARB_FEE_MAP = {
-    "bitget":   0.0001,    # 0.01% — game changer
+    "bitget":   0.0020,    # 0.20% — verified public standard rate (was wrongly 0.01%)
     "kraken":   0.0026,
     "bitstamp": 0.0050,
     "gateio":   0.0020,
@@ -856,7 +860,12 @@ SCALP_FEE_OVERRIDES       = {      # overrides CCXT data where known to be wrong
     # = True): gate 4 (_fee_viability) prices the round trip at the maker fee, so
     # it stays viable; taker execution correctly stands down at this fee.
     "mexc":   {"maker": 0.0,  "taker": 5.0},    # 0% maker / 0.05% taker (verified)
-    "bitget": {"maker": 1.0,  "taker": 1.0},    # 0.01% confirmed
+    # Bitget: 0.2% maker AND taker on majors per the exchange's public symbols
+    # endpoint (scripts/exchange_fee_check.py bitget, 2026-06-03) — the old
+    # "0.01% confirmed" was wrong by 20x. Some alts are 0.1%; we pin the majors
+    # rate (conservative). 40bps round trip → breakeven WR 95.7% → bitget is
+    # un-scalpable on either fee basis; gate 4 now correctly blocks it.
+    "bitget": {"maker": 20.0, "taker": 20.0},   # 0.20% verified (was wrongly 0.01%)
 }
 
 # OFI signal parameters

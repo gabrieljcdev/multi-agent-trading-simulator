@@ -492,11 +492,16 @@ async def test_dynamic_sizing_scales_with_gap_width(monkeypatch):
     bind."""
     monkeypatch.setattr(settings, "ARB_WATCH_PAIRS", ["BTC/USDT"])
     monkeypatch.setattr(settings, "ARB_CAPITAL_PER_EXCHANGE", 1_000_000.0)
+    # Freeze the fee map at the values this synthetic scenario was engineered
+    # around — the test pins sizing MECHANICS (gap_ratio → multiplier), not
+    # production fees (bitget's real 0.2%/leg would make this gap net-negative).
+    monkeypatch.setattr(settings, "ARB_FEE_MAP",
+                        {"bitget": 0.0001, "kraken": 0.0026})
 
     # Deep book on both sides so 10% of depth ≫ dynamic size.
     a = _mock_exchange(asks=[[100.00, 1_000.0]] * 3, bids=[[ 99.99, 1_000.0]] * 3)
     # Build the sell side so the net gap is roughly 2× the bitget
-    # threshold after fees. bitget fee 0.0001 + kraken fee 0.0026 = 0.27pct
+    # threshold after fees. frozen fees: 0.0001 + 0.0026 = 0.27pct
     # → net = gross − 0.27. For 2× threshold (≈0.06%), gross ≈ 0.33%.
     sell_price = 100.0 * (1 + 0.0033)
     b = _mock_exchange(
