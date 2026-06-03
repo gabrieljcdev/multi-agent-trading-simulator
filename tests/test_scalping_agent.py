@@ -1018,3 +1018,63 @@ async def test_toxicity_gate_passes_normal_conditions(monkeypatch):
     await agent._evaluate_entry("BTC/USDT", "mexc")
     obs = agent._observations[-1]
     assert obs.would_entry is True
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# V3 — gate 4 maker-aware fee viability
+# ─────────────────────────────────────────────────────────────────────────
+
+def test_gate4_fee_viability_maker_vs_taker(monkeypatch):
+    """Gate-4 viability prices the round trip per SCALP_USE_MAKER_EXECUTION:
+    a 0-maker / 26-taker fee is viable as maker but blocked as taker. With
+    maker execution off it matches FeeManager.is_viable. FeeManager untouched."""
+    agent = _agent_with_capital(0.0)
+    agent._fee_manager._cache["mexc"] = {
+        "BTC/USDT": {"maker_bps": 0.0, "taker_bps": 26.0, "source": "ccxt"},
+    }
+    monkeypatch.setattr(settings, "SCALP_USE_MAKER_EXECUTION", True)
+    viable, reason, info = agent._fee_viability("mexc", "BTC/USDT")
+    assert viable is True
+    assert reason == ""
+    assert info["rt_bps"] == 0.0          # maker 0 * 2
+
+    monkeypatch.setattr(settings, "SCALP_USE_MAKER_EXECUTION", False)
+    viable, reason, info = agent._fee_viability("mexc", "BTC/USDT")
+    assert viable is False
+    assert "exceeds limit" in reason
+    assert info["rt_bps"] == 52.0         # taker 26 * 2
+
+
+@pytest.mark.asyncio
+async def test_gate4_blocks_taker_passes_maker_in_entry_flow(monkeypatch):
+    """End-to-end: a 0-maker / 26-taker fee stands the entry down at gate 4
+    under taker execution, but admits it under maker execution."""
+    monkeypatch.setattr(settings, "SCALP_SESSION_START_UTC", 0)
+    monkeypatch.setattr(settings, "SCALP_SESSION_END_UTC", 24)
+    monkeypatch.setattr(settings, "SCALP_USE_CONFLUENCE", False)
+    monkeypatch.setattr(settings, "SCALP_USE_MICROPRICE_GATE", False)
+    monkeypatch.setattr(settings, "SCALP_USE_TOXICITY_GATE", False)
+
+    def _mk():
+        a = _agent_with_capital(0.0)
+        a._fee_manager._cache["mexc"] = {
+            "BTC/USDT": {"maker_bps": 0.0, "taker_bps": 26.0, "source": "ccxt"},
+        }
+        a._get_mid_price  = AsyncMock(return_value=50_000.0)
+        a._get_spread_bps = AsyncMock(return_value=1.0)
+        a._get_regime     = AsyncMock(return_value="TRENDING")
+        _arm_ofi(a, direction="LONG")
+        return a
+
+    monkeypatch.setattr(settings, "SCALP_USE_MAKER_EXECUTION", False)
+    a_taker = _mk()
+    await a_taker._evaluate_entry("BTC/USDT", "mexc")
+    obs_t = a_taker._observations[-1]
+    assert obs_t.would_entry is False
+    assert "exceeds limit" in obs_t.skip_reason
+
+    monkeypatch.setattr(settings, "SCALP_USE_MAKER_EXECUTION", True)
+    a_maker = _mk()
+    await a_maker._evaluate_entry("BTC/USDT", "mexc")
+    obs_m = a_maker._observations[-1]
+    assert obs_m.would_entry is True

@@ -1039,13 +1039,42 @@ class ScalpingAgent(BaseAgent):
         maker execution off this is exactly the FeeManager's taker-based
         round_trip_bps, so behaviour is identical when the flag is disabled.
 
-        NB: gate 4's fee-viability check (FeeManager.is_viable) is part of gates
-        1-13 and stays taker-based by contract; only the sizing/observation fee
-        basis pivots here."""
+        Used by gate-4 viability (_fee_viability), TP/SL sizing, and the
+        recorded round_trip_cost_bps — all now share this one maker-aware
+        basis."""
         if getattr(settings, "SCALP_USE_MAKER_EXECUTION", False):
             fees = self._fee_manager.get_fees(exchange, symbol)
             return float(fees["maker_bps"]) * 2.0
         return self._fee_manager.round_trip_bps(exchange, symbol)
+
+    def _fee_viability(self, exchange: str, symbol: str) -> tuple[bool, str, dict]:
+        """Maker-aware fee viability for gate 4 (and the dashboard fee panel).
+
+        Mirrors FeeManager.is_viable's breakeven math exactly, but prices the
+        round trip through _round_trip_bps so the taker-to-maker pivot
+        (SCALP_USE_MAKER_EXECUTION) is reflected: at MEXC's 0% maker, maker
+        execution stays viable even after the taker override is corrected to the
+        real 5 bps, whereas the taker basis would block it. FeeManager is left
+        unchanged; with maker execution off this returns the same verdict and
+        reason string as FeeManager.is_viable.
+
+        Returns (viable, reason, info) where info carries rt/tp/sl/breakeven_wr
+        so callers don't recompute them."""
+        rt = self._round_trip_bps(exchange, symbol)
+        tp = rt + float(settings.SCALP_NET_PROFIT_TARGET_BPS)
+        rr = float(settings.SCALP_RR_RATIO)
+        sl = tp / rr if rr > 0 else tp
+        denom = tp + sl
+        be = (rt + sl) / denom if denom > 0 else 1.0
+        limit = float(settings.SCALP_MAX_BREAKEVEN_WIN_RATE)
+        info = {"rt_bps": rt, "tp_bps": tp, "sl_bps": sl, "breakeven_wr": be}
+        if be > limit:
+            return False, (
+                f"Fee breakeven {be:.1%} on {exchange} exceeds limit "
+                f"{limit:.1%} (round_trip={rt:.1f}bps, "
+                f"tp={tp:.1f}bps, sl={sl:.1f}bps)"
+            ), info
+        return True, "", info
 
     async def _get_symbol_move_bps(self, symbol: str, exchange: str) -> float:
         """|1-minute mid move| for (symbol, exchange) in bps — the toxicity
@@ -1294,8 +1323,10 @@ class ScalpingAgent(BaseAgent):
         # when SCALP_USE_MAKER_EXECUTION is off.
         rt_bps = self._round_trip_bps(exchange, symbol)
 
-        # 4. Fee viability
-        viable, reason = self._fee_manager.is_viable(exchange, symbol)
+        # 4. Fee viability — maker-aware (prices the round trip per
+        # SCALP_USE_MAKER_EXECUTION). FeeManager is unchanged; this matches
+        # FeeManager.is_viable when maker execution is off.
+        viable, reason, _fee_info = self._fee_viability(exchange, symbol)
         if not viable:
             self._log_skip(symbol, exchange, now, ofi=ofi,
                            reason=reason, rt_bps=rt_bps, min_wr=1.0,
@@ -1882,18 +1913,15 @@ class ScalpingAgent(BaseAgent):
             fee_viability: dict[str, dict] = {}
             for ex in settings.STRATEGY_EXCHANGE_MAP.get("scalp", []):
                 try:
-                    tp, sl = self._fee_manager.compute_tp_sl(ex, settings.SCALP_PAIRS[0])
-                    rt     = self._fee_manager.round_trip_bps(ex, settings.SCALP_PAIRS[0])
-                    be     = self._fee_manager.breakeven_win_rate(
-                        ex, settings.SCALP_PAIRS[0], tp, sl,
-                    )
-                    viable, _ = self._fee_manager.is_viable(ex, settings.SCALP_PAIRS[0])
+                    # Maker-aware, same basis as gate 4 — panel can't diverge
+                    # from the gate that actually admits the trade.
+                    viable, _reason, info = self._fee_viability(ex, settings.SCALP_PAIRS[0])
                     fee_viability[ex] = {
                         "viable":       bool(viable),
-                        "breakeven_wr": float(be),
-                        "tp_bps":       float(tp),
-                        "sl_bps":       float(sl),
-                        "rt_bps":       float(rt),
+                        "breakeven_wr": float(info["breakeven_wr"]),
+                        "tp_bps":       float(info["tp_bps"]),
+                        "sl_bps":       float(info["sl_bps"]),
+                        "rt_bps":       float(info["rt_bps"]),
                     }
                 except Exception:
                     fee_viability[ex] = {
