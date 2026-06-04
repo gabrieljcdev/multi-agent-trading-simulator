@@ -1492,12 +1492,15 @@ function ledRender(data, seq){
   const label = (TICKER_CFG.labels||{})[data.exchange] || data.exchange || "?";
   const rows = data.rows || [];
   const live = data.ok && rows.length > 0;
-  dot.className = "leddot " + (live ? "ok" : "bad");
-  status.textContent = `${label} · ${live ? rows.length + " pairs" : "no data"} · ${data.ts || "--:--:--"}`;
+  const warming = !live && data.error === "warming up";
+  dot.className = "leddot " + (live ? "ok" : (warming ? "wait" : "bad"));
+  status.textContent = `${label} · ${live ? rows.length + " pairs"
+    : (warming ? "warming up…" : "no data")} · ${data.ts || "--:--:--"}`;
   if (!live){
     ledRows = [];
     $("ledPage").textContent = "1/1";
-    grid.innerHTML = `<div class="ledbox lederr">no data from ${esc(label)}</div>`;
+    grid.innerHTML = `<div class="ledbox lederr">${esc(label)}: ` +
+      `${warming ? "warming up — first prices arrive within a minute" : "no data"}</div>`;
     return;
   }
   ledRows = rows;
