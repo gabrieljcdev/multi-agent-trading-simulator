@@ -6,7 +6,7 @@ All database table definitions using SQLAlchemy ORM.
 from datetime import datetime
 from sqlalchemy import (
     Column, Integer, Float, String, Boolean,
-    DateTime, Text, JSON, ForeignKey, Index
+    DateTime, Text, JSON, ForeignKey, Index, UniqueConstraint
 )
 from sqlalchemy.orm import DeclarativeBase, relationship
 
@@ -762,3 +762,195 @@ class CircuitBreakerLog(Base):
     detail      = Column(Text)
     auto_resume_at = Column(DateTime)  # When bot will auto-resume (if applicable)
     manually_resolved = Column(Boolean, default=False)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# OpportunityScannerAgent tables (PROTOCOL_OPPORTUNITIES)
+# ═══════════════════════════════════════════════════════════════════════
+#
+# Timestamp type: DateTime (UTC) for EVERY timestamp column here — a
+# deliberate choice. The audit flags that scalp_observations /
+# funding_arb_observations use Float epoch while everything else uses
+# DateTime, a join footgun; these tables stay with the dominant DateTime
+# convention. first_seen is IMMUTABLE after first insert (upsert helper
+# never rewrites it).
+#
+# TODO: new tables — fresh init_db creates them; existing databases run
+# scripts/migrate_opportunity_scanner.py (the project's migration
+# convention; there is no Alembic infrastructure in this repo).
+
+
+class OpportunityCore(Base):
+    """The shared, rank-comparable core — one row per detected opportunity.
+
+    Natural key (opp_type, protocol, chain, market_key) carries a REAL
+    UNIQUE constraint (not just an index) so concurrent re-detections
+    cannot race a duplicate row — the footgun the audit flags on the
+    scalp/funding observation tables is deliberately not repeated here.
+
+    Record-vs-enforce: disqualified rows are WRITTEN with risk_status =
+    "disqualified" and filtered only by the ranked-view read. The
+    exploration-lane columns (unconventional_*) never reorder the
+    standard view — they only feed the separate exploratory sort.
+    """
+    __tablename__ = "opportunity_core"
+
+    id                       = Column(Integer, primary_key=True)
+    opp_type                 = Column(String(20), nullable=False)  # liquidation | funding | lp | launch
+    protocol                 = Column(String(40), nullable=False)
+    chain                    = Column(String(20), nullable=False)
+    market_key               = Column(String(120), nullable=False) # per-type natural key (e.g. market address)
+    asset_class              = Column(String(20))                  # shared taxonomy (MARKET_VIEW §1)
+    detector_id              = Column(String(40), nullable=False)
+    first_seen               = Column(DateTime, nullable=False)    # UTC, IMMUTABLE after insert
+    competitor_count         = Column(Integer)
+    competitor_trend         = Column(String(15))                  # zero | rising_slow | rising_fast | saturated
+    competitor_count_history = Column(JSON)                        # [{ts, count}]
+    last_competition_check   = Column(DateTime)
+    edge_annualized_pct      = Column(Float)                       # None until enough events (no fabricated APR)
+    edge_confidence          = Column(String(10))                  # low | medium | high
+    risk_status              = Column(String(15))                  # survivable | disqualified
+    risk_flags               = Column(JSON)                        # [{flag, severity, detail}] red AND green
+    reachability_verdict     = Column(String(20))                  # reachable | unknown | unreachable
+    shark_constraints        = Column(JSON)
+    window_status            = Column(String(10))                  # opening | open | closing | closed
+    # Exploration lane (FEATURE BLOCK 6) — surfacing/study only; never
+    # gates, sizes, or reorders the standard view.
+    unconventional_score     = Column(Float)
+    unconventional_factors   = Column(JSON)                        # JSON array from the fixed vocabulary
+    unconventional_rationale = Column(Text)                        # free text the UI surfaces
+    as_of                    = Column(DateTime)
+    created_at               = Column(DateTime, default=datetime.utcnow)
+
+    observation = relationship("OpportunityObservation",
+                               back_populates="core", uselist=False)
+
+    __table_args__ = (
+        UniqueConstraint("opp_type", "protocol", "chain", "market_key",
+                         name="uq_opportunity_core_natural_key"),
+        Index("ix_opportunity_core_opp_type", "opp_type"),
+        Index("ix_opportunity_core_risk_status", "risk_status"),
+        Index("ix_opportunity_core_trend", "competitor_trend"),
+        Index("ix_opportunity_core_window", "window_status"),
+    )
+
+
+class OpportunityLiquidationDetail(Base):
+    """Typed detail for opp_type=liquidation — the only one populated
+    this pass (createmarket detector)."""
+    __tablename__ = "liquidation_detail"
+
+    id               = Column(Integer, primary_key=True)
+    core_id          = Column(Integer, ForeignKey("opportunity_core.id"), nullable=False)
+    collateral_asset = Column(String(40))
+    debt_asset       = Column(String(40))
+    lif_pct          = Column(Float)          # liquidation incentive factor, % per event
+    lltv             = Column(Float)
+    oracle_type      = Column(String(40))
+    bad_debt_history = Column(JSON)
+    dune_market_id   = Column(String(80))
+
+    __table_args__ = (
+        Index("ix_liquidation_detail_core", "core_id"),
+    )
+
+
+class OpportunityFundingDetail(Base):
+    """Typed detail for opp_type=funding — created empty this pass (the
+    funding detector is a stub; it will consume binance_futures /
+    bybit_derivs feeds, not a new HTTP stack)."""
+    __tablename__ = "funding_detail"
+
+    id                 = Column(Integer, primary_key=True)
+    core_id            = Column(Integer, ForeignKey("opportunity_core.id"), nullable=False)
+    venue_long         = Column(String(20))
+    venue_short        = Column(String(20))
+    funding_rate_bps   = Column(Float)
+    leg_spread_bps     = Column(Float)
+    open_interest_usd  = Column(Float)
+    payment_interval_h = Column(Float)
+
+    __table_args__ = (
+        Index("ix_funding_detail_core", "core_id"),
+    )
+
+
+class OpportunityLpDetail(Base):
+    """Typed detail for opp_type=lp — created empty this pass
+    (new_pool_detector is unresolved: noise floor open question §6)."""
+    __tablename__ = "lp_detail"
+
+    id               = Column(Integer, primary_key=True)
+    core_id          = Column(Integer, ForeignKey("opportunity_core.id"), nullable=False)
+    pool_address     = Column(String(60))
+    fee_tier         = Column(Float)
+    tvl_band         = Column(String(20))
+    historical_il_pct = Column(Float)
+    tick_spacing     = Column(Integer)
+
+    __table_args__ = (
+        Index("ix_lp_detail_core", "core_id"),
+    )
+
+
+class OpportunityLaunchDetail(Base):
+    """Typed detail for opp_type=launch — created empty this pass
+    (new_chain / new_perp detectors are stubs)."""
+    __tablename__ = "launch_detail"
+
+    id                 = Column(Integer, primary_key=True)
+    core_id            = Column(Integer, ForeignKey("opportunity_core.id"), nullable=False)
+    launch_type        = Column(String(20))
+    token_address      = Column(String(60))
+    age_hours          = Column(Float)
+    incentive_richness = Column(Float)
+    audit_status       = Column(String(20))
+
+    __table_args__ = (
+        Index("ix_launch_detail_core", "core_id"),
+    )
+
+
+class OpportunityObservation(Base):
+    """The hypothesis log (FEATURE BLOCK 5) — the multiple-comparisons
+    defence. One immutable decision-time row per opportunity, labels
+    backfilled later by a separate timed pass into SEPARATE columns
+    (features-now / labels-later, mirroring _future_price_tracker_loop).
+
+    feature_vector_json contains ONLY data available at/before
+    first_seen — NO look-ahead, ever. Every hypothesis is logged
+    (disqualified rows and non-events included) so detector precision
+    and the effective trial count are estimable later for the deflated
+    Sharpe / CPCV pass; detector_id + opp_type persist for that
+    clustering. DSR/CPCV themselves are NOT computed here.
+    """
+    __tablename__ = "opportunity_observation"
+
+    id                   = Column(Integer, primary_key=True)
+    core_id              = Column(Integer, ForeignKey("opportunity_core.id"),
+                                  nullable=False, unique=True)
+    detector_id          = Column(String(40), nullable=False)
+    opp_type             = Column(String(20), nullable=False)
+    first_seen           = Column(DateTime, nullable=False)
+    feature_vector_json  = Column(JSON)        # as-of-first_seen snapshot, never backfilled
+    detection_latency_ms = Column(Float)       # on-chain event → logged candidate (§1.3)
+    # Exploration lane, as captured at decision time (FEATURE BLOCK 6a).
+    unconventional_score        = Column(Float)
+    unconventional_factors_json = Column(JSON)
+    unconventional_rationale    = Column(Text)
+    # Forward labels — null at insert; filled ONLY by the backfill pass.
+    label_filled_at                = Column(DateTime)
+    realized_competitor_count_json = Column(JSON)   # {horizon_h: count}
+    realized_edge_decay_json       = Column(JSON)   # {horizon_h: edge_annualized_pct}
+    window_status_at_horizon_json  = Column(JSON)   # {horizon_h: status}
+    # Gate self-audit (FEATURE BLOCK 6c) — disqualified rows only; keyed
+    # by the red flag that disqualified. LOGS ONLY: never changes the
+    # gate verdict, never makes a row actionable.
+    counterfactual_outcome_json    = Column(JSON)
+
+    core = relationship("OpportunityCore", back_populates="observation")
+
+    __table_args__ = (
+        Index("ix_opportunity_obs_detector", "detector_id", "opp_type"),
+        Index("ix_opportunity_obs_first_seen", "first_seen"),
+    )

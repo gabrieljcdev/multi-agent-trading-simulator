@@ -367,6 +367,55 @@ ARB_FEE_MAP = {
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
+# OPPORTUNITY SCANNER AGENT ($0 observation mode — PROTOCOL_OPPORTUNITIES)
+# ══════════════════════════════════════════════════════════════════════════════
+# Edge-layer watcher: pluggable detectors → fatal-risk gate → trajectory-
+# ranked view, plus the hypothesis log that makes later DSR / CPCV rigour
+# mechanically possible. Places NO capital, opens NO positions. Values are
+# conservative starting points for observation sweeps, NOT derived truth —
+# the # TODO: calibrate ones are §6 open questions the observation phase
+# exists to answer.
+
+# Feature flags
+OPPORTUNITY_SCANNER_ENABLED = True        # master enable for the observation agent
+OPPORTUNITY_SHOW_DISQUALIFIED = False     # gate disqualified rows out of the default view (still written)
+
+# Detection cadence (per-detector refresh; createmarket is the only live one this pass)
+OPPORTUNITY_CREATEMARKET_REFRESH_SEC = 60     # test: 15-300   how often to scan for new lending markets
+OPPORTUNITY_DETECTION_LATENCY_SLA_MS = 60000  # test: 5000-300000  TODO: validate the SLA the detection layer is graded against (§6 open question) — a target to measure against, not a derived bound
+
+# createmarket detector data feed (Morpho Blue public GraphQL API — free, no
+# key; the detector reads market creations from it rather than adding a
+# parallel HTTP stack). Euler v2 / Silo seams stay in the detector as TODOs.
+OPPORTUNITY_MORPHO_API_URL = "https://blue-api.morpho.org/graphql"
+OPPORTUNITY_CREATEMARKET_LOOKBACK_H = 24      # test: 6-72     how young a market must be to count as "new"
+OPPORTUNITY_CREATEMARKET_PAGE_SIZE  = 100     # test: 25-200   markets pulled per scan (newest first)
+
+# Competition re-measurement
+OPPORTUNITY_COMPETITION_RECHECK_SEC = 1800    # test: 300-7200  re-measure competition (edge decays; stale = lie)
+OPPORTUNITY_COMPETITION_WINDOW_H = 72         # test: 24-168    trailing window for distinct-liquidator count
+
+# competitor_trend transition thresholds — TODO: VALIDATE against observed window closures; do NOT trust until calibrated (§6)
+OPPORTUNITY_TREND_RISING_SLOW_PER_DAY = 0.5   # test: 0.1-2.0   new competitors/day to leave "zero" → rising_slow  # TODO: calibrate
+OPPORTUNITY_TREND_RISING_FAST_PER_DAY = 2.0   # test: 1.0-6.0   new competitors/day → rising_fast (window closing)  # TODO: calibrate
+OPPORTUNITY_SATURATED_COUNT = 5               # test: 3-10      competitor count at which the window is saturated (doc: blacklist >3-5)  # TODO: calibrate
+
+# Edge normalization
+OPPORTUNITY_MIN_EVENTS_FOR_FREQUENCY = 5      # test: 3-20      liquidation events observed before annualizing one-shot edge; below this, edge_confidence="low" and no APR is fabricated
+
+# Hypothesis log / forward labels
+OPPORTUNITY_LABEL_HORIZONS_H = [24, 168, 720] # test: tune to window lifecycles  (1d / 7d / 30d — NOT intraday)
+OPPORTUNITY_LABEL_BACKFILL_SEC = 3600         # test: 900-7200  cadence of the separate label-backfill pass
+
+# Detector noise floor — TODO: new_pool_detector noise floor is unresolved (§6); not implemented this pass
+# OPPORTUNITY_LAUNCH_MIN_LIQUIDITY_USD = ...  # left commented until the new_pool_detector is designed
+
+# Exploration lane (FEATURE BLOCK 6) — observation-only; never gates, sizes, or acts
+OPPORTUNITY_EXPLORATION_ENABLED = True        # surface + study unconventional reads (still $0, never acts)
+OPPORTUNITY_UNCONVENTIONAL_MIN_SCORE = 0.3    # test: 0.1-0.6   score below which a row stays out of the exploratory view (noise floor for the lane)
+OPPORTUNITY_GATE_SELF_AUDIT_ENABLED = True    # log counterfactual outcomes on disqualified rows (6c) — LOGS ONLY, never loosens the gate
+
+# ══════════════════════════════════════════════════════════════════════════════
 # MOMENTUM SIGNAL (TRACK B)
 # ══════════════════════════════════════════════════════════════════════════════
 

@@ -353,14 +353,15 @@ let logFilter = "ALL";
 // Web UI v3 — every registered agent renders in the grid. The v2 filter
 // that hid arb/xchain/funding_arb/balance is gone now that each gets its
 // own detail page (rather than an inline dashboard panel).
-const AGENT_ORDER = ["signal","arb","scalp","xchain","funding_arb","balance"];
+const AGENT_ORDER = ["signal","arb","scalp","xchain","funding_arb","balance","opportunity_scanner"];
 const AGENT_NAME = {
   signal:"Signal Agent", arb:"Arb Agent", scalp:"Scalp Agent",
   xchain:"Cross-Chain Agent", funding_arb:"Funding-Rate Arb", balance:"Balance Agent",
+  opportunity_scanner:"Opportunity Scanner",
 };
 // Set of agent_ids that observe-but-don't-trade — renders the card at
 // 70% opacity (per v2 OBS convention) so the grid still reads scannable.
-const OBSERVATION_AGENTS = new Set(["xchain","funding_arb"]);
+const OBSERVATION_AGENTS = new Set(["xchain","funding_arb","opportunity_scanner"]);
 // Web UI v3 — null means "show the dashboard"; any agent_id means "show
 // that agent's detail page in place of the dashboard content". Lives in
 // JS memory only; survives WebSocket reconnects but resets on refresh.
@@ -1035,6 +1036,74 @@ function fundingPanelHtml(f){
     summary + reasonRow;
 }
 
+/* ---------- opportunity scanner panel (read-only; $0 observation) ----------
+   Two clearly-fenced views: the STANDARD trajectory-ranked actionable list
+   (every row LEADS with competitor trend; edge never renders without it) and
+   the EXPLORATORY lane (FEATURE BLOCK 6b) sorted by unconventional_score,
+   with the agent's free-text rationale rendered inline. They never merge.
+   No action controls — the panel surfaces reasoning only. */
+const OPP_TREND_CLS = {zero:"pos", rising_slow:"dim", rising_fast:"warn", saturated:"neg"};
+
+function oppRowsHtml(rows, exploratory){
+  rows = rows || [];
+  if(!rows.length) return `<span class="muted">no ${exploratory?"exploratory":"ranked"} opportunities yet</span>`;
+  const head = exploratory
+    ? `<tr><th>score</th><th>trend</th><th>market</th><th>edge</th><th>factors</th></tr>`
+    : `<tr><th>trend</th><th>edge</th><th>reach</th><th>window</th><th>market</th><th>first seen</th></tr>`;
+  const body = rows.map(r => {
+    const trend = r.competitor_trend || "—";
+    const tCls = OPP_TREND_CLS[trend] || "dim";
+    const trendCell = `<span class="${tCls}">${esc(trend)}</span>` +
+      ` <span class="dim">(${r.competitor_count==null?"?":r.competitor_count})</span>`;
+    const mkt = `${esc(r.protocol||"—")}/${esc(r.chain||"—")} ` +
+      `<span class="dim" title="${esc(r.market_key||"")}">${esc((r.market_key||"").slice(0,10))}…</span>`;
+    // edge_display already carries the "frequency unknown" marker when no
+    // honest APR exists — never invent a number client-side either.
+    const edge = esc(r.edge_display || "—");
+    if(exploratory){
+      const factors = (r.unconventional_factors||[])
+        .map(f => `<span class="tag">${esc(f)}</span>`).join(" ");
+      const rationale = r.unconventional_rationale
+        ? `<tr><td colspan="5" class="dim" style="font-size:11px;padding-left:18px">↳ ${esc(r.unconventional_rationale)}</td></tr>`
+        : ``;   // degrade gracefully: row renders without rationale
+      return `<tr><td>${(r.unconventional_score||0).toFixed(2)}</td>` +
+        `<td>${trendCell}</td><td>${mkt}</td><td>${edge}</td><td>${factors||"—"}</td></tr>` +
+        rationale;
+    }
+    return `<tr><td>${trendCell}</td><td>${edge}</td>` +
+      `<td class="dim">${esc(r.reachability_verdict||"unknown")}</td>` +
+      `<td class="dim">${esc(r.window_status||"—")}</td>` +
+      `<td>${mkt}</td><td class="dim">${esc((r.first_seen||"").slice(0,16))}</td></tr>`;
+  }).join("");
+  return `<table><thead>${head}</thead><tbody>${body}</tbody></table>`;
+}
+
+function opportunityPanelHtml(o){
+  o = o || {};
+  const s = o.summary || {};
+  const isObs = (o.status === "OBSERVATION");
+  const header = obsHeader(
+    `<b>OPPORTUNITY</b> · ${esc(o.status||"OFFLINE")} · $0 observation · ` +
+    `${s.n_core||0} tracked (${s.n_survivable||0} survivable / ` +
+    `${s.n_disqualified||0} disqualified) · ` +
+    `${s.n_observations||0} hypotheses (${s.n_labeled||0} labeled)`,
+    isObs,
+  );
+  const lat = statRow([
+    ["detect latency (session)", `${(s.session_detection_latency_ms||0).toFixed(0)}ms`],
+    ["detect latency (all)",     `${(s.mean_detection_latency_ms||0).toFixed(0)}ms`],
+    ["SLA",                      `${(s.detection_latency_sla_ms||0).toFixed(0)}ms`],
+    ["candidates (session)",     s.candidates_seen_session||0],
+  ]);
+  return header +
+    `<h2 class="dim" style="margin-top:8px">Actionable view — trajectory → edge → reachability</h2>` +
+    `<div class="scroll" style="max-height:220px">${oppRowsHtml(o.standard, false)}</div>` +
+    `<h2 class="dim" style="margin-top:10px">Exploration lane — unconventional reads ` +
+    `<span class="tag" title="Separate from the standard view; observation-only; never reorders or contaminates it">SEPARATE · OBSERVATION-ONLY</span></h2>` +
+    `<div class="scroll" style="max-height:220px">${oppRowsHtml(o.exploratory, true)}</div>` +
+    lat;
+}
+
 /* ---------- balance agent panel ---------- */
 function balancePanelHtml(b){
   if(!b) return `<span class="muted">balance agent not started</span>`;
@@ -1202,6 +1271,7 @@ function renderAgentDetail(state, id){
       case "xchain":      return xchainDetailHtml(state);
       case "funding_arb": return fundingDetailHtml(state);
       case "balance":     return balanceDetailHtml(state);
+      case "opportunity_scanner": return opportunityDetailHtml(state);
       default:            return `<span class="muted">unknown agent: ${esc(id)}</span>`;
     }
   });
@@ -1246,6 +1316,10 @@ function xchainDetailHtml(state){
 
 function fundingDetailHtml(state){
   return `<div class="card">${fundingPanelHtml(state.funding)}</div>`;
+}
+
+function opportunityDetailHtml(state){
+  return `<div class="card">${opportunityPanelHtml(state.opportunity)}</div>`;
 }
 
 function balanceDetailHtml(state){

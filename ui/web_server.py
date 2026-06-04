@@ -48,7 +48,8 @@ _VALID_MODES = ("per_trade", "window", "autonomous")
 # Agent ids that have a dedicated page. Matches REGISTERED_AGENTS exactly.
 # Web UI v2 dropped the macro / sentiment_agent / onchain placeholders;
 # added xchain / funding_arb / balance now that those agents are real.
-_VALID_AGENTS = ("signal", "arb", "scalp", "xchain", "funding_arb", "balance")
+_VALID_AGENTS = ("signal", "arb", "scalp", "xchain", "funding_arb", "balance",
+                 "opportunity_scanner")
 _SESSIONS = ("LONDON", "NEW_YORK", "ASIA", "OFF_HOURS")
 # Anchor city per session for the local clock + session-page header.
 _SESSION_TZ = {
@@ -1024,6 +1025,7 @@ class WebServer:
             "xchain":         self._snap_xchain(),
             "funding":        self._snap_funding(),
             "balance":        self._snap_balance(),
+            "opportunity":    self._snap_opportunity(),
         }
 
     # ── Web UI v2 panel snapshots ───────────────────────────────────────
@@ -1234,6 +1236,77 @@ class WebServer:
             out["today_summary"] = db_queries.get_funding_today_summary()
         except Exception as e:
             logger.debug("funding today_summary failed: %s", e)
+        return out
+
+    def _snap_opportunity(self) -> dict:
+        """Opportunity Scanner panel (READ-ONLY — surfaces reasoning,
+        exposes no action control).
+
+        Two clearly-fenced lists: `standard` is the trajectory-ranked
+        actionable view (survivors only by default, every row leading
+        with competitor_trend — edge never travels without it);
+        `exploratory` is the FEATURE BLOCK 6b lane sorted by
+        unconventional_score, carrying the free-text rationale the
+        operator reads inline. The two never merge. Every read is
+        defensive — one broken read never crashes render.
+        """
+        out = {
+            "status":      "OFFLINE",
+            "standard":    [],
+            "exploratory": [],
+            "summary": {
+                "n_core": 0, "n_survivable": 0, "n_disqualified": 0,
+                "n_observations": 0, "n_labeled": 0, "by_trend": {},
+                "mean_detection_latency_ms": 0.0,
+                "session_detection_latency_ms": 0.0,
+                "detection_latency_sla_ms": float(getattr(
+                    settings, "OPPORTUNITY_DETECTION_LATENCY_SLA_MS", 0.0)),
+                "candidates_seen_session": 0,
+            },
+        }
+        agent = self._get_agent("opportunity_scanner")
+        out["status"] = self._status_from(agent)
+
+        def _trim(row: dict) -> dict:
+            # Keep the snapshot light; competitor_trend ALWAYS rides
+            # beside the edge fields (render invariant).
+            return {
+                "opp_type":               row.get("opp_type"),
+                "protocol":               row.get("protocol"),
+                "chain":                  row.get("chain"),
+                "market_key":             row.get("market_key"),
+                "first_seen":             row.get("first_seen"),
+                "competitor_trend":       row.get("competitor_trend"),
+                "competitor_count":       row.get("competitor_count"),
+                "edge_annualized_pct":    row.get("edge_annualized_pct"),
+                "edge_confidence":        row.get("edge_confidence"),
+                "edge_display":           row.get("edge_display"),
+                "reachability_verdict":   row.get("reachability_verdict"),
+                "window_status":          row.get("window_status"),
+                "risk_status":            row.get("risk_status"),
+                "unconventional_score":   row.get("unconventional_score"),
+                "unconventional_factors": row.get("unconventional_factors") or [],
+                "unconventional_rationale": row.get("unconventional_rationale"),
+            }
+
+        try:
+            if agent is not None:
+                std = agent.get_ranked_view(mode="standard") or []
+                exp = agent.get_ranked_view(mode="exploratory") or []
+            else:
+                std = db_queries.get_ranked_opportunities(mode="standard")
+                exp = db_queries.get_ranked_opportunities(mode="exploratory")
+            out["standard"]    = [_trim(r) for r in std[:15]]
+            out["exploratory"] = [_trim(r) for r in exp[:15]]
+        except Exception as e:
+            logger.debug("opportunity ranked views failed: %s", e)
+        try:
+            if agent is not None:
+                out["summary"] = agent.get_observation_summary()
+            else:
+                out["summary"].update(db_queries.get_opportunity_summary())
+        except Exception as e:
+            logger.debug("opportunity summary failed: %s", e)
         return out
 
     def _snap_balance(self) -> dict:

@@ -18,6 +18,9 @@ from .models import (
     ScalpObservationModel,
     FundingArbObservationModel,
     XChainObservation,
+    OpportunityCore, OpportunityObservation,
+    OpportunityLiquidationDetail, OpportunityFundingDetail,
+    OpportunityLpDetail, OpportunityLaunchDetail,
 )
 
 
@@ -2534,3 +2537,374 @@ def get_fund_efficiency_summary(window_hours: int = 24) -> list[dict]:
         if r.starvation_event:
             bucket["starvation_events"] += 1
     return list(out.values())
+
+
+# ── OpportunityScannerAgent (observation mode — PROTOCOL_OPPORTUNITIES) ────
+
+# Mutable core fields a re-detection / re-measurement may update. first_seen
+# and created_at are DELIBERATELY absent — first_seen is immutable.
+_OPPORTUNITY_CORE_MUTABLE = {
+    "asset_class", "detector_id",
+    "competitor_count", "competitor_trend", "competitor_count_history",
+    "last_competition_check",
+    "edge_annualized_pct", "edge_confidence",
+    "risk_status", "risk_flags",
+    "reachability_verdict", "shark_constraints", "window_status",
+    "unconventional_score", "unconventional_factors", "unconventional_rationale",
+    "as_of",
+}
+
+_OPPORTUNITY_DETAIL_MODELS = {
+    "liquidation": OpportunityLiquidationDetail,
+    "funding":     OpportunityFundingDetail,
+    "lp":          OpportunityLpDetail,
+    "launch":      OpportunityLaunchDetail,
+}
+
+# Standard-view ordering (mirrors agents/opportunities/ranker.py — kept
+# local because queries.py cannot import the agents package without a
+# circular import; the ranker's tests pin both stay in sync).
+_TREND_RANK        = {"zero": 0, "rising_slow": 1, "rising_fast": 2, "saturated": 3}
+_REACHABILITY_RANK = {"reachable": 0, "unknown": 1, "unreachable": 2}
+
+
+def upsert_opportunity_core(row: dict) -> int:
+    """Insert an opportunity_core row on first sight; UPDATE mutable
+    fields on re-detection. Never touches first_seen or created_at after
+    the first insert (first_seen immutability is load-bearing for the
+    hypothesis log). Returns the core row id.
+
+    Natural key: (opp_type, protocol, chain, market_key) — a real UNIQUE
+    constraint backs it, so a concurrent duplicate insert raises
+    IntegrityError; we catch, re-read, and update instead.
+    """
+    from sqlalchemy.exc import IntegrityError
+    key = dict(
+        opp_type=row["opp_type"], protocol=row["protocol"],
+        chain=row["chain"], market_key=row["market_key"],
+    )
+    mutable = {k: v for k, v in row.items() if k in _OPPORTUNITY_CORE_MUTABLE}
+    with get_session() as s:
+        existing = s.query(OpportunityCore).filter_by(**key).first()
+        if existing is None:
+            core = OpportunityCore(
+                **key,
+                first_seen=row["first_seen"],
+                **mutable,
+            )
+            # Seed competition defaults on INSERT only — the detection
+            # path doesn't pass them, so a re-detection upsert can never
+            # clobber the re-measurement loop's values back to zero.
+            if core.competitor_count is None:
+                core.competitor_count = 0
+            if core.competitor_trend is None:
+                core.competitor_trend = "zero"
+            if core.window_status is None:
+                core.window_status = "opening"
+            if core.competitor_count_history is None:
+                core.competitor_count_history = []
+            s.add(core)
+            try:
+                s.flush()
+                return int(core.id)
+            except IntegrityError:
+                # Lost a concurrent-insert race — the UNIQUE constraint
+                # held; fall through to the update path on the winner row.
+                s.rollback()
+                existing = s.query(OpportunityCore).filter_by(**key).first()
+                if existing is None:
+                    raise
+        for k, v in mutable.items():
+            setattr(existing, k, v)
+        return int(existing.id)
+
+
+def save_opportunity_detail(opp_type: str, core_id: int, detail: dict) -> None:
+    """Route a typed detail dict to the right per-type table. One detail
+    row per core row — re-detection updates in place. Unknown keys are
+    filtered (mirrors save_funding_observations' allowed-set style)."""
+    model = _OPPORTUNITY_DETAIL_MODELS.get(opp_type)
+    if model is None:
+        return
+    cols = {c.name for c in model.__table__.columns} - {"id", "core_id"}
+    payload = {k: v for k, v in (detail or {}).items() if k in cols}
+    with get_session() as s:
+        existing = s.query(model).filter_by(core_id=core_id).first()
+        if existing is None:
+            s.add(model(core_id=core_id, **payload))
+        else:
+            for k, v in payload.items():
+                setattr(existing, k, v)
+
+
+def save_opportunity_observation(row: dict) -> None:
+    """Write the immutable decision-time snapshot ONCE (hypothesis log).
+
+    UNIQUE on core_id: a re-detection never rewrites the feature vector —
+    no look-ahead may leak into it. Label columns stay null here; only
+    update_opportunity_labels fills them.
+    """
+    with get_session() as s:
+        existing = (
+            s.query(OpportunityObservation)
+            .filter_by(core_id=row["core_id"])
+            .first()
+        )
+        if existing is not None:
+            return
+        s.add(OpportunityObservation(
+            core_id=row["core_id"],
+            detector_id=row["detector_id"],
+            opp_type=row["opp_type"],
+            first_seen=row["first_seen"],
+            feature_vector_json=row.get("feature_vector_json"),
+            detection_latency_ms=row.get("detection_latency_ms"),
+            unconventional_score=row.get("unconventional_score"),
+            unconventional_factors_json=row.get("unconventional_factors_json"),
+            unconventional_rationale=row.get("unconventional_rationale"),
+        ))
+
+
+def update_opportunity_labels(core_id: int, horizon_h: int, labels: dict) -> None:
+    """Backfill forward labels for one horizon — the SEPARATE scheduled
+    pass (features-now / labels-later). Merges {horizon_h: value} into
+    each label JSON column so multiple horizons accumulate in place.
+
+    For disqualified rows the same pass also writes
+    counterfactual_outcome_json (FEATURE BLOCK 6c) — LOGS ONLY; the gate
+    verdict and both ranked views are unchanged by anything written here.
+    """
+    h = str(int(horizon_h))
+    with get_session() as s:
+        obs = (
+            s.query(OpportunityObservation)
+            .filter_by(core_id=core_id)
+            .first()
+        )
+        if obs is None:
+            return
+        for col, key in (
+            ("realized_competitor_count_json", "realized_competitor_count"),
+            ("realized_edge_decay_json",       "realized_edge_decay"),
+            ("window_status_at_horizon_json",  "window_status_at_horizon"),
+        ):
+            if key in labels:
+                merged = dict(getattr(obs, col) or {})
+                merged[h] = labels[key]
+                setattr(obs, col, merged)
+        if "counterfactual_outcome" in labels:
+            merged = dict(obs.counterfactual_outcome_json or {})
+            merged[h] = labels["counterfactual_outcome"]
+            obs.counterfactual_outcome_json = merged
+        obs.label_filled_at = datetime.utcnow()
+
+
+def record_competition_check(core_id: int, count: int, trend: str,
+                             history_append: list,
+                             window_status: Optional[str] = None) -> None:
+    """The re-measurement write: competitor_count / trend / history /
+    last_competition_check. Never touches first_seen."""
+    with get_session() as s:
+        core = s.query(OpportunityCore).filter_by(id=core_id).first()
+        if core is None:
+            return
+        core.competitor_count = int(count)
+        core.competitor_trend = trend
+        history = list(core.competitor_count_history or [])
+        history.extend(history_append or [])
+        core.competitor_count_history = history
+        core.last_competition_check = datetime.utcnow()
+        if window_status is not None:
+            core.window_status = window_status
+
+
+def get_open_opportunity_cores(limit: int = 200) -> list[dict]:
+    """Core rows whose window is not closed — the re-measurement loop's
+    work list. Plain dicts, detached from the session."""
+    with get_session() as s:
+        rows = (
+            s.query(OpportunityCore)
+            .filter(OpportunityCore.window_status != "closed")
+            .order_by(OpportunityCore.last_competition_check.asc())
+            .limit(limit)
+            .all()
+        )
+        return [_opportunity_core_to_dict(r) for r in rows]
+
+
+def get_opportunity_observations_needing_labels(horizon_h: int,
+                                                limit: int = 200) -> list[dict]:
+    """Observation rows whose first_seen is at least horizon_h old and
+    whose label set for that horizon is still missing. Drives the
+    label-backfill pass."""
+    h = str(int(horizon_h))
+    cutoff = datetime.utcnow() - timedelta(hours=int(horizon_h))
+    out = []
+    with get_session() as s:
+        rows = (
+            s.query(OpportunityObservation)
+            .filter(OpportunityObservation.first_seen <= cutoff)
+            .limit(limit * 4)   # coarse pre-filter; horizon check below
+            .all()
+        )
+        for r in rows:
+            filled = r.window_status_at_horizon_json or {}
+            if h in filled:
+                continue
+            out.append({
+                "core_id":     r.core_id,
+                "detector_id": r.detector_id,
+                "opp_type":    r.opp_type,
+                "first_seen":  r.first_seen,
+            })
+            if len(out) >= limit:
+                break
+    return out
+
+
+def _opportunity_core_to_dict(r) -> dict:
+    return {
+        "id":                       r.id,
+        "opp_type":                 r.opp_type,
+        "protocol":                 r.protocol,
+        "chain":                    r.chain,
+        "market_key":               r.market_key,
+        "asset_class":              r.asset_class,
+        "detector_id":              r.detector_id,
+        "first_seen":               r.first_seen.isoformat() if r.first_seen else None,
+        "competitor_count":         r.competitor_count,
+        "competitor_trend":         r.competitor_trend,
+        "competitor_count_history": r.competitor_count_history or [],
+        "last_competition_check":   (r.last_competition_check.isoformat()
+                                     if r.last_competition_check else None),
+        "edge_annualized_pct":      r.edge_annualized_pct,
+        "edge_confidence":          r.edge_confidence,
+        "risk_status":              r.risk_status,
+        "risk_flags":               r.risk_flags or [],
+        "reachability_verdict":     r.reachability_verdict,
+        "shark_constraints":        r.shark_constraints,
+        "window_status":            r.window_status,
+        "unconventional_score":     r.unconventional_score,
+        "unconventional_factors":   r.unconventional_factors or [],
+        "unconventional_rationale": r.unconventional_rationale,
+    }
+
+
+def get_ranked_opportunities(mode: str = "standard",
+                             show_disqualified: bool = False,
+                             limit: int = 50) -> list[dict]:
+    """The actionable view read (dashboard + agent).
+
+    mode="standard"    — trajectory (headline) → edge (secondary) →
+                         reachability (tie-break). Time dominates
+                         magnitude: a zero-competitor survivor outranks
+                         a fatter edge whose competitor count jumped.
+    mode="exploratory" — FEATURE BLOCK 6b: same survivor set, sorted by
+                         unconventional_score then factor richness; rows
+                         below OPPORTUNITY_UNCONVENTIONAL_MIN_SCORE are
+                         excluded. The two views NEVER merge.
+
+    Disqualified rows are excluded from BOTH views unless
+    show_disqualified=True (record-vs-enforce: the gate filters the
+    view, not the write). Every returned row carries competitor_trend —
+    edge is never surfaced without trajectory adjacent.
+    """
+    from config import settings
+    with get_session() as s:
+        q = s.query(OpportunityCore)
+        if not show_disqualified:
+            q = q.filter(OpportunityCore.risk_status == "survivable")
+        rows = [_opportunity_core_to_dict(r) for r in q.all()]
+
+    if mode == "exploratory":
+        floor = float(getattr(settings, "OPPORTUNITY_UNCONVENTIONAL_MIN_SCORE", 0.3))
+        rows = [r for r in rows if (r["unconventional_score"] or 0.0) >= floor]
+        rows.sort(key=lambda r: (
+            -(r["unconventional_score"] or 0.0),
+            -len(r["unconventional_factors"] or []),
+        ))
+    else:
+        rows.sort(key=lambda r: (
+            _TREND_RANK.get(r["competitor_trend"], len(_TREND_RANK)),
+            -(r["edge_annualized_pct"]
+              if r["edge_annualized_pct"] is not None else float("-inf")),
+            _REACHABILITY_RANK.get(r["reachability_verdict"],
+                                   _REACHABILITY_RANK["unknown"]),
+        ))
+    return rows[:limit]
+
+
+def get_opportunity_summary() -> dict:
+    """Aggregate stats for the dashboard panel. Zeroed defaults on any
+    hiccup — panel render treats zeros as 'no data yet'."""
+    out = {
+        "n_core":          0,
+        "n_survivable":    0,
+        "n_disqualified":  0,
+        "n_observations":  0,
+        "n_labeled":       0,
+        "by_trend":        {},
+        "mean_detection_latency_ms": 0.0,
+    }
+    try:
+        with get_session() as s:
+            cores = s.query(OpportunityCore).all()
+            out["n_core"] = len(cores)
+            out["n_survivable"] = sum(
+                1 for c in cores if c.risk_status == "survivable")
+            out["n_disqualified"] = sum(
+                1 for c in cores if c.risk_status == "disqualified")
+            by_trend: dict[str, int] = {}
+            for c in cores:
+                if c.competitor_trend:
+                    by_trend[c.competitor_trend] = by_trend.get(c.competitor_trend, 0) + 1
+            out["by_trend"] = by_trend
+            obs = s.query(OpportunityObservation).all()
+            out["n_observations"] = len(obs)
+            out["n_labeled"] = sum(1 for o in obs if o.label_filled_at is not None)
+            lats = [o.detection_latency_ms for o in obs
+                    if o.detection_latency_ms is not None]
+            if lats:
+                out["mean_detection_latency_ms"] = sum(lats) / len(lats)
+    except Exception:
+        pass
+    return out
+
+
+def get_opportunity_core_by_id(core_id: int) -> Optional[dict]:
+    """One core row as a dict (None if missing) — the label-backfill
+    pass reads current state through this."""
+    with get_session() as s:
+        r = s.query(OpportunityCore).filter_by(id=core_id).first()
+        return _opportunity_core_to_dict(r) if r is not None else None
+
+
+def get_disqualified_opportunity_cores(limit: int = 200) -> list[dict]:
+    """Disqualified rows for the gate self-audit backfill (6c). Read
+    only — nothing here can make a row actionable."""
+    with get_session() as s:
+        rows = (
+            s.query(OpportunityCore)
+            .filter(OpportunityCore.risk_status == "disqualified")
+            .limit(limit)
+            .all()
+        )
+        return [_opportunity_core_to_dict(r) for r in rows]
+
+
+def get_opportunity_detail(opp_type: str, core_id: int) -> dict:
+    """Typed detail row as a dict; safe empty dict when missing
+    (graceful degradation for the dashboard read)."""
+    model = _OPPORTUNITY_DETAIL_MODELS.get(opp_type)
+    if model is None:
+        return {}
+    try:
+        with get_session() as s:
+            r = s.query(model).filter_by(core_id=core_id).first()
+            if r is None:
+                return {}
+            return {c.name: getattr(r, c.name)
+                    for c in model.__table__.columns
+                    if c.name not in ("id", "core_id")}
+    except Exception:
+        return {}

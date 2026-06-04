@@ -493,6 +493,7 @@ from agents.scalping_agent import ScalpingAgent
 from agents.crosschain_agent import CrossChainArbAgent
 from agents.balance_agent import BalanceAgent
 from agents.funding_arb_agent import FundingArbAgent
+from agents.opportunity_scanner_agent import OpportunityScannerAgent
 
 
 REGISTERED_AGENTS: list[BaseAgent] = [
@@ -502,6 +503,9 @@ REGISTERED_AGENTS: list[BaseAgent] = [
     CrossChainArbAgent(),
     FundingArbAgent(),
     BalanceAgent(),
+    # $0 observation-mode edge watcher — capital_allocation = 0.0, so the
+    # _check_capital_sum() invariant is untouched.
+    OpportunityScannerAgent(),
     # Add new agents here (instances).
 ]
 
@@ -516,4 +520,5 @@ __all__ = [
     "CrossChainArbAgent",
     "FundingArbAgent",
     "BalanceAgent",
+    "OpportunityScannerAgent",
 ]
