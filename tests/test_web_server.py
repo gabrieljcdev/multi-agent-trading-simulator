@@ -1212,15 +1212,18 @@ def _seed_ticker_cache(ws: WebServer, exchange: str, rows: list) -> dict:
     return payload
 
 
-def test_ticker_rows_from_bulk_sorts_and_caps():
-    """Row builder: dollar-quoted pairs ranked by 24h volume, capped at the
-    grid capacity, highest-volume entries surviving the cap."""
-    cap = settings.TICKER_GRID_BOXES * settings.TICKER_ROWS_PER_BOX
-    rows = WebServer._ticker_rows_from_bulk(_bulk_tickers(300), ("USD",), cap)
-    assert len(rows) == cap
+def test_ticker_rows_from_bulk_sorts_and_carries_volume():
+    """Row builder: dollar-quoted pairs ranked by 24h volume. Default is
+    UNCAPPED (all pairs ship; the grid paginates client-side), each row
+    carrying its 24h quote volume; an explicit cap still truncates."""
+    rows = WebServer._ticker_rows_from_bulk(_bulk_tickers(300), ("USD",))
+    assert len(rows) == 300                                      # all pairs
     assert [r["coin"] for r in rows[:3]] == ["C0", "C1", "C2"]   # volume order
     assert rows[0]["price"] == pytest.approx(100.0)
     assert rows[0]["pct"] == pytest.approx(1.5)
+    assert rows[0]["vol"] == pytest.approx(300_000.0)            # volume metric
+    capped = WebServer._ticker_rows_from_bulk(_bulk_tickers(300), ("USD",), cap=80)
+    assert len(capped) == 80
 
 
 def test_ticker_rows_from_bulk_skips_unusable():
@@ -1347,3 +1350,50 @@ async def test_ticker_worker_refresh_writes_cache_and_sticky_on_error(monkeypatc
     await worker._refresh_venue(ccxt_stub, clients, "kraken")
     _, payload2 = ws._ticker_cache["kraken"]
     assert payload2 == payload
+
+
+# ── Coin-logo proxy (GET /api/coinlogo/{coin}) ─────────────────────────────
+
+@pytest.mark.asyncio
+async def test_coinlogo_served_from_cache():
+    """A cached logo is served as SVG with browser caching — no upstream
+    fetch on the request path once cached."""
+    ws = WebServer(coordinator=None, bot=None)
+    ws._logo_cache["btc"] = b"<svg>btc</svg>"
+    client = await _client(ws)
+    try:
+        r = await client.get("/api/coinlogo/btc")
+        assert r.status == 200
+        assert r.headers["Content-Type"].startswith("image/svg")
+        assert "max-age" in r.headers.get("Cache-Control", "")
+        assert (await r.read()) == b"<svg>btc</svg>"
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_coinlogo_known_missing_404s_fast():
+    """A coin cached as None (known-missing) 404s without refetching —
+    the grid falls back to its letter avatar."""
+    ws = WebServer(coordinator=None, bot=None)
+    ws._logo_cache["nope"] = None
+    client = await _client(ws)
+    try:
+        r = await client.get("/api/coinlogo/nope")
+        assert r.status == 404
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_coinlogo_rejects_junk_names():
+    """Non-alphanumeric / oversized coin names 404 without any fetch."""
+    ws = WebServer(coordinator=None, bot=None)
+    client = await _client(ws)
+    try:
+        r = await client.get("/api/coinlogo/..%2F..%2Fetc")
+        assert r.status == 404
+        r = await client.get("/api/coinlogo/waytoolongcoinname")
+        assert r.status == 404
+    finally:
+        await client.close()

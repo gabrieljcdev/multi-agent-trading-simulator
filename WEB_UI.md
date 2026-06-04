@@ -234,10 +234,15 @@ above the top bar and the tab nav — visible on every view. The header
 bar carries a collapse toggle (▲/▼), a status LED (green live / amber
 fetching / red no-data) with venue + pair count + last-update, and the
 exchange dropdown (defaults to `TICKER_DEFAULT_EXCHANGE` on every load —
-deliberately not persisted). The body is a 4-wide grid of LED tiles
-(`TICKER_GRID_BOXES`, 2-wide under 1100px), each tile listing
-`TICKER_ROWS_PER_BOX` pairs: white symbol, white price, green-▲ /
-red-▼ / grey-▬ 24h % with glows; a null pct renders `▬ —`.
+deliberately not persisted). The header also carries ‹ › page
+arrows + a page indicator — ALL of the venue's dollar-quoted pairs are
+available, paged `TICKER_GRID_BOXES × TICKER_ROWS_PER_BOX` at a time
+(page resets to 1 on venue change). The body is a 4-wide grid of LED
+tiles (2-wide under 1100px), each tile listing `TICKER_ROWS_PER_BOX`
+pairs: coin logo (server-proxied via `/api/coinlogo/{coin}`, letter
+avatar on 404), white symbol, **amber/yellow price**, green-▲ / red-▼ /
+grey-▬ 24h % with glows (null pct renders `▬ —`), and a dim 24h volume
+(`$1.2B` / `$48M` style).
 
 Data comes from `GET /api/ticker` polled every `TICKER_POLL_INTERVAL_S`
 seconds — a plain `fetch`, intentionally separate from the WebSocket
@@ -311,6 +316,7 @@ the error string. Never raises to the aiohttp layer.
 | `/api/agent/{agent_id}` | `{trades, insights}` for the agent detail page |
 | `/api/session/{session_name}` | session trades + local clock for the session page |
 | `/api/ticker?exchange=<id>` | LED-ticker prices, proxied through the bot's ccxt layer (see below) |
+| `/api/coinlogo/{coin}` | coin-logo proxy (cryptocurrency-icons SVG, server-cached; 404 → grid letter-avatar fallback) |
 
 ### `GET /api/ticker`
 
@@ -329,16 +335,20 @@ writes finished payloads into a cache. The handler is a pure cache read
  "rows": [{"coin": "BTC", "symbol": "BTC/USD", "price": 64210.5, "pct": 1.23}]}
 ```
 
-Rows are the venue's dollar-quoted pairs (USD/USDT/USDC), deduped per
-base, ranked by 24h quote volume, capped at the grid capacity
-(`TICKER_GRID_BOXES × TICKER_ROWS_PER_BOX`). `pct` is the 24h change
-from the bulk payload (null when the venue omits it); unusable entries
+Rows are ALL of the venue's dollar-quoted pairs (USD/USDT/USDC), deduped
+per base, ranked by 24h quote volume — uncapped; the grid paginates
+client-side in pages of `TICKER_GRID_BOXES × TICKER_ROWS_PER_BOX`. Each
+row carries `price`, `pct` (24h change from the bulk payload; null when
+the venue omits it) and `vol` (24h quote volume, ~USD); unusable entries
 are skipped. A venue's last good payload is sticky across failed
 refreshes. Before the worker's first payload for a venue the endpoint
 answers `{ok: false, error: "warming up"}`; unknown `exchange` falls
 back to `TICKER_DEFAULT_EXCHANGE`; the handler never raises. The venue
 registry (labels + accepted quotes) lives in
-`web_server._TICKER_REGISTRY`.
+`web_server._TICKER_REGISTRY`. Row logos come from
+`GET /api/coinlogo/{coin}` — a server-cached proxy of the
+cryptocurrency-icons SVG set (the browser only ever talks to the bot);
+a 404 falls back to a letter avatar in the grid.
 
 ### `/action/kill`
 

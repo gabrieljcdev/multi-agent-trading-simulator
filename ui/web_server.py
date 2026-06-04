@@ -141,10 +141,9 @@ class _TickerWorker(threading.Thread):
             if not getattr(client, "markets", None):
                 timeout *= 3
             tickers = await asyncio.wait_for(client.fetch_tickers(), timeout=timeout)
-            cap = (int(getattr(settings, "TICKER_GRID_BOXES", 16) or 16)
-                   * int(getattr(settings, "TICKER_ROWS_PER_BOX", 5) or 5))
+            # No cap — ALL usable pairs ship; the grid paginates client-side.
             rows = WebServer._ticker_rows_from_bulk(
-                tickers, tuple(reg.get("quotes") or ("USD", "USDT", "USDC")), cap)
+                tickers, tuple(reg.get("quotes") or ("USD", "USDT", "USDC")))
             if not rows:
                 raise RuntimeError("no usable tickers")
             self._server._ticker_cache[ex] = (time.time(), {
@@ -278,6 +277,9 @@ class WebServer:
         # the /api/ticker handler only ever READS it.
         self._ticker_cache: dict = {}
         self._ticker_worker: Optional[_TickerWorker] = None
+        # Coin-logo proxy cache {sym: svg bytes | None}. None = known-missing
+        # (404 fast, no refetch); the browser only ever talks to the bot.
+        self._logo_cache: dict = {}
 
     # ── Lifecycle ────────────────────────────────────────────────────────
 
@@ -290,6 +292,7 @@ class WebServer:
             web.get("/api/agent/{agent_id}",       self.handle_agent_detail),
             web.get("/api/session/{session_name}", self.handle_session_detail),
             web.get("/api/ticker",                 self.handle_ticker),
+            web.get("/api/coinlogo/{coin}",        self.handle_coinlogo),
             web.post("/action/approve",        self.handle_approve),
             web.post("/action/skip",           self.handle_skip),
             web.post("/action/kill",           self.handle_kill),
@@ -799,15 +802,63 @@ class WebServer:
             logger.debug(f"ticker endpoint failed: {e}")
             return web.json_response({"ok": False, "error": str(e)[:200]})
 
-    @staticmethod
-    def _ticker_rows_from_bulk(tickers: dict, quotes: tuple, cap: int) -> list:
-        """Filter a fetch_tickers payload to dollar-quoted pairs, keep the
-        highest-volume listing per base, sort by 24h quote volume, cap.
+    async def handle_coinlogo(self, request) -> web.Response:
+        """Coin-logo proxy for the LED grid — the browser only ever talks to
+        the bot (the repo's no-CDN-in-the-page convention). First request per
+        coin fetches the cryptocurrency-icons SVG and caches it in memory;
+        misses are cached as None so unknown coins 404 fast and the grid
+        falls back to its letter avatar. Never raises."""
+        try:
+            sym = (request.match_info.get("coin") or "").strip().lower()
+            if not sym.isalnum() or len(sym) > 12:
+                return web.Response(status=404)
+            if sym in self._logo_cache:
+                data = self._logo_cache[sym]
+                if data is None:
+                    return web.Response(status=404)
+                return web.Response(body=data, content_type="image/svg+xml",
+                                    headers={"Cache-Control": "max-age=86400"})
+            data = None
+            definitive_miss = False
+            try:
+                import aiohttp
+                url = ("https://cdn.jsdelivr.net/npm/cryptocurrency-icons"
+                       f"@0.18.1/svg/color/{sym}.svg")
+                timeout = aiohttp.ClientTimeout(total=10)
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.get(url) as resp:
+                        if resp.status == 200:
+                            data = await resp.read()
+                        elif resp.status in (403, 404):
+                            definitive_miss = True   # icon set has no such coin
+            except Exception as e:
+                # Transport hiccup / timeout — do NOT cache, retry next request
+                # (a transient failure must not poison the coin forever).
+                logger.debug(f"coinlogo fetch {sym}: {e}")
+            if data is not None:
+                self._logo_cache[sym] = data
+                return web.Response(body=data, content_type="image/svg+xml",
+                                    headers={"Cache-Control": "max-age=86400"})
+            if definitive_miss:
+                self._logo_cache[sym] = None
+            return web.Response(status=404)
+        except Exception as e:
+            logger.debug(f"coinlogo endpoint: {e}")
+            return web.Response(status=404)
 
-        pct is ccxt's 24h `percentage` (computed from `open` when absent;
-        None when neither exists — the UI renders those flat/dim). Rows
-        with no usable last/close price are skipped — the bulk analogue of
-        the per-coin error isolation."""
+    @staticmethod
+    def _ticker_rows_from_bulk(tickers: dict, quotes: tuple,
+                               cap: Optional[int] = None) -> list:
+        """Filter a fetch_tickers payload to dollar-quoted pairs, keep the
+        highest-volume listing per base, sort by 24h quote volume. cap=None
+        returns ALL usable pairs (the grid paginates client-side).
+
+        Each row carries `vol` (24h quote volume, ~USD since the quote is a
+        dollar stable) — surfaced as the grid's volume metric. pct is ccxt's
+        24h `percentage` (computed from `open` when absent; None when
+        neither exists — the UI renders those flat/dim). Rows with no
+        usable last/close price are skipped — the bulk analogue of the
+        per-coin error isolation."""
         best: dict = {}
         for symbol, t in (tickers or {}).items():
             try:
@@ -830,20 +881,18 @@ class WebServer:
                     vol = float(bv) * price if bv else 0.0
                 vol = float(vol or 0.0)
                 cur = best.get(base)
-                if cur is None or vol > cur["_vol"]:
+                if cur is None or vol > cur["vol"]:
                     best[base] = {
                         "coin":   base,
                         "symbol": symbol,
                         "price":  price,
                         "pct":    None if pct is None else round(float(pct), 2),
-                        "_vol":   vol,
+                        "vol":    round(vol, 2),
                     }
             except Exception:
                 continue
-        rows = sorted(best.values(), key=lambda r: -r["_vol"])[:cap]
-        for r in rows:
-            r.pop("_vol", None)
-        return rows
+        rows = sorted(best.values(), key=lambda r: -r["vol"])
+        return rows if cap is None else rows[:cap]
 
     # ── Snapshot ─────────────────────────────────────────────────────────
 

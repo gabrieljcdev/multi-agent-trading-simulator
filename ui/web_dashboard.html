@@ -129,13 +129,18 @@
     box-shadow:inset 0 0 12px rgba(0,0,0,.8);
     font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px;
     font-variant-numeric:tabular-nums}
-  .ledrow{display:flex;align-items:baseline;gap:6px;padding:1.5px 0;
+  .ledrow{display:flex;align-items:center;gap:6px;padding:1.5px 0;
     white-space:nowrap;overflow:hidden}
-  .ledsym{color:#fff;font-weight:bold;text-transform:uppercase;width:5.5em;
+  .ledico{width:14px;height:14px;border-radius:50%;flex:none}
+  .ledico.fb{display:inline-flex;align-items:center;justify-content:center;
+    background:#232623;color:#cfd2c8;font-size:9px;font-weight:bold}
+  .ledsym{color:#fff;font-weight:bold;text-transform:uppercase;width:4.6em;
     overflow:hidden;text-overflow:ellipsis;
     text-shadow:0 0 5px rgba(255,255,255,.40)}
-  .ledpx{color:#fff;margin-left:auto;text-shadow:0 0 4px rgba(255,255,255,.25)}
-  .ledpct{width:6.2em;text-align:right}
+  .ledpx{color:#ffd84d;margin-left:auto;
+    text-shadow:0 0 6px rgba(255,216,77,.55)}
+  .ledpct{width:5.8em;text-align:right}
+  .ledvol{width:4.6em;text-align:right;color:#8b8d84;font-size:11px}
   .ledup{color:#27e07d;text-shadow:0 0 6px rgba(39,224,125,.55)}
   .leddown{color:#ff4d4d;text-shadow:0 0 6px rgba(255,77,77,.55)}
   .ledflat{color:#9a9a90}
@@ -159,6 +164,9 @@
       <span class="leddot" id="ledDot"></span>
       <span id="ledStatus" class="dim">—</span>
       <span class="spacer"></span>
+      <button id="ledPrev" title="previous page">‹</button>
+      <span id="ledPage" class="dim">1/1</span>
+      <button id="ledNext" title="next page">›</button>
       <label class="dim">venue <select id="ledExchange"></select></label>
     </div>
     <div class="ledgrid" id="ledGrid"></div>
@@ -1424,12 +1432,26 @@ try{
   if (inj.charAt(0) === "{") TICKER_CFG = JSON.parse(inj);
 }catch(e){ console.error("ticker cfg parse:", e); }
 
-let ledTimer = null, ledSeq = 0;
+let ledTimer = null, ledSeq = 0, ledPage = 0, ledRows = [];
 function ledFmtPrice(p){
   if (p >= 1000) return p.toLocaleString(undefined,{maximumFractionDigits:0});
   if (p >= 10)   return p.toFixed(2);
   if (p >= 0.1)  return p.toFixed(4);
   return p.toPrecision(3);
+}
+function ledFmtVol(v){
+  if (v == null || !(v >= 0)) return "";
+  if (v >= 1e9) return "$" + (v/1e9).toFixed(1) + "B";
+  if (v >= 1e6) return "$" + (v/1e6).toFixed(1) + "M";
+  if (v >= 1e3) return "$" + (v/1e3).toFixed(0) + "K";
+  return "$" + v.toFixed(0);
+}
+function ledIcoFb(img){
+  // Logo 404 → letter avatar (long-tail coins have no icon in the set).
+  const span = document.createElement("span");
+  span.className = "ledico fb";
+  span.textContent = (img.getAttribute("data-sym") || "?").slice(0, 1);
+  img.replaceWith(span);
 }
 function ledRowHtml(r){
   const pct = r.pct;
@@ -1439,9 +1461,30 @@ function ledRowHtml(r){
     arrow = pct > 0.05 ? "▲" : (pct < -0.05 ? "▼" : "▬");
     txt   = (pct > 0 ? "+" : "") + pct.toFixed(2) + "%";
   }
-  return `<div class="ledrow"><span class="ledsym">${esc(r.coin)}</span>` +
+  const sym = esc(r.coin);
+  return `<div class="ledrow">` +
+         `<img class="ledico" alt="" data-sym="${sym}" onerror="ledIcoFb(this)"` +
+         ` src="/api/coinlogo/${encodeURIComponent(String(r.coin).toLowerCase())}">` +
+         `<span class="ledsym">${sym}</span>` +
          `<span class="ledpx">${ledFmtPrice(r.price)}</span>` +
-         `<span class="ledpct ${cls}">${arrow} ${txt}</span></div>`;
+         `<span class="ledpct ${cls}">${arrow} ${txt}</span>` +
+         `<span class="ledvol">${ledFmtVol(r.vol)}</span></div>`;
+}
+function ledDrawPage(){
+  const grid = $("ledGrid");
+  const per = TICKER_CFG.rows_per_box || 5, nbox = TICKER_CFG.boxes || 16;
+  const pageSize = per * nbox;
+  const pages = Math.max(1, Math.ceil(ledRows.length / pageSize));
+  ledPage = Math.min(Math.max(0, ledPage), pages - 1);
+  $("ledPage").textContent = `${ledPage + 1}/${pages}`;
+  const slice = ledRows.slice(ledPage * pageSize, (ledPage + 1) * pageSize);
+  let html = "";
+  for (let b = 0; b < nbox; b++){
+    const chunk = slice.slice(b * per, (b + 1) * per);
+    if (!chunk.length) break;
+    html += `<div class="ledbox">${chunk.map(ledRowHtml).join("")}</div>`;
+  }
+  grid.innerHTML = html;
 }
 function ledRender(data, seq){
   if (seq !== ledSeq) return;   // superseded by a newer poll / venue switch
@@ -1452,17 +1495,13 @@ function ledRender(data, seq){
   dot.className = "leddot " + (live ? "ok" : "bad");
   status.textContent = `${label} · ${live ? rows.length + " pairs" : "no data"} · ${data.ts || "--:--:--"}`;
   if (!live){
+    ledRows = [];
+    $("ledPage").textContent = "1/1";
     grid.innerHTML = `<div class="ledbox lederr">no data from ${esc(label)}</div>`;
     return;
   }
-  const per = TICKER_CFG.rows_per_box || 5, nbox = TICKER_CFG.boxes || 16;
-  let html = "";
-  for (let b = 0; b < nbox; b++){
-    const chunk = rows.slice(b * per, (b + 1) * per);
-    if (!chunk.length) break;
-    html += `<div class="ledbox">${chunk.map(ledRowHtml).join("")}</div>`;
-  }
-  grid.innerHTML = html;
+  ledRows = rows;
+  ledDrawPage();
 }
 async function ledPoll(){
   const seq = ++ledSeq;          // tag the request; stale replies are dropped
@@ -1483,7 +1522,13 @@ function ledInit(){
   sel.innerHTML = (TICKER_CFG.exchanges||[]).map(v =>
     `<option value="${esc(v)}"${v===TICKER_CFG.default?" selected":""}>` +
     `${esc((TICKER_CFG.labels||{})[v]||v)}</option>`).join("");
-  sel.onchange = () => { $("ledStatus").textContent = "switching…"; ledPoll(); };
+  sel.onchange = () => {
+    ledPage = 0;                       // new venue → back to page 1
+    $("ledStatus").textContent = "switching…";
+    ledPoll();
+  };
+  $("ledPrev").onclick = () => { ledPage--; ledDrawPage(); };
+  $("ledNext").onclick = () => { ledPage++; ledDrawPage(); };
   $("ledToggle").onclick = () => {
     const closed = $("ledWrap").classList.toggle("closed");
     $("ledToggle").textContent = closed ? "▼" : "▲";

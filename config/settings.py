@@ -1336,15 +1336,17 @@ WEB_UI_SCALP_FEED_HISTORY = 30         # test: 10, 20, 30, 50
 # Prices are PROXIED through the bot (browser never calls a venue directly).
 # A dedicated worker thread (ui/web_server._TickerWorker, own event loop so
 # heavy ccxt parsing never starves the dashboard) round-robins the venues
-# with one bulk fetch_tickers() each: pairs quoted in USD/USDT/USDC, deduped
-# per base, ranked by 24h quote volume, capped at the grid capacity
-# (TICKER_GRID_BOXES × TICKER_ROWS_PER_BOX). % move is the 24h change from
-# the bulk payload — no per-pair candle calls. GET /api/ticker is a pure
-# cache read of the worker's latest payload.
+# with one bulk fetch_tickers() each: ALL pairs quoted in USD/USDT/USDC,
+# deduped per base, ranked by 24h quote volume, each row carrying price /
+# 24h % / 24h quote volume. The grid paginates client-side (‹ › arrows) in
+# pages of TICKER_GRID_BOXES × TICKER_ROWS_PER_BOX. % move is the 24h change
+# from the bulk payload — no per-pair candle calls. GET /api/ticker is a
+# pure cache read of the worker's latest payload; /api/coinlogo/{coin}
+# proxies + caches coin logos so the browser only talks to the bot.
 TICKER_EXCHANGES        = ["kraken", "binance", "coinbase", "bybit", "hyperliquid"]
 TICKER_DEFAULT_EXCHANGE = "kraken"     # test: any of TICKER_EXCHANGES (fresh each page load)
-TICKER_GRID_BOXES       = 16           # test: 8, 12, 16  (4-wide grid of LED tiles)
-TICKER_ROWS_PER_BOX     = 5            # test: 4-6        (pairs per tile; capacity = boxes × rows)
+TICKER_GRID_BOXES       = 16           # test: 8, 12, 16  (4-wide grid of LED tiles per page)
+TICKER_ROWS_PER_BOX     = 5            # test: 4-6        (pairs per tile; page size = boxes × rows)
 TICKER_POLL_INTERVAL_S  = 15           # test: 10-30  (worker refresh cycle AND frontend poll cadence)
 TICKER_FETCH_TIMEOUT_S  = 10           # test: 5-20   (per-venue bulk-fetch bound in the worker; 3× on the first, markets-loading call)
 
