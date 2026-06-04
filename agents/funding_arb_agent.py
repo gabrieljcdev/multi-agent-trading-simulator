@@ -49,6 +49,9 @@ from execution.funding_engine import (
 
 log = logging.getLogger(__name__)
 
+# Annualisation base for funding accrual (sim-capital lifecycle).
+_YEAR_SEC = 365.0 * 86400.0
+
 
 class FundingArbAgent(BaseAgent):
     agent_id     = "funding_arb"
@@ -106,7 +109,13 @@ class FundingArbAgent(BaseAgent):
         self._running = True
         self._status = RUNNING
         self._start_time = time.time()
-        mode = "OBSERVATION" if self.observation_mode else "LIVE"
+        if self._sim_trading:
+            mode = (f"SIM-TRADING (observation + "
+                    f"${float(settings.FUNDING_SIM_CAPITAL_USD):.0f} sim capital)")
+        elif self.observation_mode:
+            mode = "OBSERVATION"
+        else:
+            mode = "LIVE"
         log.info(
             "[FundingArbAgent] starting in %s mode (capital=$%.0f)",
             mode, self.capital_allocation,
@@ -150,8 +159,8 @@ class FundingArbAgent(BaseAgent):
         """Snapshot of agent state. NEVER raises — error → AgentStats(error=…)."""
         try:
             capital_deployed = sum(p.notional_usd for p in self._positions.values())
-            daily_pnl_pct = (self._daily_pnl / self.capital_allocation * 100.0) \
-                if self.capital_allocation else 0.0
+            risk_cap = self._risk_capital()
+            daily_pnl_pct = (self._daily_pnl / risk_cap * 100.0) if risk_cap else 0.0
             return AgentStats(
                 agent_id=self.agent_id,
                 status=HALTED if self._halted else (RUNNING if self._running else OFFLINE),
@@ -246,8 +255,15 @@ class FundingArbAgent(BaseAgent):
             observed = opps[:cap] if cap > 0 else opps
             for opp in observed:
                 await self._log_observation(opp)
-                # ROUTE NO ORDERS. The agent stays in observation mode until
-                # FUNDING_OBSERVATION_MODE is flipped.
+                # ROUTE NO LIVE ORDERS. The agent stays in observation mode
+                # until FUNDING_OBSERVATION_MODE is flipped.
+            # Phase 2a — sim-capital trial: with FUNDING_SIM_CAPITAL_USD > 0
+            # (and SIM_MODE enforced) the observer also RUNS its carry sim:
+            # bounded budget, tracked positions, per-tick accrual, exit-
+            # reason-driven closes. engine.open's sim router path writes sim
+            # Trade rows only; the observation assert stays as the hard gate.
+            if self._sim_trading:
+                await self._sim_entry_pass(opps)
             return
 
         # Live: the open-concurrency cap stays FUNDING_MAX_CONCURRENT — it
@@ -257,11 +273,84 @@ class FundingArbAgent(BaseAgent):
         for opp in top:
             if opp.symbol in self._positions:
                 continue
-            await self._engine.open(opp)
+            pos = await self._engine.open(opp)
+            if pos is not None:
+                self._positions[opp.symbol] = pos
+
+    # ── Sim-capital trial (Phase 2a) ────────────────────────────────────
+
+    @property
+    def _sim_trading(self) -> bool:
+        """True when the bounded sim-capital trial is active: observation
+        mode is still on (live stays impossible), SIM_MODE is on (the
+        engine's hard gate), and a sim budget is allocated."""
+        return (self.observation_mode
+                and bool(settings.SIM_MODE)
+                and float(getattr(settings, "FUNDING_SIM_CAPITAL_USD", 0.0)) > 0)
+
+    def _risk_capital(self) -> float:
+        """Capital the circuit breakers / P&L percentages measure against:
+        the live allocation, or the sim budget during the sim trial."""
+        cap = float(self.get_capital_allocation() or 0.0)
+        if self._sim_trading:
+            cap = max(cap, float(settings.FUNDING_SIM_CAPITAL_USD))
+        return cap
+
+    async def _sim_entry_pass(self, opps) -> None:
+        """Open sim positions for the best eligible opportunities.
+
+        Eligibility mirrors the observation would_enter semantics: single-
+        venue delta_neutral only (cross-venue and reverse_carry stay
+        observation-only — open() has no leg map for them), |APR| over the
+        FUNDING_MIN_APR floor, depth ok, symbol not already held. Bounded
+        by FUNDING_MAX_CONCURRENT open positions and the remaining margin
+        budget (FUNDING_SIM_CAPITAL_USD − margin in use)."""
+        if self._halted or self._manually_halted:
+            return
+        floor = float(settings.FUNDING_MIN_APR)
+        budget = float(settings.FUNDING_SIM_CAPITAL_USD)
+        for opp in opps:
+            if len(self._positions) >= int(settings.FUNDING_MAX_CONCURRENT):
+                break
+            if opp.legs != "single" or opp.variant != "delta_neutral":
+                continue
+            if not opp.depth_ok or abs(opp.funding_apr) < floor:
+                continue
+            if opp.symbol in self._positions:
+                continue
+            margin_in_use = sum(p.margin_used for p in self._positions.values())
+            pos = await self._engine.open(opp, max_margin=budget - margin_in_use)
+            if pos is not None:
+                self._positions[opp.symbol] = pos
+                log.info(
+                    "[FundingArbAgent] SIM ENTRY %s apr=%.2f%% notional=$%.0f "
+                    "margin=$%.0f (budget left $%.0f)",
+                    opp.symbol, opp.funding_apr * 100.0, pos.notional_usd,
+                    pos.margin_used, budget - margin_in_use - pos.margin_used,
+                )
 
     async def _manage_open_positions(self) -> None:
-        """Sweep open positions and exit any that match a reason."""
+        """Sweep open positions: refresh each held pair's funding rate from
+        the latest scan, accrue funding at that live rate since the last
+        sweep, then exit any position matching an exit reason.
+
+        The rate refresh is what makes the funding_decay exit real — without
+        it pos.opp.funding_apr stays frozen at the entry rate and a flipped
+        rate would never trigger an exit."""
+        now = time.time()
         for symbol, pos in list(self._positions.items()):
+            latest = next(
+                (o for o in self._last_opps
+                 if o.symbol == symbol and getattr(o, "legs", "single") == "single"),
+                None,
+            )
+            if latest is not None:
+                pos.opp.funding_apr = latest.funding_apr
+            dt = max(0.0, now - pos.last_accrual)
+            pos.funding_collected += (
+                pos.notional_usd * pos.opp.funding_apr * dt / _YEAR_SEC
+            )
+            pos.last_accrual = now
             reason = self._engine.exit_reason(pos)
             if reason is None:
                 continue
@@ -505,7 +594,10 @@ class FundingArbAgent(BaseAgent):
         scales naturally. Once halted the loop continues to tick (so the
         dashboard keeps reading get_stats) but the scan is short-circuited.
         """
-        alloc = float(self.get_capital_allocation() or 0.0)
+        # Risk capital = live allocation, or the sim budget during the
+        # sim-capital trial — the daily-loss leash applies to sim money too,
+        # so a bleeding sim strategy halts instead of compounding noise.
+        alloc = self._risk_capital()
         if alloc > 0:
             halt_usd = (float(settings.FUNDING_DAILY_LOSS_HALT_PCT) / 100.0) * alloc
             if self._daily_loss >= halt_usd:

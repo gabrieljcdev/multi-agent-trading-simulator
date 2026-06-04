@@ -108,6 +108,9 @@ class FundingPosition:
     funding_collected: float = 0.0
     fees_paid:         float = 0.0
     opened_at:         float = field(default_factory=time.time)
+    # Timestamp of the last funding accrual sweep (sim-capital lifecycle) —
+    # the agent accrues notional × apr × Δt/year on every manage pass.
+    last_accrual:      float = field(default_factory=time.time)
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -398,19 +401,26 @@ class FundingEngine:
         ) * (year / hold)
         return spread_apr - rt_fees_apr - buffer_apr
 
-    async def open(self, opp: FundingOpportunity) -> None:
-        """Open both legs of a delta-neutral carry concurrently.
+    async def open(self, opp: FundingOpportunity,
+                   max_margin: Optional[float] = None,
+                   ) -> Optional[FundingPosition]:
+        """Open both legs of a delta-neutral carry concurrently and RETURN
+        the position so the caller can track it (sim-capital lifecycle).
 
         Acquires the per-symbol lock + the engine semaphore (exactly like
         arb_engine), sizes off settings.FUNDING_MAX_NOTIONAL_USD and the
         OI fraction cap, then fires both legs via a single asyncio.gather.
+        `max_margin` is the caller's remaining capital budget — a position
+        whose margin would exceed it is refused (returns None, no leg
+        placed). fees_paid is pre-booked as the round-trip slippage cost
+        (entry+exit, both legs), matching _log_observation's fee model, so
+        the close-time net is funding_collected − fees_paid.
 
         Live order placement is gated through OrderRouter (sim writes a
         Trade row; live is a stub that returns None). FUNDING_OBSERVATION_MODE
         adds a hard assertion that SIM_MODE must be True before any leg
-        reaches the router — so a misconfigured Phase-1 deployment cannot
-        accidentally route an order. The agent's loop additionally bypasses
-        open() entirely in observation mode.
+        reaches the router — so a misconfigured deployment cannot
+        accidentally route an order.
         """
         if settings.FUNDING_OBSERVATION_MODE:
             # Defence in depth: observation mode is a HARD GATE. Even if the
@@ -430,7 +440,7 @@ class FundingEngine:
                 "[FundingEngine] refusing to open variant=%s (observation-only)",
                 opp.variant,
             )
-            return
+            return None
 
         lock = self._symbol_locks.get(opp.symbol)
         if lock is None:
@@ -440,7 +450,7 @@ class FundingEngine:
             self._symbol_locks[opp.symbol] = lock
         if lock.locked():
             # Per-symbol re-entry guard — somebody else already on this pair.
-            return
+            return None
 
         async with lock, self._semaphore:
             notional = min(
@@ -448,6 +458,12 @@ class FundingEngine:
                 float(opp.oi_usd) * float(settings.FUNDING_MAX_OI_FRACTION),
             )
             margin_used = notional / max(float(settings.FUNDING_TARGET_LEVERAGE), 1e-9)
+            if max_margin is not None and margin_used > max_margin:
+                logger.info(
+                    "[FundingEngine] skip %s — margin $%.2f exceeds budget $%.2f",
+                    opp.symbol, margin_used, max_margin,
+                )
+                return None
             basis_at_entry = self._basis(opp)
 
             pos = FundingPosition(
@@ -455,12 +471,16 @@ class FundingEngine:
                 notional_usd=notional,
                 margin_used=margin_used,
                 basis_at_entry=basis_at_entry,
+                # Round-trip slippage (entry+exit) booked up front — same fee
+                # model _log_observation projects, so realised net == model.
+                fees_paid=2.0 * notional * float(settings.FUNDING_SIM_SLIPPAGE_PCT),
             )
             # BOTH legs concurrently — never sequential.
             await asyncio.gather(
                 self._place(pos, leg="long"),
                 self._place(pos, leg="short"),
             )
+            return pos
 
     def exit_reason(self, pos: FundingPosition) -> Optional[str]:
         """Return the first matching exit reason in priority order, or None.

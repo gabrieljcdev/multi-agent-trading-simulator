@@ -596,8 +596,10 @@ async def test_live_mode_still_caps_opens_at_concurrency(monkeypatch):
 
 def test_daily_loss_circuit_breaker_halts(monkeypatch):
     # %-based: halt fires when daily_loss reaches (PCT/100) * allocation.
-    # Pick concrete alloc + PCT so the threshold is deterministic.
+    # Pick concrete alloc + PCT so the threshold is deterministic. Sim
+    # capital pinned to 0 — this test exercises the LIVE-allocation rule.
     monkeypatch.setattr(settings, "FUNDING_DAILY_LOSS_HALT_PCT", 2.0)
+    monkeypatch.setattr(settings, "FUNDING_SIM_CAPITAL_USD", 0.0)
     agent = FundingArbAgent(engine=_engine_with())
     agent.capital_allocation = 250.0   # 2% of $250 → $5 halt
     agent._daily_loss = 6.0
@@ -611,6 +613,7 @@ def test_daily_loss_circuit_breaker_zero_alloc_noop(monkeypatch):
     rule — never divides by zero, never silently stops a zero-capital
     agent from observing."""
     monkeypatch.setattr(settings, "FUNDING_DAILY_LOSS_HALT_PCT", 2.0)
+    monkeypatch.setattr(settings, "FUNDING_SIM_CAPITAL_USD", 0.0)
     agent = FundingArbAgent(engine=_engine_with())
     agent.capital_allocation = 0.0
     agent._daily_loss = 1_000_000.0
@@ -622,6 +625,7 @@ def test_daily_loss_halt_scales_with_allocation(monkeypatch):
     """Doubling allocation doubles the USD loss tolerated — that's the
     whole point of the %-based rule (it scales with the fund)."""
     monkeypatch.setattr(settings, "FUNDING_DAILY_LOSS_HALT_PCT", 2.0)
+    monkeypatch.setattr(settings, "FUNDING_SIM_CAPITAL_USD", 0.0)
     # Small fund, $5 halt
     a1 = FundingArbAgent(engine=_engine_with())
     a1.capital_allocation = 250.0
@@ -814,6 +818,188 @@ def test_coordinator_picks_up_via_registry():
     # methods all callable.
     for m in ("start", "stop", "get_stats", "close_all_positions"):
         assert callable(getattr(funding[0], m))
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Phase 2a — sim-capital trial (FUNDING_SIM_CAPITAL_USD)
+# ─────────────────────────────────────────────────────────────────────────
+
+def _sim_settings(monkeypatch, capital: float = 500.0):
+    monkeypatch.setattr(settings, "FUNDING_OBSERVATION_MODE", True)
+    monkeypatch.setattr(settings, "SIM_MODE", True)
+    monkeypatch.setattr(settings, "FUNDING_SIM_CAPITAL_USD", capital)
+    monkeypatch.setattr(settings, "FUNDING_MIN_APR", 0.05)
+    monkeypatch.setattr(settings, "FUNDING_MAX_CONCURRENT", 2)
+    monkeypatch.setattr(settings, "FUNDING_MAX_OBSERVED_PER_SCAN", 100)
+
+
+@pytest.mark.asyncio
+async def test_open_returns_position_and_budget_gate(monkeypatch, _force_observation):
+    """engine.open returns the tracked position (margin + pre-booked round-
+    trip fees); a margin budget too small for the position refuses it
+    without placing a leg."""
+    monkeypatch.setattr(settings, "FUNDING_MAX_NOTIONAL_USD", 250.0)
+    monkeypatch.setattr(settings, "FUNDING_TARGET_LEVERAGE", 2.0)
+    monkeypatch.setattr(settings, "FUNDING_SIM_SLIPPAGE_PCT", 0.0002)
+    eng = _engine_with()
+    with patch.object(eng, "_place", new=AsyncMock()) as place:
+        pos = await eng.open(_opp(symbol="BTC/USDT"))
+        assert pos is not None
+        assert pos.notional_usd == pytest.approx(250.0)
+        assert pos.margin_used == pytest.approx(125.0)
+        assert pos.fees_paid == pytest.approx(2 * 250.0 * 0.0002)
+        assert place.call_count == 2          # both legs
+
+    with patch.object(eng, "_place", new=AsyncMock()) as place:
+        refused = await eng.open(_opp(symbol="ETH/USDT"), max_margin=100.0)
+        assert refused is None                # 125 margin > 100 budget
+        place.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_sim_entry_pass_opens_within_caps(monkeypatch):
+    """_dispatch_opps in sim-trading mode: observation rows still flow for
+    everything; sim entries only for single delta_neutral pairs over the
+    floor with depth, capped at FUNDING_MAX_CONCURRENT, budget passed."""
+    _sim_settings(monkeypatch)
+    captured_rows: list = []
+    monkeypatch.setattr(
+        "agents.funding_arb_agent.db_queries.save_funding_observations",
+        lambda rows: captured_rows.extend(rows),
+    )
+    agent = FundingArbAgent(engine=_engine_with())
+
+    def _mk_pos(opp):
+        return FundingPosition(opp=opp, notional_usd=250.0,
+                               margin_used=125.0, basis_at_entry=0.0)
+
+    opened: list = []
+
+    async def _fake_open(opp, max_margin=None):
+        opened.append((opp.symbol, max_margin))
+        return _mk_pos(opp)
+
+    monkeypatch.setattr(agent._engine, "open", _fake_open)
+
+    opps = [
+        _opp(symbol="A/USDT", funding_apr=0.30),
+        _opp(symbol="B/USDT", funding_apr=0.20),
+        _opp(symbol="C/USDT", funding_apr=0.15),            # over cap
+        _opp(symbol="THIN/USDT", funding_apr=0.50, depth_ok=False),
+        _opp(symbol="LOW/USDT", funding_apr=0.01),          # under floor
+    ]
+    cross = _opp(symbol="X/USDT", funding_apr=0.90)
+    cross.legs = "cross_venue"
+    rev = FundingOpportunity(symbol="R/USDT", variant="reverse_carry",
+                             venue_long="binance", venue_short="binance",
+                             funding_apr=-0.80, spread_apr=0.0,
+                             oi_usd=1e7, depth_ok=True)
+    await agent._dispatch_opps(opps + [cross, rev])
+
+    # Observation rows flowed for the whole set.
+    assert len(captured_rows) == 7
+    # Only the top-2 eligible singles were opened (A, B by APR; cross/rev/
+    # thin/low-floor excluded; C blocked by the concurrency cap).
+    assert [s for s, _ in opened] == ["A/USDT", "B/USDT"]
+    # Budget threaded through: first open sees the full $500, second $375.
+    assert opened[0][1] == pytest.approx(500.0)
+    assert opened[1][1] == pytest.approx(375.0)
+    assert set(agent._positions) == {"A/USDT", "B/USDT"}
+
+
+@pytest.mark.asyncio
+async def test_sim_zero_capital_is_pure_observation(monkeypatch):
+    """FUNDING_SIM_CAPITAL_USD=0 → previous behaviour exactly: rows logged,
+    engine.open never touched."""
+    _sim_settings(monkeypatch, capital=0.0)
+    monkeypatch.setattr(
+        "agents.funding_arb_agent.db_queries.save_funding_observations",
+        lambda rows: None,
+    )
+    agent = FundingArbAgent(engine=_engine_with())
+    spy = AsyncMock()
+    monkeypatch.setattr(agent._engine, "open", spy)
+    await agent._dispatch_opps([_opp(symbol="A/USDT", funding_apr=0.30)])
+    spy.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_sim_trading_requires_sim_mode(monkeypatch):
+    """SIM_MODE=False → the sim trial is OFF even with capital allocated
+    (defence in depth: sim money only exists inside the sim)."""
+    _sim_settings(monkeypatch)
+    monkeypatch.setattr(settings, "SIM_MODE", False)
+    agent = FundingArbAgent(engine=_engine_with())
+    assert agent._sim_trading is False
+
+
+@pytest.mark.asyncio
+async def test_manage_accrues_at_refreshed_rate(monkeypatch, _force_observation):
+    """The manage sweep refreshes the held pair's rate from the latest scan
+    and accrues funding at that LIVE rate: notional × apr × Δt/year."""
+    agent = FundingArbAgent(engine=_engine_with())
+    now = time.time()
+    pos = FundingPosition(opp=_opp(symbol="BTC/USDT", funding_apr=0.365),
+                          notional_usd=1_000.0, margin_used=500.0,
+                          basis_at_entry=0.0, opened_at=now - 86_400,
+                          last_accrual=now - 86_400)
+    agent._positions["BTC/USDT"] = pos
+    # Latest scan shows the rate DOUBLED — accrual must use the new rate.
+    agent._last_opps = [_opp(symbol="BTC/USDT", funding_apr=0.730)]
+
+    await agent._manage_open_positions()
+
+    assert pos.opp.funding_apr == pytest.approx(0.730)
+    # 1000 × 0.73 × (1day/365days) = $2.00
+    assert pos.funding_collected == pytest.approx(2.0, rel=0.01)
+    assert "BTC/USDT" in agent._positions          # healthy → still open
+
+
+@pytest.mark.asyncio
+async def test_flip_exit_closes_and_writes_row(monkeypatch, _force_observation):
+    """A flipped funding rate triggers funding_decay: the position closes,
+    the close row is persisted, and the daily P&L counters update."""
+    monkeypatch.setattr(settings, "FUNDING_FLIP_EXIT_APR", 0.0)
+    saved: list = []
+    monkeypatch.setattr(
+        "agents.funding_arb_agent.db_queries.save_funding_observations",
+        lambda rows: saved.extend(rows),
+    )
+    agent = FundingArbAgent(engine=_engine_with())
+    now = time.time()
+    pos = FundingPosition(opp=_opp(symbol="BTC/USDT", funding_apr=0.20),
+                          notional_usd=1_000.0, margin_used=500.0,
+                          basis_at_entry=0.0, opened_at=now - 3_600,
+                          last_accrual=now - 3_600,
+                          funding_collected=1.50, fees_paid=0.40)
+    agent._positions["BTC/USDT"] = pos
+    agent._last_opps = [_opp(symbol="BTC/USDT", funding_apr=-0.10)]   # flipped
+
+    await agent._manage_open_positions()
+
+    assert "BTC/USDT" not in agent._positions
+    assert saved, "close row must be persisted"
+    row = saved[-1]
+    assert row["exit_reason"] == "funding_decay"
+    assert row["observation_only"] is True
+    # net = collected − fees (small negative accrual for the flipped hour)
+    assert agent._daily_pnl == pytest.approx(row["pnl_usd"])
+    assert row["pnl_usd"] < 1.50 - 0.40 + 0.01
+
+
+def test_daily_loss_breaker_uses_sim_capital(monkeypatch):
+    """During the sim trial the daily-loss leash measures against the sim
+    budget: 2% of $500 = $10 → an $11 sim loss halts the agent."""
+    monkeypatch.setattr(settings, "FUNDING_DAILY_LOSS_HALT_PCT", 2.0)
+    monkeypatch.setattr(settings, "FUNDING_OBSERVATION_MODE", True)
+    monkeypatch.setattr(settings, "SIM_MODE", True)
+    monkeypatch.setattr(settings, "FUNDING_SIM_CAPITAL_USD", 500.0)
+    agent = FundingArbAgent(engine=_engine_with())
+    agent.capital_allocation = 0.0
+    agent._daily_loss = 11.0
+    agent._check_circuit_breakers()
+    assert agent._halted is True
+    assert agent._halt_reason == "daily_loss"
 
 
 # Reset the module-level singleton's venue-health flag between tests so

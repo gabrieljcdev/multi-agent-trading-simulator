@@ -316,6 +316,18 @@ FUNDING_CONSECUTIVE_LOSS_HALT  = 4          # test: 3-6
 # OBSERVATION ONLY: FUNDING_OBSERVATION_MODE stays True, FUNDING_CAPITAL_USD
 # stays 0.0, no venue can place an order. These tune what is OBSERVED, never
 # whether anything trades.
+# Sim-capital trial (Phase 2a, 2026-06-04): lets the observer actually RUN
+# its carry sim with a bounded budget while FUNDING_OBSERVATION_MODE stays
+# True. Positions are simulated end-to-end (entry via engine.open's sim
+# router path, per-tick funding accrual at the live rate, exit_reason-driven
+# closes) and realised P&L lands in funding_arb_observations. Scope: single-
+# venue delta_neutral only — cross-venue and reverse_carry stay observation.
+# NO order can reach a venue: requires SIM_MODE, and the engine's
+# observation-mode assert stays. 0 = pure observation (previous behaviour).
+# Gate context at enablement: 13.2k obs, crowding OPEN 25.8%, best OPEN net
+# APR 174%, median would-enter APR 11%.
+FUNDING_SIM_CAPITAL_USD           = 500.0   # test: 0, 250, 500, 1000  (0 = observation only)
+
 FUNDING_VENUES_ENABLED            = ["binance", "hyperliquid"]  # test: ["binance"] first, then add hyperliquid
 FUNDING_HL_BULK_TTL_SEC           = 30     # test: 10, 30, 60  (Hyperliquid bulk-fetch cache TTL; rate-limit transport detail)
 
