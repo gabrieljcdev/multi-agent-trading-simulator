@@ -1359,7 +1359,7 @@ async def test_coinlogo_served_from_cache():
     """A cached logo is served as SVG with browser caching — no upstream
     fetch on the request path once cached."""
     ws = WebServer(coordinator=None, bot=None)
-    ws._logo_cache["btc"] = b"<svg>btc</svg>"
+    ws._logo_cache["btc"] = (b"<svg>btc</svg>", "image/svg+xml")
     client = await _client(ws)
     try:
         r = await client.get("/api/coinlogo/btc")

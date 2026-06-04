@@ -277,9 +277,15 @@ class WebServer:
         # the /api/ticker handler only ever READS it.
         self._ticker_cache: dict = {}
         self._ticker_worker: Optional[_TickerWorker] = None
-        # Coin-logo proxy cache {sym: svg bytes | None}. None = known-missing
-        # (404 fast, no refetch); the browser only ever talks to the bot.
+        # Coin-logo proxy cache {sym: (bytes, content_type) | None}. None =
+        # definitively missing from EVERY source (404 fast, no refetch);
+        # the browser only ever talks to the bot. Session/semaphore/imgmap
+        # are lazy (loop-bound primitives can't be built off-loop here).
         self._logo_cache: dict = {}
+        self._logo_session = None
+        self._logo_sem: Optional[asyncio.Semaphore] = None
+        self._cc_imgmap: Optional[dict] = None
+        self._cc_imgmap_lock: Optional[asyncio.Lock] = None
 
     # ── Lifecycle ────────────────────────────────────────────────────────
 
@@ -396,6 +402,12 @@ class WebServer:
             except Exception:
                 pass
             self._ticker_worker = None
+        if self._logo_session is not None:
+            try:
+                await self._logo_session.close()
+            except Exception:
+                pass
+            self._logo_session = None
         logger.info("Web UI stopped")
 
     # ── Broadcast loop ───────────────────────────────────────────────────
@@ -802,46 +814,112 @@ class WebServer:
             logger.debug(f"ticker endpoint failed: {e}")
             return web.json_response({"ok": False, "error": str(e)[:200]})
 
+    @staticmethod
+    def _logo_response(hit) -> web.Response:
+        if hit is None:
+            return web.Response(status=404)
+        body, ctype = hit
+        return web.Response(body=body, content_type=ctype,
+                            headers={"Cache-Control": "max-age=86400"})
+
+    async def _logo_http_get(self, url: str) -> tuple:
+        """(status, body, content_type) via a shared session with a browser
+        UA (cryptocompare's media host bot-blocks default agents). Raises on
+        transport errors — callers treat those as transient."""
+        import aiohttp
+        if self._logo_session is None or self._logo_session.closed:
+            self._logo_session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=10),
+                headers={"User-Agent": ("Mozilla/5.0 (X11; Linux x86_64) "
+                                        "AppleWebKit/537.36")})
+        async with self._logo_session.get(url) as resp:
+            body = await resp.read() if resp.status == 200 else b""
+            return resp.status, body, resp.headers.get("Content-Type", "")
+
+    async def _cc_image_path(self, sym: str) -> Optional[str]:
+        """CryptoCompare ImageUrl path for a symbol, from its coinlist
+        (~20k symbols → excellent modern-coin coverage), lazily loaded once
+        and parsed OFF-loop. None when unknown; the map stays unset on a
+        failed load so it's retried later rather than poisoning everything."""
+        if self._cc_imgmap is not None:
+            return self._cc_imgmap.get(sym) or None
+        if self._cc_imgmap_lock is None:
+            self._cc_imgmap_lock = asyncio.Lock()
+        async with self._cc_imgmap_lock:
+            if self._cc_imgmap is not None:
+                return self._cc_imgmap.get(sym) or None
+            import os
+            url = "https://min-api.cryptocompare.com/data/all/coinlist"
+            key = os.getenv("CRYPTOCOMPARE_API_KEY", "")
+            if key:
+                url += f"?api_key={key}"
+            status, raw, _ = await self._logo_http_get(url)
+            if status != 200 or not raw:
+                return None
+
+            def _parse(blob: bytes) -> dict:
+                data = json.loads(blob).get("Data") or {}
+                return {k.lower(): (v.get("ImageUrl") or "")
+                        for k, v in data.items() if isinstance(v, dict)}
+
+            # Multi-MB JSON — parse in a thread so the loop never stalls.
+            self._cc_imgmap = await asyncio.to_thread(_parse, raw)
+            logger.info(f"coinlogo: cryptocompare image map loaded "
+                        f"({len(self._cc_imgmap)} symbols)")
+        return self._cc_imgmap.get(sym) or None
+
     async def handle_coinlogo(self, request) -> web.Response:
         """Coin-logo proxy for the LED grid — the browser only ever talks to
-        the bot (the repo's no-CDN-in-the-page convention). First request per
-        coin fetches the cryptocurrency-icons SVG and caches it in memory;
-        misses are cached as None so unknown coins 404 fast and the grid
-        falls back to its letter avatar. Never raises."""
+        the bot. Source chain per coin, cached in memory after the first hit:
+          1. cryptocurrency-icons SVG (tiny, pretty; old set — majors only)
+          2. CryptoCompare media PNG (modern coverage via its coinlist map)
+        Only a DEFINITIVE miss from every source caches as None (fast 404 →
+        the grid's letter avatar). Throttle responses (403/429) and transport
+        hiccups are never cached — they retry on a later request — and a
+        small semaphore stops a page load's ~80-logo burst from triggering
+        upstream throttling in the first place. Never raises."""
         try:
             sym = (request.match_info.get("coin") or "").strip().lower()
             if not sym.isalnum() or len(sym) > 12:
                 return web.Response(status=404)
             if sym in self._logo_cache:
-                data = self._logo_cache[sym]
-                if data is None:
-                    return web.Response(status=404)
-                return web.Response(body=data, content_type="image/svg+xml",
-                                    headers={"Cache-Control": "max-age=86400"})
-            data = None
-            definitive_miss = False
-            try:
-                import aiohttp
-                url = ("https://cdn.jsdelivr.net/npm/cryptocurrency-icons"
-                       f"@0.18.1/svg/color/{sym}.svg")
-                timeout = aiohttp.ClientTimeout(total=10)
-                async with aiohttp.ClientSession(timeout=timeout) as session:
-                    async with session.get(url) as resp:
-                        if resp.status == 200:
-                            data = await resp.read()
-                        elif resp.status in (403, 404):
-                            definitive_miss = True   # icon set has no such coin
-            except Exception as e:
-                # Transport hiccup / timeout — do NOT cache, retry next request
-                # (a transient failure must not poison the coin forever).
-                logger.debug(f"coinlogo fetch {sym}: {e}")
-            if data is not None:
-                self._logo_cache[sym] = data
-                return web.Response(body=data, content_type="image/svg+xml",
-                                    headers={"Cache-Control": "max-age=86400"})
-            if definitive_miss:
-                self._logo_cache[sym] = None
-            return web.Response(status=404)
+                return self._logo_response(self._logo_cache[sym])
+            if self._logo_sem is None:
+                self._logo_sem = asyncio.Semaphore(4)
+            async with self._logo_sem:
+                if sym in self._logo_cache:      # raced: filled while we waited
+                    return self._logo_response(self._logo_cache[sym])
+                definitive = 0
+                # 1. cryptocurrency-icons SVG
+                try:
+                    status, body, _ = await self._logo_http_get(
+                        "https://cdn.jsdelivr.net/npm/cryptocurrency-icons"
+                        f"@0.18.1/svg/color/{sym}.svg")
+                    if status == 200 and body:
+                        self._logo_cache[sym] = (body, "image/svg+xml")
+                        return self._logo_response(self._logo_cache[sym])
+                    if status == 404:
+                        definitive += 1
+                except Exception as e:
+                    logger.debug(f"coinlogo icons {sym}: {e}")
+                # 2. CryptoCompare media
+                try:
+                    path = await self._cc_image_path(sym)
+                    if path:
+                        status, body, ctype = await self._logo_http_get(
+                            "https://www.cryptocompare.com" + path)
+                        if status == 200 and body:
+                            self._logo_cache[sym] = (body, ctype or "image/png")
+                            return self._logo_response(self._logo_cache[sym])
+                        if status == 404:
+                            definitive += 1
+                    elif self._cc_imgmap is not None:
+                        definitive += 1          # map loaded, symbol absent
+                except Exception as e:
+                    logger.debug(f"coinlogo cc {sym}: {e}")
+                if definitive >= 2:
+                    self._logo_cache[sym] = None
+                return web.Response(status=404)
         except Exception as e:
             logger.debug(f"coinlogo endpoint: {e}")
             return web.Response(status=404)
