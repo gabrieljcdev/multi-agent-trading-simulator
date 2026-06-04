@@ -94,6 +94,55 @@ class ATRStopCalculator:
                       base_sl_bps=base_sl, atr_bps=atr_bps,
                       atr_adjusted=adjusted, sl_clamped=clamped)
 
+    def compute_tp_sl_vol(self, symbol: str, exchange: str,
+                          round_trip_bps: float):
+        """Vol-scaled TP/SL candidate for the HIGH-FEE conditional path
+        (gate 4b). Returns a TpSlV2, or None when ATR is unavailable (caller
+        falls back to the static fee skip).
+
+        Unlike compute_tp_sl_v2 — whose TP is fee-fixed (rt + target) and
+        where ATR only ever WIDENS the SL — this lets TP scale with realised
+        volatility:
+
+            tp = max(rt + net_target, SCALP_ATR_TP_MULTIPLIER × atr_bps)
+            sl = clamp(SCALP_ATR_SL_MULTIPLIER × atr_bps, floor, ceiling)
+
+        That is the only geometry under which a high-fee venue can clear the
+        breakeven cap: fees shrink relative to the achievable move. The SL is
+        the ATR-clamped stop alone — NOT widened to tp/RR (a vol-scaled TP
+        would drag tp/RR to tens of bps and push breakeven back above the
+        cap). The breakeven-win-rate guarantee that the wider-of-two rule
+        provides in compute_tp_sl_v2 is enforced DIRECTLY here instead: the
+        caller (gate 4b) recomputes breakeven on this exact geometry and
+        refuses the entry unless it clears SCALP_MAX_BREAKEVEN_WIN_RATE.
+        """
+        target = getattr(self.s, "SCALP_NET_PROFIT_TARGET_BPS", 3.0)
+        rr = getattr(self.s, "SCALP_RR_RATIO", 1.6)
+        floor = getattr(self.s, "SCALP_ATR_SL_FLOOR_BPS", 1.5)
+        ceiling = getattr(self.s, "SCALP_ATR_SL_CEILING_BPS", 8.0)
+        mult_sl = getattr(self.s, "SCALP_ATR_SL_MULTIPLIER", 0.3)
+        mult_tp = getattr(self.s, "SCALP_ATR_TP_MULTIPLIER", 1.2)
+
+        atr_bps = self._safe_atr_bps(symbol, exchange)
+        if atr_bps is None:
+            return None
+
+        base_tp = round_trip_bps + target
+        tp = max(base_tp, mult_tp * atr_bps)
+
+        sl = atr_bps * mult_sl
+        clamped = ""
+        if sl < floor:
+            sl, clamped = floor, "FLOOR"
+        elif sl > ceiling:
+            sl, clamped = ceiling, "CEILING"
+
+        base_sl = base_tp / rr if rr > 0 else base_tp
+        actual_rr = tp / sl if sl > 0 else 0.0
+        return TpSlV2(tp_bps=tp, sl_bps=sl, rr_actual=actual_rr,
+                      base_sl_bps=base_sl, atr_bps=atr_bps,
+                      atr_adjusted=True, sl_clamped=clamped)
+
     def _safe_atr_bps(self, symbol: str, exchange: str):
         """Fetch ATR as bps-of-mid, return None on any failure."""
         try:

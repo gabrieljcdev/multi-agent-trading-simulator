@@ -990,6 +990,20 @@ SCALP_USE_TOXICITY_GATE   = True   # test: True/False
 SCALP_TOXICITY_SPREAD_BPS = 2.5    # test: 1.5-6.0  (stand down if top-of-book spread exceeds this)
 SCALP_TOXICITY_VOL_BPS    = 40.0   # test: 20-80    (stand down if |1m mid move| exceeds this, in bps)
 
+# Gate 4b — vol-conditional viability on HIGH-FEE venues (observation-first).
+# When static gate-4 fee viability fails (e.g. bitget: 40bps round trip →
+# 95.7% breakeven), a scalp can still be viable if current volatility makes
+# the achievable move large relative to fees: TP scales with ATR
+# (max(rt+target, SCALP_ATR_TP_MULTIPLIER × atr_bps)) and the breakeven is
+# re-checked on that geometry. Admitted entries are OBSERVATION ROWS ONLY
+# while SCALP_HIGH_FEE_OBSERVE_ONLY is True — no order, not even sim — until
+# the accumulated rows prove the win rate. Anchor math: bitget rt=40bps,
+# SL ceiling 8bps → needs tp_vol ≥ ~65.8bps → atr ≥ ~55bps at mult 1.2.
+SCALP_USE_HIGH_FEE_VOL_GATE  = True    # test: True/False  (gate 4b: vol-conditional viability when static gate 4 fails)
+SCALP_HIGH_FEE_OBSERVE_ONLY  = True    # test: True (NEVER False this phase — no orders on high-fee venues)
+SCALP_ATR_TP_MULTIPLIER      = 1.2     # test: 0.8, 1.0, 1.2, 1.5  (achievable-move proxy: TP = mult × ATR)
+SCALP_HIGH_FEE_VENUES        = []      # test: [], ["bitget"]  (extra venues evaluated via gate 4b only)
+
 # Activation criteria — v1 (original) and v2 (tighter). Both readiness checks
 # read these; see database/queries.get_scalp_activation_readiness[_v2].
 SCALP_MIN_OBSERVATIONS_FOR_LIVE = 200

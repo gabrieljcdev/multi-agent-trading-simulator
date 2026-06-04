@@ -1076,6 +1076,45 @@ class ScalpingAgent(BaseAgent):
             ), info
         return True, "", info
 
+    @staticmethod
+    def _approved_scalp_exchanges() -> list:
+        """Scalp-approved venues: STRATEGY_EXCHANGE_MAP['scalp'] plus any
+        gate-4b observation venues (SCALP_HIGH_FEE_VENUES). The high-fee list
+        only ever ADDS observation candidates — gate 4/4b decides viability
+        and SCALP_HIGH_FEE_OBSERVE_ONLY keeps them order-free."""
+        base = list(settings.STRATEGY_EXCHANGE_MAP.get("scalp", []))
+        for v in getattr(settings, "SCALP_HIGH_FEE_VENUES", []) or []:
+            if v not in base:
+                base.append(v)
+        return base
+
+    def _gate4b_vol_viability(self, exchange: str, symbol: str, rt_bps: float):
+        """Gate 4b — vol-conditional viability for a venue whose STATIC fee
+        viability (gate 4) failed.
+
+        Computes the vol-scaled geometry (ATRStopCalculator.compute_tp_sl_vol:
+        TP = max(rt+target, SCALP_ATR_TP_MULTIPLIER × atr); SL = ATR-clamped)
+        and re-checks the breakeven win rate on it. A high-fee venue is
+        admissible exactly when current volatility makes the achievable move
+        large relative to fees (bitget at rt=40bps needs atr ≥ ~55bps).
+
+        Returns (tpsl | None, skip_reason). tpsl=None → not admissible this
+        tick (no ATR, or breakeven still above the cap)."""
+        tpsl = self.atr_calc.compute_tp_sl_vol(
+            symbol=symbol, exchange=exchange, round_trip_bps=rt_bps,
+        )
+        if tpsl is None:
+            return None, "no ATR for vol-scaled TP"
+        denom = tpsl.tp_bps + tpsl.sl_bps
+        be = (rt_bps + tpsl.sl_bps) / denom if denom > 0 else 1.0
+        cap = float(settings.SCALP_MAX_BREAKEVEN_WIN_RATE)
+        if be > cap:
+            return None, (
+                f"Fee breakeven {be:.1%} even at vol-scaled TP "
+                f"({tpsl.tp_bps:.0f}bps, atr={tpsl.atr_bps:.0f}bps)"
+            )
+        return tpsl, ""
+
     async def _get_symbol_move_bps(self, symbol: str, exchange: str) -> float:
         """|1-minute mid move| for (symbol, exchange) in bps — the toxicity
         gate's volatility arm. Unlike gate 13 (BTC only, for alts) this reads
@@ -1169,8 +1208,9 @@ class ScalpingAgent(BaseAgent):
     # ── Main loop ───────────────────────────────────────────────────────
 
     async def _loop(self) -> None:
-        # Pre-warm the fee cache for every approved scalp exchange.
-        for exchange_id in settings.STRATEGY_EXCHANGE_MAP.get("scalp", []):
+        # Pre-warm the fee cache for every approved scalp exchange (incl. any
+        # gate-4b observation venues from SCALP_HIGH_FEE_VENUES).
+        for exchange_id in self._approved_scalp_exchanges():
             try:
                 ccxt_ex = await self._get_ccxt_exchange(exchange_id)
                 await self._fee_manager.load_exchange(exchange_id, ccxt_ex)
@@ -1191,7 +1231,7 @@ class ScalpingAgent(BaseAgent):
                 self._resolve_market_data()
                 if self._halted:
                     continue
-                approved = settings.STRATEGY_EXCHANGE_MAP.get("scalp", [])
+                approved = self._approved_scalp_exchanges()
                 for symbol in settings.SCALP_PAIRS:
                     for exchange in approved:
                         pos_key = self._pos_key(symbol, exchange)
@@ -1275,7 +1315,7 @@ class ScalpingAgent(BaseAgent):
         # keeps running so SL/TP/exit logic still fires for open positions.
         if self._manually_halted:
             return
-        approved = settings.STRATEGY_EXCHANGE_MAP.get("scalp", [])
+        approved = self._approved_scalp_exchanges()
         now = time.time()
 
         # 1. exchange approved
@@ -1326,12 +1366,34 @@ class ScalpingAgent(BaseAgent):
         # 4. Fee viability — maker-aware (prices the round trip per
         # SCALP_USE_MAKER_EXECUTION). FeeManager is unchanged; this matches
         # FeeManager.is_viable when maker execution is off.
+        #
+        # 4b. Vol-conditional fallback (observation-first): when the STATIC
+        # viability fails (high-fee venue, e.g. bitget), the scalp may still
+        # be viable if current volatility makes the achievable move large
+        # relative to fees. _gate4b_vol_viability re-checks breakeven on a
+        # vol-scaled TP; an admitted entry carries that geometry forward and
+        # is FORCED observation-only downstream (no order, not even sim)
+        # while SCALP_HIGH_FEE_OBSERVE_ONLY is True. Venues that pass static
+        # gate 4 (MEXC) never enter this path — zero fast-path change.
         viable, reason, _fee_info = self._fee_viability(exchange, symbol)
+        high_fee_tpsl = None
         if not viable:
-            self._log_skip(symbol, exchange, now, ofi=ofi,
-                           reason=reason, rt_bps=rt_bps, min_wr=1.0,
-                           spread_bps=0.0, regime="?")
-            return
+            if getattr(settings, "SCALP_USE_HIGH_FEE_VOL_GATE", False):
+                high_fee_tpsl, reason_4b = self._gate4b_vol_viability(
+                    exchange, symbol, rt_bps,
+                )
+                if high_fee_tpsl is None:
+                    self._log_skip(symbol, exchange, now, ofi=ofi,
+                                   reason=reason_4b if "breakeven" in reason_4b
+                                   else reason,
+                                   rt_bps=rt_bps, min_wr=1.0,
+                                   spread_bps=0.0, regime="?")
+                    return
+            else:
+                self._log_skip(symbol, exchange, now, ofi=ofi,
+                               reason=reason, rt_bps=rt_bps, min_wr=1.0,
+                               spread_bps=0.0, regime="?")
+                return
 
         # 5. Z-score above entry threshold
         if abs(ofi["z"]) < settings.SCALP_OFI_Z_ENTRY:
@@ -1503,13 +1565,20 @@ class ScalpingAgent(BaseAgent):
                 return
 
         # ── ATR-aware TP/SL (replaces fee_manager.compute_tp_sl on pass) ─
-        tpsl = self.atr_calc.compute_tp_sl_v2(
-            symbol=symbol, exchange=exchange,
-            round_trip_bps=self._round_trip_bps(exchange, symbol),
-        )
+        # A gate-4b admission carries its vol-scaled geometry forward — the
+        # entry must be priced on the SAME tp/sl the viability re-check used.
+        if high_fee_tpsl is not None:
+            tpsl = high_fee_tpsl
+            denom = tpsl.tp_bps + tpsl.sl_bps
+            min_wr = (rt_bps + tpsl.sl_bps) / denom if denom > 0 else 1.0
+        else:
+            tpsl = self.atr_calc.compute_tp_sl_v2(
+                symbol=symbol, exchange=exchange,
+                round_trip_bps=self._round_trip_bps(exchange, symbol),
+            )
+            min_wr = self._fee_manager.breakeven_win_rate(
+                exchange, symbol, tpsl.tp_bps, tpsl.sl_bps)
         tp_bps, sl_bps = tpsl.tp_bps, tpsl.sl_bps
-        min_wr = self._fee_manager.breakeven_win_rate(exchange, symbol,
-                                                     tp_bps, sl_bps)
         if direction == "LONG":
             tp_price = entry_price * (1 + tp_bps / 10000.0)
             sl_price = entry_price * (1 - sl_bps / 10000.0)
@@ -1526,10 +1595,19 @@ class ScalpingAgent(BaseAgent):
             spread_bps=spread_bps, regime=regime,
         )
         self._annotate_v2(obs, v2_fields, tpsl=tpsl)
+        observation_only = self._capital <= 0
+        if high_fee_tpsl is not None:
+            # Gate-4b cohort: tag the row so analysis can isolate it, and
+            # HARD RULE — while SCALP_HIGH_FEE_OBSERVE_ONLY is True a
+            # high-fee-venue entry is observation only (no order, not even
+            # sim), regardless of SCALP_CAPITAL. Promotion to capital is a
+            # later, data-gated decision once these rows prove the win rate.
+            obs.strength_label = "HIGH_FEE_VOL"
+            if getattr(settings, "SCALP_HIGH_FEE_OBSERVE_ONLY", True):
+                observation_only = True
+                obs.observation_only = True
         self._observations.append(obs)
         self._pending_flush.append(obs)
-
-        observation_only = self._capital <= 0
         # Position size scales with the BalanceAgent-set allocation so
         # realised profit compounds: base = SCALP_POSITION_SIZE_USD ×
         # (allocation / FUND_MEXC_SCALP_CAPITAL). 1.0× on cold start.
@@ -1911,7 +1989,7 @@ class ScalpingAgent(BaseAgent):
             # Live fee viability per approved scalp exchange — lets the
             # dashboard show fee health without importing FeeManager.
             fee_viability: dict[str, dict] = {}
-            for ex in settings.STRATEGY_EXCHANGE_MAP.get("scalp", []):
+            for ex in self._approved_scalp_exchanges():
                 try:
                     # Maker-aware, same basis as gate 4 — panel can't diverge
                     # from the gate that actually admits the trade.

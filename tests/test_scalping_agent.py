@@ -1083,3 +1083,143 @@ async def test_gate4_blocks_taker_passes_maker_in_entry_flow(monkeypatch):
     await a_maker._evaluate_entry("BTC/USDT", "mexc")
     obs_m = a_maker._observations[-1]
     assert obs_m.would_entry is True
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Gate 4b — vol-conditional viability on high-fee venues (observation-first)
+# ─────────────────────────────────────────────────────────────────────────
+
+from agents.scalping_atr_sl import ATRStopCalculator, TpSlV2  # noqa: E402
+
+
+def _atr_calc_with(atr_bps):
+    """ATRStopCalculator over a stub market_data whose ATR reads atr_bps
+    (mid=100 → atr value = atr_bps/100 in price terms)."""
+    from unittest.mock import MagicMock
+    md = MagicMock()
+    md.get_atr.return_value = None if atr_bps is None else atr_bps / 100.0
+    md.get_mid_price.return_value = 100.0
+    return ATRStopCalculator(md, settings)
+
+
+def test_vol_tp_floors_at_fee_target_and_scales_with_atr():
+    """compute_tp_sl_vol: TP floors at rt+target on quiet tape, scales with
+    ATR when vol is high; SL is the ATR-clamped stop (ceiling 8). Pins the
+    spec's bitget anchor: rt=40 needs atr ≥ ~55bps to clear the 65% cap."""
+    rt = 40.0
+    # Quiet tape: atr 10bps → tp floors at 43 (rt+3), sl = 10*0.3 = 3.
+    t = _atr_calc_with(10.0).compute_tp_sl_vol("BTC/USDT", "bitget", rt)
+    assert t.tp_bps == pytest.approx(rt + settings.SCALP_NET_PROFIT_TARGET_BPS)
+    assert t.sl_bps == pytest.approx(3.0)
+    # High vol: atr 60 → tp = 1.2×60 = 72, sl clamped to ceiling 8.
+    t = _atr_calc_with(60.0).compute_tp_sl_vol("BTC/USDT", "bitget", rt)
+    assert t.tp_bps == pytest.approx(72.0)
+    assert t.sl_bps == pytest.approx(settings.SCALP_ATR_SL_CEILING_BPS)
+    assert t.sl_clamped == "CEILING"
+    # Anchor: atr 55 → tp 66 → be = (40+8)/74 = 64.9% ≤ 65% (passes);
+    #         atr 50 → tp 60 → be = (40+8)/68 = 70.6% (fails).
+    t55 = _atr_calc_with(55.0).compute_tp_sl_vol("BTC/USDT", "bitget", rt)
+    be55 = (rt + t55.sl_bps) / (t55.tp_bps + t55.sl_bps)
+    assert be55 <= settings.SCALP_MAX_BREAKEVEN_WIN_RATE
+    t50 = _atr_calc_with(50.0).compute_tp_sl_vol("BTC/USDT", "bitget", rt)
+    be50 = (rt + t50.sl_bps) / (t50.tp_bps + t50.sl_bps)
+    assert be50 > settings.SCALP_MAX_BREAKEVEN_WIN_RATE
+    # No ATR → None (caller falls back to the static skip).
+    assert _atr_calc_with(None).compute_tp_sl_vol("BTC/USDT", "bitget", rt) is None
+
+
+def _gate4b_agent(monkeypatch, capital=0.0):
+    """Agent armed to reach gate 4 on bitget (real 20/20bps override → static
+    viability fails → gate 4b). Confluence/microprice/toxicity off to isolate."""
+    monkeypatch.setattr(settings, "SCALP_SESSION_START_UTC", 0)
+    monkeypatch.setattr(settings, "SCALP_SESSION_END_UTC", 24)
+    monkeypatch.setattr(settings, "SCALP_USE_CONFLUENCE", False)
+    monkeypatch.setattr(settings, "SCALP_USE_MICROPRICE_GATE", False)
+    monkeypatch.setattr(settings, "SCALP_USE_TOXICITY_GATE", False)
+    monkeypatch.setattr(settings, "SCALP_USE_HIGH_FEE_VOL_GATE", True)
+    monkeypatch.setattr(settings, "SCALP_HIGH_FEE_VENUES", ["bitget"])
+    agent = _agent_with_capital(capital)
+    agent._get_mid_price  = AsyncMock(return_value=50_000.0)
+    agent._get_spread_bps = AsyncMock(return_value=1.0)
+    agent._get_regime     = AsyncMock(return_value="TRENDING")
+    _arm_ofi(agent, key="BTC/USDT:bitget", direction="LONG")
+    return agent
+
+
+@pytest.mark.asyncio
+async def test_gate4b_skips_with_vol_reason_when_breakeven_high(monkeypatch):
+    """Low vol: the vol-scaled TP still leaves breakeven above the cap →
+    skip with the vol-aware reason (not the static one)."""
+    agent = _gate4b_agent(monkeypatch)
+    monkeypatch.setattr(
+        agent.atr_calc, "compute_tp_sl_vol",
+        lambda **kw: TpSlV2(tp_bps=60.0, sl_bps=8.0, rr_actual=7.5,
+                            base_sl_bps=26.9, atr_bps=50.0,
+                            atr_adjusted=True, sl_clamped="CEILING"))
+    await agent._evaluate_entry("BTC/USDT", "bitget")
+    obs = agent._observations[-1]
+    assert obs.would_entry is False
+    assert "even at vol-scaled TP" in obs.skip_reason
+
+
+@pytest.mark.asyncio
+async def test_gate4b_admits_observation_only_no_order(monkeypatch):
+    """High vol: breakeven clears the cap → admitted as an OBSERVATION row
+    (would_entry=True, observation_only FORCED even with capital, cohort tag,
+    vol geometry recorded) and NO order is placed — not even sim."""
+    from unittest.mock import MagicMock
+    save_trade = MagicMock()
+    monkeypatch.setattr("agents.scalping_agent.db_queries.save_trade", save_trade)
+    agent = _gate4b_agent(monkeypatch, capital=100.0)   # live capital!
+    monkeypatch.setattr(
+        agent.atr_calc, "compute_tp_sl_vol",
+        lambda **kw: TpSlV2(tp_bps=80.0, sl_bps=8.0, rr_actual=10.0,
+                            base_sl_bps=26.9, atr_bps=66.7,
+                            atr_adjusted=True, sl_clamped="CEILING"))
+    await agent._evaluate_entry("BTC/USDT", "bitget")
+    obs = agent._observations[-1]
+    assert obs.would_entry is True
+    assert obs.observation_only is True                 # forced despite capital
+    assert obs.strength_label == "HIGH_FEE_VOL"
+    assert obs.tp_bps == pytest.approx(80.0)
+    assert obs.sl_bps == pytest.approx(8.0)
+    # breakeven recorded on the vol geometry: (40+8)/(80+8) = 54.5%
+    assert obs.min_win_rate_required == pytest.approx(48.0 / 88.0, rel=0.01)
+    # Position tracked for exits, but size 0 and NO order routed.
+    pos = agent._positions.get("BTC/USDT:bitget")
+    assert pos is not None and pos.size_usd == 0.0
+    save_trade.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_static_viable_venue_never_enters_gate4b(monkeypatch):
+    """MEXC fast-path regression: static gate 4 passes → compute_tp_sl_vol
+    is never consulted; entry behaves exactly as before."""
+    monkeypatch.setattr(settings, "SCALP_SESSION_START_UTC", 0)
+    monkeypatch.setattr(settings, "SCALP_SESSION_END_UTC", 24)
+    monkeypatch.setattr(settings, "SCALP_USE_CONFLUENCE", False)
+    monkeypatch.setattr(settings, "SCALP_USE_MICROPRICE_GATE", False)
+    monkeypatch.setattr(settings, "SCALP_USE_TOXICITY_GATE", False)
+    agent = _agent_with_capital(0.0)
+    agent._get_mid_price  = AsyncMock(return_value=50_000.0)
+    agent._get_spread_bps = AsyncMock(return_value=1.0)
+    agent._get_regime     = AsyncMock(return_value="TRENDING")
+    _arm_ofi(agent, direction="LONG")
+    from unittest.mock import MagicMock as _MM
+    spy = _MM()
+    monkeypatch.setattr(agent.atr_calc, "compute_tp_sl_vol", spy)
+    await agent._evaluate_entry("BTC/USDT", "mexc")
+    obs = agent._observations[-1]
+    assert obs.would_entry is True
+    spy.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_gate4b_flag_off_falls_back_to_static_skip(monkeypatch):
+    """SCALP_USE_HIGH_FEE_VOL_GATE=False → today's behaviour: static fee skip."""
+    agent = _gate4b_agent(monkeypatch)
+    monkeypatch.setattr(settings, "SCALP_USE_HIGH_FEE_VOL_GATE", False)
+    await agent._evaluate_entry("BTC/USDT", "bitget")
+    obs = agent._observations[-1]
+    assert obs.would_entry is False
+    assert "exceeds limit" in obs.skip_reason
