@@ -1191,3 +1191,121 @@ async def test_halt_logs_event(monkeypatch):
         assert ("HALT_MANUAL", "scalp") in coord._halt_log
     finally:
         await client.close()
+
+
+# ── LED ticker endpoint (GET /api/ticker) ──────────────────────────────────
+
+def _ticker_stub_client(price: float = 64_000.0, open4h: float = 63_000.0):
+    """ccxt-shaped stub: fetch_ticker returns a fixed last price,
+    fetch_ohlcv one 4h candle whose open is open4h."""
+    client = MagicMock()
+    client.fetch_ticker = AsyncMock(return_value={"last": price})
+    client.fetch_ohlcv = AsyncMock(return_value=[[0, open4h, 0, 0, 0, 0]])
+    return client
+
+
+@pytest.mark.asyncio
+async def test_ticker_endpoint_returns_rows(monkeypatch):
+    """GET /api/ticker?exchange=kraken → ok:true with one row per
+    configured coin, each carrying price + pct vs the 4h open. The venue
+    fetch is mocked — no live network call."""
+    ws = WebServer(coordinator=None, bot=None)
+    stub = _ticker_stub_client(price=64_000.0, open4h=63_000.0)
+    monkeypatch.setattr(ws, "_ticker_get_client", AsyncMock(return_value=stub))
+    client = await _client(ws)
+    try:
+        r = await client.get("/api/ticker?exchange=kraken")
+        assert r.status == 200
+        data = await r.json()
+        assert data["ok"] is True
+        assert data["exchange"] == "kraken"
+        coins = [row["coin"] for row in data["rows"]]
+        assert coins == list(settings.TICKER_COINS)
+        for row in data["rows"]:
+            assert row["price"] == pytest.approx(64_000.0)
+            # (64000-63000)/63000*100 = 1.5873 → rounded to 2dp
+            assert row["pct"] == pytest.approx(1.59, abs=0.01)
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_ticker_unknown_exchange_falls_back(monkeypatch):
+    """An unknown ?exchange= falls back to TICKER_DEFAULT_EXCHANGE and the
+    endpoint still answers ok:true."""
+    ws = WebServer(coordinator=None, bot=None)
+    monkeypatch.setattr(ws, "_ticker_get_client",
+                        AsyncMock(return_value=_ticker_stub_client()))
+    client = await _client(ws)
+    try:
+        r = await client.get("/api/ticker?exchange=nonsense_venue")
+        data = await r.json()
+        assert data["ok"] is True
+        assert data["exchange"] == settings.TICKER_DEFAULT_EXCHANGE
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_ticker_per_coin_failure_is_isolated(monkeypatch):
+    """One coin's fetch raising marks ONLY that row {error: true}; the other
+    rows keep price/pct and the endpoint stays ok:true."""
+    ws = WebServer(coordinator=None, bot=None)
+    stub = _ticker_stub_client()
+
+    async def _tick(symbol):
+        if symbol.startswith("ETH"):
+            raise RuntimeError("venue hiccup")
+        return {"last": 64_000.0}
+
+    stub.fetch_ticker = AsyncMock(side_effect=_tick)
+    monkeypatch.setattr(ws, "_ticker_get_client", AsyncMock(return_value=stub))
+    client = await _client(ws)
+    try:
+        r = await client.get("/api/ticker?exchange=kraken")
+        data = await r.json()
+        assert data["ok"] is True
+        by_coin = {row["coin"]: row for row in data["rows"]}
+        assert by_coin["ETH"].get("error") is True
+        assert "price" not in by_coin["ETH"]
+        assert by_coin["BTC"]["price"] == pytest.approx(64_000.0)
+        assert by_coin["SOL"]["price"] == pytest.approx(64_000.0)
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_ticker_endpoint_never_raises(monkeypatch):
+    """A total fetch failure (client resolution blows up) returns a JSON
+    {ok: false} — never a 500."""
+    ws = WebServer(coordinator=None, bot=None)
+    monkeypatch.setattr(ws, "_ticker_get_client",
+                        AsyncMock(side_effect=RuntimeError("everything down")))
+    client = await _client(ws)
+    try:
+        r = await client.get("/api/ticker?exchange=kraken")
+        assert r.status == 200
+        data = await r.json()
+        assert data["ok"] is False
+        assert "error" in data
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_ticker_cache_reduces_fetch_calls(monkeypatch):
+    """Two requests inside TICKER_CACHE_TTL_S hit the venue once: the
+    second is served from the per-exchange cache."""
+    ws = WebServer(coordinator=None, bot=None)
+    stub = _ticker_stub_client()
+    monkeypatch.setattr(ws, "_ticker_get_client", AsyncMock(return_value=stub))
+    client = await _client(ws)
+    try:
+        r1 = await client.get("/api/ticker?exchange=kraken")
+        r2 = await client.get("/api/ticker?exchange=kraken")
+        assert (await r1.json())["ok"] and (await r2.json())["ok"]
+        # One fetch per coin, once — not twice.
+        assert stub.fetch_ticker.call_count == len(settings.TICKER_COINS)
+        assert stub.fetch_ohlcv.call_count == len(settings.TICKER_COINS)
+    finally:
+        await client.close()

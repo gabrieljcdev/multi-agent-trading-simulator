@@ -1332,6 +1332,18 @@ WEB_UI_PUSH_INTERVAL_S = 0.5           # test: 0.25-2.0  (WebSocket push rate, s
 # rows, newest first; the DB is the backing store so they survive restarts.
 WEB_UI_SCALP_FEED_HISTORY = 30         # test: 10, 20, 30, 50
 
+# ── LED price ticker (web UI strip; GET /api/ticker) ────────────────────────
+# Prices are PROXIED through the bot (browser never calls a venue directly).
+# Coins/venues are read by both the endpoint and the frontend, so adding a
+# coin is a one-line change here (+ a registry symbol entry in web_server.py
+# for a brand-new venue).
+TICKER_COINS            = ["BTC", "ETH", "SOL"]   # test: any ccxt-listed bases
+TICKER_EXCHANGES        = ["kraken", "binance", "coinbase", "bybit", "hyperliquid"]
+TICKER_DEFAULT_EXCHANGE = "kraken"     # test: any of TICKER_EXCHANGES (fresh each page load)
+TICKER_CACHE_TTL_S      = 8            # test: 5-10   (server-side per-venue price cache)
+TICKER_POLL_INTERVAL_S  = 15           # test: 10-30  (frontend poll cadence)
+TICKER_FETCH_TIMEOUT_S  = 10           # test: 5-20   (per-coin fetch bound; slow/rate-starved venue → error row, never a hung request)
+
 # ── Dashboard arb-opportunity panel colour ladder ───────────────────────────
 # Execution rate = executed / above_threshold. Green when we're catching
 # the majority of viable gaps; amber when half are slipping through;

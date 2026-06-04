@@ -227,6 +227,25 @@ functions follow the same conventions:
 - All buttons disable on click and re-enable when the next snapshot
   reflects the new server state — never optimistically update local UI.
 
+### LED price ticker (page-level, not a tab panel)
+
+A dot-matrix-styled strip pinned at the very top of the page (`#ledWrap`,
+`position: sticky`), above the top bar and the tab nav — visible on every
+view. It scrolls coin / price / 4h-% items right-to-left in a seamless
+loop (items rendered twice + `translateX(-50%)` keyframe). White symbols
+and prices; green-▲ / red-▼ / grey-▬ percentages with glows. Controls
+beneath the strip: exchange dropdown (defaults to
+`TICKER_DEFAULT_EXCHANGE` on every load — deliberately not persisted),
+speed slider (`--tickerDur` CSS var), Pause/Play, and a status LED with
+venue + last-update time.
+
+Data comes from `GET /api/ticker` polled every `TICKER_POLL_INTERVAL_S`
+seconds — a plain `fetch`, intentionally separate from the WebSocket
+snapshot. The venue list / default / poll cadence are injected
+server-side into the page by `_load_html` (the `__TICKER_CFG_JSON__`
+placeholder), so they're settings-driven without touching the WS schema.
+A per-coin error renders as a dim `--- COIN N/A ---` segment.
+
 ---
 
 ## Push loop
@@ -283,6 +302,35 @@ the error string. Never raises to the aiohttp layer.
 | `/action/rebalance` | see below | three-action arm/confirm/cancel |
 | `/action/agent/{agent_id}/halt`   | `{}` | `coordinator.halt_agent(id)`; logs `HALT_MANUAL` (v3.1) |
 | `/action/agent/{agent_id}/resume` | `{}` | `coordinator.resume_agent(id)`; logs `RESUME_MANUAL` (v3.1) |
+
+### GET endpoints
+
+| Path | Returns |
+|---|---|
+| `/api/agent/{agent_id}` | `{trades, insights}` for the agent detail page |
+| `/api/session/{session_name}` | session trades + local clock for the session page |
+| `/api/ticker?exchange=<id>` | LED-ticker prices, proxied through the bot's ccxt layer (see below) |
+
+### `GET /api/ticker`
+
+Feeds the LED price strip. The browser never calls a venue directly —
+this endpoint fetches `fetch_ticker` + the current 4h candle's open via
+ccxt (reusing MarketData's clients where the venue is already connected,
+lazily building one otherwise) and returns:
+
+```json
+{"ok": true, "exchange": "kraken", "label": "Kraken", "ts": "HH:MM:SS",
+ "rows": [{"coin": "BTC", "price": 64210.5, "pct": 1.23},
+          {"coin": "ETH", "error": true}]}
+```
+
+`pct` is the move vs the current 4h open. A failing coin degrades to its
+own `{coin, error: true}` row (endpoint stays `ok: true`); only a total
+failure returns `{ok: false}` — the handler never raises. Responses are
+cached per venue for `TICKER_CACHE_TTL_S`. Unknown `exchange` falls back
+to `TICKER_DEFAULT_EXCHANGE`. Venue/symbol mapping lives in
+`web_server._TICKER_REGISTRY`; coins + venue list come from the
+`TICKER_*` settings.
 
 ### `/action/kill`
 
@@ -479,6 +527,13 @@ BALANCE_AUTO_DISPATCH             False                 v2 operator-gated dispat
 
 STABLECOIN_BENCHMARK_APR_PCT      5.0                   funding panel APR colour threshold
 FUNDING_DELTA_TOLERANCE_USD       5.0                   funding position delta colour threshold
+
+TICKER_COINS                      ["BTC","ETH","SOL"]   coins on the LED strip
+TICKER_EXCHANGES                  [kraken,…,hyperliquid] venues in the ticker dropdown
+TICKER_DEFAULT_EXCHANGE           "kraken"              fresh selection each page load
+TICKER_CACHE_TTL_S                8                     server-side per-venue price cache
+TICKER_POLL_INTERVAL_S            15                    frontend /api/ticker poll cadence
+TICKER_FETCH_TIMEOUT_S            10                    per-coin fetch bound (slow venue → error row)
 ```
 
 `BALANCE_AUTO_DISPATCH=False` is the v2 default — the operator confirms
