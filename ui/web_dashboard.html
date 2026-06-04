@@ -10,12 +10,20 @@
     --tx0:#1a1a18; --tx1:#5f5e5a; --tx2:#9b9890;
     --pos:#3B6D11; --neg:#A32D2D; --warn:#854F0B;
     --line:#dcdad3;
+    /* opportunity scanner chips + exploratory lane (light) */
+    --opp-zero:#3B6D11; --opp-slow:#2b6cb0; --opp-fast:#854F0B;
+    --opp-sat:#777570;  --opp-shark:#A32D2D;
+    --opp-expl-bg:#f7f4ea; --opp-expl-line:#d8d2bd;
   }
   .dark{
     --bg0:#1c1c1a; --bg1:#242422; --bg2:#2e2e2b;
     --tx0:#eeece6; --tx1:#a8a69e; --tx2:#6a6860;
     --pos:#8ecc54; --neg:#f08080; --warn:#e8a830;
     --line:#3a3a36;
+    /* opportunity scanner chips + exploratory lane (dark) */
+    --opp-zero:#8ecc54; --opp-slow:#6aa9e8; --opp-fast:#e8a830;
+    --opp-sat:#85837b;  --opp-shark:#f08080;
+    --opp-expl-bg:#28281f; --opp-expl-line:#4a4a38;
   }
   *{box-sizing:border-box}
   body{margin:0;background:var(--bg1);color:var(--tx0);
@@ -87,6 +95,25 @@
     background:var(--bg2);color:var(--tx1)}
   .chip.exec{color:var(--pos)} .chip.skip{color:var(--warn)} .chip.arb{color:#2b6cb0}
   .chip.err,.chip.kill{color:var(--neg)} .chip.warn{color:var(--warn)}
+  /* opportunity scanner — trend/reach/window chips, confidence dots,
+     exploratory lane fence, reasoning-feed cards (light+dark via tokens) */
+  .oppchip{display:inline-block;padding:0 6px;border-radius:3px;font-size:11px;
+    font-weight:bold;background:var(--bg2)}
+  .oppchip.opp-zero{color:var(--opp-zero)} .oppchip.opp-slow{color:var(--opp-slow)}
+  .oppchip.opp-fast{color:var(--opp-fast)} .oppchip.opp-sat{color:var(--opp-sat)}
+  .oppchip.opp-shark{color:var(--opp-shark)}
+  .edot{display:inline-block;width:8px;height:8px;border-radius:50%;
+    border:1px solid var(--tx1);vertical-align:middle;margin-left:4px}
+  .edot.high{background:var(--tx0)}
+  .edot.medium{background:linear-gradient(90deg,var(--tx0) 50%,transparent 50%)}
+  .edot.low{background:transparent}
+  .opp-expl{background:var(--opp-expl-bg);border:1px dashed var(--opp-expl-line);
+    border-radius:4px;padding:8px;margin-top:8px}
+  .opp-rationale{color:var(--tx1);font-size:12px;white-space:normal;
+    padding:2px 6px 6px 18px}
+  .opp-note{background:var(--bg0);border:1px solid var(--line);border-radius:4px;
+    padding:8px;margin-bottom:6px}
+  .opp-note .body{margin:4px 0;white-space:normal}
   .grid2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
   .grid3{display:grid;grid-template-columns:2fr 1fr;gap:10px}
   .sessions{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
@@ -256,6 +283,13 @@
 
         <div class="card">
           <h2>Session P&amp;L</h2><div class="sessions" id="sessions"></div>
+        </div>
+
+        <!-- Opportunity Scanner — READ-ONLY window onto the $0 observation
+             agent. No action controls; the feed's Noteworthy/All-posts
+             dropdown is the only interactive element and fires a GET read. -->
+        <div class="card" style="margin-top:10px">
+          <h2>Opportunity Scanner</h2><div id="opportunities"></div>
         </div>
       </div>
 
@@ -693,6 +727,12 @@ function updateUI(s){
     el.onkeydown = (e) => { if(e.key==="Enter"||e.key===" "){ e.preventDefault(); go(); } };
   });
 
+  // Opportunity Scanner panel (read-only; $0 observation). Binding runs
+  // after BOTH render paths (dashboard panel + the scanner's detail page,
+  // rendered above) so the feed dropdown works in either context.
+  safeRender("opportunities", () => opportunityPanelHtml(s.opportunities));
+  bindOppNotesFilters();
+
   // arb history tab
   const ah = s.arb_history || [];
   $("a-n").textContent = ah.length;
@@ -1036,72 +1076,174 @@ function fundingPanelHtml(f){
     summary + reasonRow;
 }
 
-/* ---------- opportunity scanner panel (read-only; $0 observation) ----------
-   Two clearly-fenced views: the STANDARD trajectory-ranked actionable list
-   (every row LEADS with competitor trend; edge never renders without it) and
-   the EXPLORATORY lane (FEATURE BLOCK 6b) sorted by unconventional_score,
-   with the agent's free-text rationale rendered inline. They never merge.
-   No action controls — the panel surfaces reasoning only. */
-const OPP_TREND_CLS = {zero:"pos", rising_slow:"dim", rising_fast:"warn", saturated:"neg"};
+/* ---------- opportunity scanner panel (READ-ONLY — $0 observation) ----------
+   Two clearly-fenced views — the STANDARD trajectory-ranked actionable list
+   (every row LEADS with competitor trend; edge is structurally adjacent and
+   never renders without it) and the EXPLORATORY lane (FEATURE BLOCK 6b)
+   sorted by unconventional_score, with the agent's free-text rationale
+   rendered inline. They share the survivor set but NEVER merge. Below them,
+   the reasoning feed renders the agent's prose posts as postmortem-style
+   cards. The feed's Noteworthy/All-posts dropdown is the panel's ONLY
+   interactive control and fires a GET read — no buttons, no actions. */
+let oppNotesMode = "noteworthy";   // feed filter state; survives re-renders
+let oppNotesAllCache = null;       // GET /api/opportunity_notes payload for "All posts"
 
-function oppRowsHtml(rows, exploratory){
+const OPP_TREND_CHIP  = {zero:"opp-zero", rising_slow:"opp-slow",
+                         rising_fast:"opp-fast", saturated:"opp-sat"};
+const OPP_REACH_CHIP  = {reachable:"opp-zero", marginal:"opp-fast",
+                         shark_territory:"opp-shark", unreachable:"opp-shark",
+                         unknown:"opp-sat"};
+const OPP_WINDOW_CHIP = {opening:"opp-zero", open:"opp-zero",
+                         closing:"opp-fast", closed:"opp-sat"};
+
+function oppChip(v, map){
+  if(!v) return `<span class="dim">—</span>`;
+  return `<span class="oppchip ${map[v]||"opp-sat"}">${esc(v)}</span>`;
+}
+
+function oppTrendCellHtml(r){
+  // The HEADLINE — always the first cell of a row.
+  return oppChip(r.competitor_trend, OPP_TREND_CHIP) +
+    ` <span class="dim">(${r.competitor_count==null?"?":r.competitor_count})</span>`;
+}
+
+function oppEdgeHtml(r){
+  // Edge never renders naked: every caller places this cell structurally
+  // beside the trend cell. Null edge is an honest "—" — never an invented
+  // APR client-side. The confidence dot: high solid / medium half / low hollow.
+  if(r.edge_annualized_pct == null) return `<span class="dim">—</span>`;
+  return `${(+r.edge_annualized_pct).toFixed(1)}%` +
+    `<span class="edot ${esc(r.edge_confidence||"low")}"` +
+    ` title="confidence: ${esc(r.edge_confidence||"low")}"></span>`;
+}
+
+function oppMarketHtml(r){
+  return `${esc(r.protocol||"—")}/${esc(r.chain||"—")} ` +
+    `<span class="dim" title="${esc(r.market_key||"")}">${esc((r.market_key||"").slice(0,10))}…</span>`;
+}
+
+function oppStandardHtml(rows){
   rows = rows || [];
-  if(!rows.length) return `<span class="muted">no ${exploratory?"exploratory":"ranked"} opportunities yet</span>`;
-  const head = exploratory
-    ? `<tr><th>score</th><th>trend</th><th>market</th><th>edge</th><th>factors</th></tr>`
-    : `<tr><th>trend</th><th>edge</th><th>reach</th><th>window</th><th>market</th><th>first seen</th></tr>`;
-  const body = rows.map(r => {
-    const trend = r.competitor_trend || "—";
-    const tCls = OPP_TREND_CLS[trend] || "dim";
-    const trendCell = `<span class="${tCls}">${esc(trend)}</span>` +
-      ` <span class="dim">(${r.competitor_count==null?"?":r.competitor_count})</span>`;
-    const mkt = `${esc(r.protocol||"—")}/${esc(r.chain||"—")} ` +
-      `<span class="dim" title="${esc(r.market_key||"")}">${esc((r.market_key||"").slice(0,10))}…</span>`;
-    // edge_display already carries the "frequency unknown" marker when no
-    // honest APR exists — never invent a number client-side either.
-    const edge = esc(r.edge_display || "—");
-    if(exploratory){
+  if(!rows.length) return `<span class="muted">No opportunities logged yet</span>`;
+  return `<table><thead><tr><th>trend</th><th>edge</th><th>reach</th>` +
+    `<th>window</th><th>type</th><th>market</th><th>first seen</th></tr></thead><tbody>` +
+    rows.map(r => `<tr>` +
+      `<td>${oppTrendCellHtml(r)}</td>` +
+      `<td>${oppEdgeHtml(r)}</td>` +
+      `<td>${oppChip(r.reachability, OPP_REACH_CHIP)}</td>` +
+      `<td>${oppChip(r.window_status, OPP_WINDOW_CHIP)}</td>` +
+      `<td class="dim">${esc(r.opp_type||"—")}</td>` +
+      `<td>${oppMarketHtml(r)}</td>` +
+      `<td class="dim">${esc(r.first_seen||"—")}</td></tr>`).join("") +
+    `</tbody></table>`;
+}
+
+function oppExploratoryHtml(rows){
+  rows = rows || [];
+  if(!rows.length) return `<span class="muted">No opportunities logged yet</span>`;
+  return `<table><thead><tr><th>score</th><th>trend</th><th>edge</th>` +
+    `<th>market</th><th>factors</th></tr></thead><tbody>` +
+    rows.map(r => {
       const factors = (r.unconventional_factors||[])
-        .map(f => `<span class="tag">${esc(f)}</span>`).join(" ");
+        .map(f => `<span class="chip">${esc(f)}</span>`).join("");
+      // Degrade gracefully: a missing rationale renders the row without it
+      // — never "undefined", never a crash.
       const rationale = r.unconventional_rationale
-        ? `<tr><td colspan="5" class="dim" style="font-size:11px;padding-left:18px">↳ ${esc(r.unconventional_rationale)}</td></tr>`
-        : ``;   // degrade gracefully: row renders without rationale
-      return `<tr><td>${(r.unconventional_score||0).toFixed(2)}</td>` +
-        `<td>${trendCell}</td><td>${mkt}</td><td>${edge}</td><td>${factors||"—"}</td></tr>` +
-        rationale;
-    }
-    return `<tr><td>${trendCell}</td><td>${edge}</td>` +
-      `<td class="dim">${esc(r.reachability_verdict||"unknown")}</td>` +
-      `<td class="dim">${esc(r.window_status||"—")}</td>` +
-      `<td>${mkt}</td><td class="dim">${esc((r.first_seen||"").slice(0,16))}</td></tr>`;
+        ? `<tr><td colspan="5" class="opp-rationale">↳ ${esc(r.unconventional_rationale)}</td></tr>`
+        : ``;
+      return `<tr>` +
+        `<td><b>${r.unconventional_score==null?"—":(+r.unconventional_score).toFixed(2)}</b></td>` +
+        `<td>${oppTrendCellHtml(r)}</td>` +
+        `<td>${oppEdgeHtml(r)}</td>` +
+        `<td>${oppMarketHtml(r)}</td>` +
+        `<td>${factors||"—"}</td></tr>` + rationale;
+    }).join("") + `</tbody></table>`;
+}
+
+function oppOutcomeBadge(n){
+  if(!n.was_right) return ``;            // unresolved window → no badge
+  const cls = n.was_right==="correct" ? "opp-zero"
+            : n.was_right==="incorrect" ? "opp-shark" : "opp-sat";
+  const tip = n.outcome_summary ? ` title="${esc(n.outcome_summary)}"` : ``;
+  return ` <span class="oppchip ${cls}"${tip}>${esc(n.was_right)}</span>`;
+}
+
+function oppNoteCardsHtml(notes){
+  notes = notes || [];
+  if(!notes.length) return `<span class="muted">No reasoning posts yet.</span>`;
+  return notes.map(n => {
+    const tags = (n.factor_tags||[]).map(t => `<span class="chip">${esc(t)}</span>`).join("");
+    const nums = `<span class="dim">edge ${n.edge_pct==null?"—":(+n.edge_pct).toFixed(1)+"%"}</span> ` +
+      oppChip(n.competitor_trend, OPP_TREND_CHIP) + ` ` +
+      oppChip(n.reachability, OPP_REACH_CHIP);
+    const outcome = (n.was_right && n.outcome_summary)
+      ? `<div class="dim" style="font-size:11px">${esc(n.outcome_summary)}</div>` : ``;
+    return `<div class="opp-note">` +
+      `<div class="dim">${esc(n.ts||"—")}` +
+        `${n.noteworthy ? ` <span class="chip warn">noteworthy</span>` : ``}` +
+        `${oppOutcomeBadge(n)}</div>` +
+      `<div class="body">${esc(n.body||"")}</div>` +
+      `<div>${tags} ${nums}</div>` + outcome +
+    `</div>`;
   }).join("");
-  return `<table><thead>${head}</thead><tbody>${body}</tbody></table>`;
 }
 
 function opportunityPanelHtml(o){
   o = o || {};
-  const s = o.summary || {};
-  const isObs = (o.status === "OBSERVATION");
-  const header = obsHeader(
-    `<b>OPPORTUNITY</b> · ${esc(o.status||"OFFLINE")} · $0 observation · ` +
-    `${s.n_core||0} tracked (${s.n_survivable||0} survivable / ` +
-    `${s.n_disqualified||0} disqualified) · ` +
-    `${s.n_observations||0} hypotheses (${s.n_labeled||0} labeled)`,
-    isObs,
-  );
-  const lat = statRow([
-    ["detect latency (session)", `${(s.session_detection_latency_ms||0).toFixed(0)}ms`],
-    ["detect latency (all)",     `${(s.mean_detection_latency_ms||0).toFixed(0)}ms`],
-    ["SLA",                      `${(s.detection_latency_sla_ms||0).toFixed(0)}ms`],
-    ["candidates (session)",     s.candidates_seen_session||0],
-  ]);
+  if(!o.enabled) return `<span class="muted">Opportunity Scanner disabled</span>`;
+  const p50 = (o.detection_latency_ms_p50==null)
+    ? "—" : `${Math.round(o.detection_latency_ms_p50)}ms`;
+  const header =
+    `<div><b>OPPORTUNITY SCANNER</b> <span class="tag warn">OBSERVATION · $0</span> · ` +
+    `<span class="dim">observations</span> ${o.observation_count||0} · ` +
+    `<span class="dim">detect p50</span> ${p50}</div>`;
+
+  const feedSel =
+    `<select class="oppNotesSel">` +
+      `<option value="noteworthy">Noteworthy</option>` +
+      `<option value="all">All posts</option>` +
+    `</select>`;
+  const notes = (oppNotesMode === "all") ? oppNotesAllCache : (o.notes||[]);
+  const feedBody = (notes == null)
+    ? `<span class="muted">loading all posts…</span>`   // fetch in flight
+    : oppNoteCardsHtml(notes);
+
   return header +
-    `<h2 class="dim" style="margin-top:8px">Actionable view — trajectory → edge → reachability</h2>` +
-    `<div class="scroll" style="max-height:220px">${oppRowsHtml(o.standard, false)}</div>` +
-    `<h2 class="dim" style="margin-top:10px">Exploration lane — unconventional reads ` +
-    `<span class="tag" title="Separate from the standard view; observation-only; never reorders or contaminates it">SEPARATE · OBSERVATION-ONLY</span></h2>` +
-    `<div class="scroll" style="max-height:220px">${oppRowsHtml(o.exploratory, true)}</div>` +
-    lat;
+    `<h2 class="dim" style="margin-top:8px">Actionable — trajectory → edge → reachability</h2>` +
+    `<div class="scroll" style="max-height:220px">${oppStandardHtml(o.standard)}</div>` +
+    `<div class="opp-expl">` +
+      `<h2 class="dim">Exploratory · unconventional reads — observation only</h2>` +
+      `<div class="scroll" style="max-height:220px">${oppExploratoryHtml(o.exploratory)}</div>` +
+    `</div>` +
+    `<h2 class="dim" style="margin-top:10px">Reasoning feed</h2>` +
+    `<div>${feedSel}</div>` +
+    `<div class="muted" style="font-size:11px;margin:2px 0 6px">` +
+      `Noteworthy = the agent's genuine non-obvious reads; outcome track-record ` +
+      `is meaningful here. 'All posts' includes routine notes.</div>` +
+    `<div class="scroll" style="max-height:300px">${feedBody}</div>`;
+}
+
+function bindOppNotesFilters(){
+  // The select re-renders with every snapshot (same convention as the
+  // balance panel's buttons); its VALUE is restored from the module-level
+  // mode so the operator's choice survives the 2Hz re-render. Switching to
+  // "All posts" fires a GET read — the panel's only fetch, never a write.
+  document.querySelectorAll(".oppNotesSel").forEach(sel => {
+    sel.value = oppNotesMode;
+    sel.onchange = async () => {
+      oppNotesMode = sel.value;
+      oppNotesAllCache = null;
+      if(oppNotesMode === "all"){
+        if(STATE && STATE.ts) updateUI(STATE);      // show "loading…"
+        try{
+          const r = await fetch("/api/opportunity_notes?noteworthy=false&limit=100");
+          const d = await r.json();
+          oppNotesAllCache = (d && d.ok) ? (d.notes||[]) : [];
+        }catch(e){ oppNotesAllCache = []; }
+      }
+      if(STATE && STATE.ts) updateUI(STATE);
+    };
+  });
 }
 
 /* ---------- balance agent panel ---------- */
@@ -1319,7 +1461,7 @@ function fundingDetailHtml(state){
 }
 
 function opportunityDetailHtml(state){
-  return `<div class="card">${opportunityPanelHtml(state.opportunity)}</div>`;
+  return `<div class="card">${opportunityPanelHtml(state.opportunities)}</div>`;
 }
 
 function balanceDetailHtml(state){

@@ -52,6 +52,7 @@ Top-level keys, in order:
 | **`xchain`** *(v2)* | dict | cross-chain panel — status, capital, chains, best_pair, inventory_targets, today_summary |
 | **`funding`** *(v2)* | dict | funding-rate panel — status, capital, venue, symbols, positions, today_summary |
 | **`balance`** *(v2)* | dict | balance-agent panel — status, pool, funds, nodes, in_transit, halted_pairs, today, pending_plan |
+| **`opportunities`** | dict | Opportunity Scanner panel (read-only; $0 observation) — enabled, observation_count, detection_latency_ms_p50, standard, exploratory, notes |
 
 ### `arb` (v2)
 
@@ -129,6 +130,46 @@ Sources: `BalanceAgent.get_pending_proposal()`, `_last_computed_targets`,
 `pending_plan.confirm_token` is non-null only while the arm window is
 open (in-memory only; expires at `REBALANCE_ARM_TIMEOUT_S` after arm).
 
+### `opportunities`
+
+```
+{
+  enabled:                   bool,          # settings.OPPORTUNITY_SCANNER_ENABLED
+  observation_count:         int,           # hypothesis-log rows
+  detection_latency_ms_p50:  int | null,    # median on-chain-event → first_seen gap
+  standard: [{                              # survivors, trajectory → edge → reachability
+    opp_type, protocol, chain, market_key,
+    first_seen:        "MM-DD HH:MM",       # UTC
+    competitor_trend,                       # HEADLINE — rendered first
+    competitor_count,
+    edge_annualized_pct: float | null,      # never rendered without trend adjacent
+    edge_confidence:     "low"|"medium"|"high",
+    reachability, window_status
+  }],
+  exploratory: [{                           # SAME survivor set, sorted by
+    ...standard fields, plus:               # unconventional_score; never merged
+    unconventional_score, unconventional_factors,
+    unconventional_rationale                # free text — rendered inline
+  }],
+  notes: [{                                 # noteworthy reasoning posts (push);
+    id, ts, body, factor_tags,              # the full feed is a pull (endpoint below)
+    edge_pct, competitor_trend, reachability,
+    noteworthy: bool,
+    was_right: "correct"|"incorrect"|"inconclusive"|null,
+    outcome_summary: string | null
+  }]
+}
+```
+Sources: `queries.get_ranked_opportunities(mode=...)`,
+`queries.get_opportunity_summary()`, `queries.get_opportunity_notes()`.
+Read-only — the panel exposes no action control; its one interactive
+element (the feed's Noteworthy/All-posts dropdown) fires a GET read.
+Lists cap at `OPPORTUNITY_PANEL_MAX_ROWS`; exploratory drops rows below
+`OPPORTUNITY_UNCONVENTIONAL_MIN_SCORE`; disqualified rows appear in
+neither list while `OPPORTUNITY_SHOW_DISQUALIFIED=False`, and the 6c
+counterfactual self-audit is deliberately NOT surfaced (DB-only, for
+later analysis).
+
 ---
 
 ## Navigation model (v3)
@@ -146,9 +187,11 @@ These are global; their behaviour does not depend on which agent — if any
 
 - `activeAgentId == null` → the **dashboard view** renders below the
   agent grid: metrics row, regime + sentiment, signal feed + approval,
-  circuit breakers + exchanges, **Open Positions**, **Session P&L**.
-  Nothing else — the v2 inline panels and the standalone Live Arb Feed
-  are gone from this view.
+  circuit breakers + exchanges, **Open Positions**, **Session P&L**,
+  and the **Opportunity Scanner panel** (read-only; standard +
+  exploratory views, reasoning feed — see the `opportunities` snapshot
+  block). The v2 inline panels and the standalone Live Arb Feed remain
+  gone from this view.
 - `activeAgentId == "<agent_id>"` → the **agent detail page** for that
   agent replaces the dashboard view content below the grid. The agent
   grid itself stays visible above so the operator can switch agents
@@ -164,12 +207,13 @@ and re-renders. Bound once at startup, outside any `safeRender`
 boundary, so it remains clickable even if the current detail page's
 body render throws.
 
-Agent grid: all six registered agents (`signal`, `arb`, `scalp`,
-`xchain`, `funding_arb`, `balance`) render uniform compact cards in this
-fixed order, regardless of whether they own a detail page. The active
-card is marked with the same outline style as an active session card
-(`outline:2px solid var(--tx0)`). Observation-mode agents
-(`xchain`, `funding_arb`) render at 70% opacity per the v2 OBS
+Agent grid: all seven registered agents (`signal`, `arb`, `scalp`,
+`xchain`, `funding_arb`, `balance`, `opportunity_scanner`) render
+uniform compact cards in this fixed order, regardless of whether they
+own a detail page. The active card is marked with the same outline
+style as an active session card (`outline:2px solid var(--tx0)`).
+Observation-mode agents (`xchain`, `funding_arb`,
+`opportunity_scanner`) render at 70% opacity per the v2 OBS
 convention.
 
 ## Per-agent detail pages
@@ -192,6 +236,7 @@ UI. The render function dispatched per agent_id:
 | `xchain`      | full `xchainPanelHtml(xchain)` |
 | `funding_arb` | full `fundingPanelHtml(funding)` |
 | `balance`     | full `balancePanelHtml(balance)` — includes the arm/confirm/cancel control block, which now lives on this detail page rather than on the dashboard |
+| `opportunity_scanner` | full `opportunityPanelHtml(opportunities)` — the same read-only panel as the dashboard card (standard + exploratory views, reasoning feed) |
 
 The four `*PanelHtml` functions (`arbFundPanelHtml`, `xchainPanelHtml`,
 `fundingPanelHtml`, `balancePanelHtml`) are unchanged from v2 — they
@@ -317,6 +362,7 @@ the error string. Never raises to the aiohttp layer.
 | `/api/session/{session_name}` | session trades + local clock for the session page |
 | `/api/ticker?exchange=<id>` | LED-ticker prices, proxied through the bot's ccxt layer (see below) |
 | `/api/coinlogo/{coin}` | coin-logo proxy (cryptocurrency-icons SVG, server-cached; 404 → grid letter-avatar fallback) |
+| `/api/opportunity_notes?noteworthy={true\|false}&limit={int}` | `{"ok": true, "notes": [...]}` — the reasoning feed's full-history pull (`noteworthy=true` default; `false` includes routine posts). Read-only; errors return `{"ok": false, "error": ...}`. The kill switch remains the only DB-writing endpoint. |
 
 ### `GET /api/ticker`
 
@@ -545,6 +591,10 @@ BALANCE_AUTO_DISPATCH             False                 v2 operator-gated dispat
 
 STABLECOIN_BENCHMARK_APR_PCT      5.0                   funding panel APR colour threshold
 FUNDING_DELTA_TOLERANCE_USD       5.0                   funding position delta colour threshold
+
+OPPORTUNITY_PANEL_MAX_ROWS        12                    max rows per view in the Opportunity Scanner panel
+  (panel also reads OPPORTUNITY_SCANNER_ENABLED, OPPORTUNITY_SHOW_DISQUALIFIED,
+   OPPORTUNITY_UNCONVENTIONAL_MIN_SCORE from the agent build)
 
 TICKER_EXCHANGES                  [kraken,…,hyperliquid] venues in the ticker dropdown
 TICKER_DEFAULT_EXCHANGE           "kraken"              fresh selection each page load

@@ -32,6 +32,8 @@ _TOP_LEVEL_KEYS = (
     "arb_history",
     # Web UI v2 — dedicated agent-panel keys.
     "arb", "xchain", "funding", "balance",
+    # Opportunity Scanner panel (read-only; $0 observation).
+    "opportunities",
 )
 
 
@@ -1397,3 +1399,218 @@ async def test_coinlogo_rejects_junk_names():
         assert r.status == 404
     finally:
         await client.close()
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Opportunity Scanner panel — `opportunities` snapshot block (read-only;
+# $0 observation) + GET /api/opportunity_notes (the reasoning feed's pull).
+#
+# Fixture-row tests seed a fresh SQLite via web_temp (same reload pattern as
+# the refresh-v1 block above); the key-presence and safe-fallback tests run
+# against the real project DB like the v2 panel tests.
+# ════════════════════════════════════════════════════════════════════════════
+
+
+def _seed_opportunity(q, mk, *, risk="survivable", trend="zero", count=0,
+                      edge=None, conf="low", reach="unknown", window="opening",
+                      score=None, factors=None, rationale=None,
+                      first_seen=None, labels_24h=None):
+    """One core row + its hypothesis-log observation (and optional 24h
+    forward labels) through the agent build's own query helpers."""
+    first_seen = first_seen or datetime.utcnow()
+    core_id = q.upsert_opportunity_core({
+        "opp_type": "liquidation", "protocol": "morpho", "chain": "base",
+        "market_key": mk, "asset_class": "defi_lending",
+        "detector_id": "createmarket", "first_seen": first_seen,
+        "risk_status": risk, "risk_flags": [],
+        "competitor_trend": trend, "competitor_count": count,
+        "edge_annualized_pct": edge, "edge_confidence": conf,
+        "reachability_verdict": reach, "window_status": window,
+        "unconventional_score": score,
+        "unconventional_factors": factors or [],
+        "unconventional_rationale": rationale,
+        "as_of": datetime.utcnow(),
+    })
+    q.save_opportunity_observation({
+        "core_id": core_id, "detector_id": "createmarket",
+        "opp_type": "liquidation", "first_seen": first_seen,
+        "feature_vector_json": {}, "detection_latency_ms": 1200.0,
+        "unconventional_score": score,
+        "unconventional_factors_json": factors or [],
+        "unconventional_rationale": rationale,
+    })
+    if labels_24h:
+        q.update_opportunity_labels(core_id, 24, labels_24h)
+    return core_id
+
+
+# ── Snapshot block ──────────────────────────────────────────────────────────
+
+def test_snapshot_includes_opportunities_keys():
+    """`opportunities` present with all sub-keys even with coordinator=None."""
+    ws = WebServer(coordinator=None, bot=None)
+    o = ws._build_snapshot()["opportunities"]
+    for k in ("enabled", "observation_count", "detection_latency_ms_p50",
+              "standard", "exploratory", "notes"):
+        assert k in o, f"missing opportunities.{k}"
+    assert isinstance(o["standard"], list)
+    assert isinstance(o["exploratory"], list)
+    assert isinstance(o["notes"], list)
+    assert isinstance(o["enabled"], bool)
+
+
+def test_snapshot_safe_when_opportunity_query_raises(monkeypatch):
+    """A raising DB read returns the complete empty-shape block — the
+    snapshot never raises (mirror test_snapshot_safe_when_coordinator_raises)."""
+    def boom(*a, **k):
+        raise RuntimeError("opportunity tables down")
+    monkeypatch.setattr("ui.web_server.db_queries.get_ranked_opportunities", boom)
+    monkeypatch.setattr("ui.web_server.db_queries.get_opportunity_summary", boom)
+    monkeypatch.setattr("ui.web_server.db_queries.get_opportunity_notes", boom)
+    ws = WebServer(coordinator=None, bot=None)
+    snap = ws._build_snapshot()           # must not raise
+    o = snap["opportunities"]
+    assert o["standard"] == [] and o["exploratory"] == [] and o["notes"] == []
+    assert o["observation_count"] == 0
+    assert o["detection_latency_ms_p50"] is None
+
+
+def test_opportunities_disabled_returns_placeholder_shape(monkeypatch):
+    monkeypatch.setattr(settings, "OPPORTUNITY_SCANNER_ENABLED", False)
+    ws = WebServer(coordinator=None, bot=None)
+    o = ws._build_snapshot()["opportunities"]
+    assert o["enabled"] is False
+    assert o["standard"] == [] and o["exploratory"] == [] and o["notes"] == []
+
+
+def test_opportunities_standard_and_exploratory_separate(web_temp):
+    """Same survivor set, two lists: standard ordered by trajectory (NOT by
+    unconventional_score), exploratory by score and carrying the rationale."""
+    wsm, db, q = web_temp
+    _seed_opportunity(q, "0xa", trend="zero", edge=10.0,
+                      score=0.4, factors=["factor_stack"], rationale="early read")
+    _seed_opportunity(q, "0xb", trend="rising_fast", edge=500.0,
+                      score=0.9, factors=["contrarian_reachability"],
+                      rationale="contrarian read")
+    o = wsm.WebServer(coordinator=None, bot=None)._build_snapshot()["opportunities"]
+    std_keys = [r["market_key"] for r in o["standard"]]
+    exp_keys = [r["market_key"] for r in o["exploratory"]]
+    assert std_keys == ["0xa", "0xb"]       # trajectory wins despite fatter edge
+    assert exp_keys == ["0xb", "0xa"]       # score order — the separate lane
+    assert set(std_keys) == set(exp_keys)   # same survivor set, never merged
+    for r in o["exploratory"]:
+        assert r["unconventional_rationale"]
+        # Edge never relays without trajectory adjacent — in both lists.
+        assert "competitor_trend" in r
+    for r in o["standard"]:
+        assert "competitor_trend" in r
+
+
+def test_opportunities_exploratory_respects_min_score(web_temp, monkeypatch):
+    wsm, db, q = web_temp
+    monkeypatch.setattr(settings, "OPPORTUNITY_UNCONVENTIONAL_MIN_SCORE", 0.3)
+    _seed_opportunity(q, "0xquiet", score=0.1, rationale="routine")
+    _seed_opportunity(q, "0xloud",  score=0.8, rationale="bold")
+    o = wsm.WebServer(coordinator=None, bot=None)._build_snapshot()["opportunities"]
+    assert [r["market_key"] for r in o["exploratory"]] == ["0xloud"]
+    # The standard view is untouched by the lane's noise floor.
+    assert {r["market_key"] for r in o["standard"]} == {"0xquiet", "0xloud"}
+
+
+def test_opportunities_disqualified_absent_by_default(web_temp, monkeypatch):
+    wsm, db, q = web_temp
+    monkeypatch.setattr(settings, "OPPORTUNITY_SHOW_DISQUALIFIED", False)
+    _seed_opportunity(q, "0xbad", risk="disqualified", edge=999.0, score=0.9,
+                      rationale="would have been juicy")
+    _seed_opportunity(q, "0xok", score=0.9, rationale="fine")
+    o = wsm.WebServer(coordinator=None, bot=None)._build_snapshot()["opportunities"]
+    assert [r["market_key"] for r in o["standard"]]    == ["0xok"]
+    assert [r["market_key"] for r in o["exploratory"]] == ["0xok"]
+
+
+def test_opportunities_rows_capped(web_temp, monkeypatch):
+    wsm, db, q = web_temp
+    monkeypatch.setattr(settings, "OPPORTUNITY_PANEL_MAX_ROWS", 3)
+    for i in range(6):
+        _seed_opportunity(q, f"0x{i}", score=0.9, rationale=f"read {i}")
+    o = wsm.WebServer(coordinator=None, bot=None)._build_snapshot()["opportunities"]
+    assert len(o["standard"]) == 3
+    assert len(o["exploratory"]) == 3
+    assert len(o["notes"]) <= 3
+
+
+# ── Reasoning-feed notes ────────────────────────────────────────────────────
+
+def test_snapshot_notes_noteworthy_only(web_temp, monkeypatch):
+    """The 2Hz snapshot pushes only noteworthy posts, newest first, capped;
+    routine posts are a pull via the endpoint."""
+    wsm, db, q = web_temp
+    monkeypatch.setattr(settings, "OPPORTUNITY_UNCONVENTIONAL_MIN_SCORE", 0.3)
+    t0 = datetime.utcnow()
+    _seed_opportunity(q, "0xold", score=0.8, rationale="older noteworthy",
+                      first_seen=t0 - timedelta(hours=2))
+    _seed_opportunity(q, "0xroutine", score=0.1, rationale="routine note",
+                      first_seen=t0 - timedelta(hours=1))
+    _seed_opportunity(q, "0xnew", score=0.9, rationale="newer noteworthy",
+                      first_seen=t0)
+    o = wsm.WebServer(coordinator=None, bot=None)._build_snapshot()["opportunities"]
+    bodies = [n["body"] for n in o["notes"]]
+    assert bodies == ["newer noteworthy", "older noteworthy"]   # newest first
+    assert all(n["noteworthy"] for n in o["notes"])
+
+
+@pytest.mark.asyncio
+async def test_opportunity_notes_endpoint_all_posts(web_temp, monkeypatch):
+    wsm, db, q = web_temp
+    monkeypatch.setattr(settings, "OPPORTUNITY_UNCONVENTIONAL_MIN_SCORE", 0.3)
+    _seed_opportunity(q, "0xnote", score=0.8, rationale="noteworthy read")
+    _seed_opportunity(q, "0xroutine", score=0.1, rationale="routine note")
+    client = await _client(wsm.WebServer(coordinator=None, bot=None))
+    try:
+        d_all = await (await client.get(
+            "/api/opportunity_notes?noteworthy=false&limit=50")).json()
+        assert d_all["ok"] is True
+        assert {n["body"] for n in d_all["notes"]} == {"noteworthy read",
+                                                       "routine note"}
+        d_nw = await (await client.get(
+            "/api/opportunity_notes?noteworthy=true&limit=50")).json()
+        assert d_nw["ok"] is True
+        assert [n["body"] for n in d_nw["notes"]] == ["noteworthy read"]
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_opportunity_notes_endpoint_safe_on_error(monkeypatch):
+    def boom(*a, **k):
+        raise RuntimeError("db down")
+    monkeypatch.setattr("ui.web_server.db_queries.get_opportunity_notes", boom)
+    ws = WebServer(coordinator=None, bot=None)
+    client = await _client(ws)
+    try:
+        r = await client.get("/api/opportunity_notes?noteworthy=false")
+        assert r.status == 200
+        d = await r.json()
+        assert d["ok"] is False
+        assert "error" in d
+    finally:
+        await client.close()
+
+
+def test_note_outcome_badge_field_present(web_temp):
+    """A note whose window resolved carries the was_right stamp + summary;
+    an unresolved note has them null (the UI renders no badge)."""
+    wsm, db, q = web_temp
+    _seed_opportunity(q, "0xresolved", score=0.8, rationale="paid off",
+                      first_seen=datetime.utcnow() - timedelta(hours=30),
+                      labels_24h={"realized_competitor_count": 0,
+                                  "realized_edge_decay": 12.0,
+                                  "window_status_at_horizon": "open"})
+    _seed_opportunity(q, "0xpending", score=0.8, rationale="jury's out")
+    notes = {n["body"]: n for n in q.get_opportunity_notes(
+        noteworthy_only=True, limit=10)}
+    resolved, pending = notes["paid off"], notes["jury's out"]
+    assert resolved["was_right"] == "correct"
+    assert "window open" in resolved["outcome_summary"]
+    assert pending["was_right"] is None
+    assert pending["outcome_summary"] is None

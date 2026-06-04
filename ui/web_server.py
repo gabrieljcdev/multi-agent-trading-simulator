@@ -300,6 +300,7 @@ class WebServer:
             web.get("/api/session/{session_name}", self.handle_session_detail),
             web.get("/api/ticker",                 self.handle_ticker),
             web.get("/api/coinlogo/{coin}",        self.handle_coinlogo),
+            web.get("/api/opportunity_notes",      self.handle_opportunity_notes),
             web.post("/action/approve",        self.handle_approve),
             web.post("/action/skip",           self.handle_skip),
             web.post("/action/kill",           self.handle_kill),
@@ -781,6 +782,33 @@ class WebServer:
             "trades":      trades,
         }, dumps=lambda o: json.dumps(_jsonable(o), default=str, allow_nan=False))
 
+    async def handle_opportunity_notes(self, request) -> web.Response:
+        """GET /api/opportunity_notes?noteworthy={true|false}&limit={int}
+        → {"ok": true, "notes": [...]} — the reasoning feed's "all posts"
+        view and pagination (a PULL; the 2Hz snapshot only pushes the
+        noteworthy default). READ-ONLY: writes nothing; the kill switch
+        remains the web UI's only DB-writing endpoint. Errors come back
+        as {"ok": false, "error": ...}, never as a raise."""
+        try:
+            noteworthy = (request.query.get("noteworthy", "true").lower()
+                          != "false")
+            try:
+                limit = int(request.query.get(
+                    "limit", getattr(settings, "OPPORTUNITY_PANEL_MAX_ROWS", 12)))
+            except (TypeError, ValueError):
+                limit = int(getattr(settings, "OPPORTUNITY_PANEL_MAX_ROWS", 12))
+            limit = max(1, min(limit, 500))
+            notes = db_queries.get_opportunity_notes(
+                noteworthy_only=noteworthy, limit=limit)
+            return web.json_response(
+                {"ok": True, "notes": notes},
+                dumps=lambda o: json.dumps(_jsonable(o), default=str,
+                                           allow_nan=False),
+            )
+        except Exception as e:
+            logger.debug("opportunity_notes endpoint failed: %s", e)
+            return web.json_response({"ok": False, "error": str(e)})
+
     # ── LED ticker (GET /api/ticker?exchange=<id>) ───────────────────────
 
     async def handle_ticker(self, request) -> web.Response:
@@ -1025,7 +1053,7 @@ class WebServer:
             "xchain":         self._snap_xchain(),
             "funding":        self._snap_funding(),
             "balance":        self._snap_balance(),
-            "opportunity":    self._snap_opportunity(),
+            "opportunities":  self._snap_opportunities(),
         }
 
     # ── Web UI v2 panel snapshots ───────────────────────────────────────
@@ -1238,75 +1266,103 @@ class WebServer:
             logger.debug("funding today_summary failed: %s", e)
         return out
 
-    def _snap_opportunity(self) -> dict:
-        """Opportunity Scanner panel (READ-ONLY — surfaces reasoning,
-        exposes no action control).
-
-        Two clearly-fenced lists: `standard` is the trajectory-ranked
-        actionable view (survivors only by default, every row leading
-        with competitor_trend — edge never travels without it);
-        `exploratory` is the FEATURE BLOCK 6b lane sorted by
-        unconventional_score, carrying the free-text rationale the
-        operator reads inline. The two never merge. Every read is
-        defensive — one broken read never crashes render.
-        """
-        out = {
-            "status":      "OFFLINE",
-            "standard":    [],
+    @staticmethod
+    def _opportunity_empty_block() -> dict:
+        """The complete safe-fallback shape — every sub-key present even
+        when a read raises or the tables are empty (snapshot iron rule)."""
+        return {
+            "enabled": bool(getattr(settings, "OPPORTUNITY_SCANNER_ENABLED",
+                                    False)),
+            "observation_count": 0,
+            "detection_latency_ms_p50": None,
+            "standard": [],
             "exploratory": [],
-            "summary": {
-                "n_core": 0, "n_survivable": 0, "n_disqualified": 0,
-                "n_observations": 0, "n_labeled": 0, "by_trend": {},
-                "mean_detection_latency_ms": 0.0,
-                "session_detection_latency_ms": 0.0,
-                "detection_latency_sla_ms": float(getattr(
-                    settings, "OPPORTUNITY_DETECTION_LATENCY_SLA_MS", 0.0)),
-                "candidates_seen_session": 0,
-            },
+            "notes": [],
         }
-        agent = self._get_agent("opportunity_scanner")
-        out["status"] = self._status_from(agent)
 
-        def _trim(row: dict) -> dict:
-            # Keep the snapshot light; competitor_trend ALWAYS rides
-            # beside the edge fields (render invariant).
-            return {
-                "opp_type":               row.get("opp_type"),
-                "protocol":               row.get("protocol"),
-                "chain":                  row.get("chain"),
-                "market_key":             row.get("market_key"),
-                "first_seen":             row.get("first_seen"),
-                "competitor_trend":       row.get("competitor_trend"),
-                "competitor_count":       row.get("competitor_count"),
-                "edge_annualized_pct":    row.get("edge_annualized_pct"),
-                "edge_confidence":        row.get("edge_confidence"),
-                "edge_display":           row.get("edge_display"),
-                "reachability_verdict":   row.get("reachability_verdict"),
-                "window_status":          row.get("window_status"),
-                "risk_status":            row.get("risk_status"),
-                "unconventional_score":   row.get("unconventional_score"),
-                "unconventional_factors": row.get("unconventional_factors") or [],
-                "unconventional_rationale": row.get("unconventional_rationale"),
-            }
+    @staticmethod
+    def _opportunity_row(row: dict, exploratory: bool) -> dict:
+        """One panel row. competitor_trend ALWAYS rides beside the edge
+        fields — edge is never relayed without trajectory adjacent."""
+        first_seen = row.get("first_seen") or ""
+        try:
+            ts = datetime.fromisoformat(first_seen).strftime("%m-%d %H:%M")
+        except (TypeError, ValueError):
+            ts = "—"
+        out = {
+            "opp_type":            row.get("opp_type"),
+            "protocol":            row.get("protocol"),
+            "chain":               row.get("chain"),
+            "market_key":          row.get("market_key"),
+            "first_seen":          ts,
+            "competitor_trend":    row.get("competitor_trend"),
+            "competitor_count":    row.get("competitor_count"),
+            "edge_annualized_pct": row.get("edge_annualized_pct"),
+            "edge_confidence":     row.get("edge_confidence"),
+            "reachability":        row.get("reachability_verdict"),
+            "window_status":       row.get("window_status"),
+        }
+        if exploratory:
+            out.update(
+                unconventional_score=row.get("unconventional_score"),
+                unconventional_factors=row.get("unconventional_factors") or [],
+                unconventional_rationale=row.get("unconventional_rationale"),
+            )
+        return out
 
+    def _snap_opportunities(self) -> dict:
+        """Opportunity Scanner panel block (READ-ONLY — monitoring, not
+        control; the agent is $0 observation-mode and so is its UI).
+
+        `standard` is the trajectory-ranked actionable view; `exploratory`
+        is the FEATURE BLOCK 6b lane sorted by unconventional_score with
+        the free-text rationale the operator reads inline. Same survivor
+        set, separate lists — they NEVER merge. Disqualified rows appear
+        in neither while OPPORTUNITY_SHOW_DISQUALIFIED=False; the 6c
+        counterfactual self-audit is deliberately NOT surfaced here (DB-
+        only, for later analysis — a future toggle would slot in via
+        show_disqualified).
+
+        `notes` carries the noteworthy reasoning posts only — the full
+        feed is a pull via GET /api/opportunity_notes, not a 2Hz push.
+        """
+        out = self._opportunity_empty_block()
+        if not out["enabled"]:
+            return out
+        max_rows = int(getattr(settings, "OPPORTUNITY_PANEL_MAX_ROWS", 12))
+        show_dq = bool(getattr(settings, "OPPORTUNITY_SHOW_DISQUALIFIED", False))
         try:
-            if agent is not None:
-                std = agent.get_ranked_view(mode="standard") or []
-                exp = agent.get_ranked_view(mode="exploratory") or []
-            else:
-                std = db_queries.get_ranked_opportunities(mode="standard")
-                exp = db_queries.get_ranked_opportunities(mode="exploratory")
-            out["standard"]    = [_trim(r) for r in std[:15]]
-            out["exploratory"] = [_trim(r) for r in exp[:15]]
+            std = db_queries.get_ranked_opportunities(
+                mode="standard", show_disqualified=show_dq)
+            out["standard"] = [self._opportunity_row(r, False)
+                               for r in std[:max_rows]]
         except Exception as e:
-            logger.debug("opportunity ranked views failed: %s", e)
+            logger.debug("opportunities standard view failed: %s", e)
         try:
-            if agent is not None:
-                out["summary"] = agent.get_observation_summary()
-            else:
-                out["summary"].update(db_queries.get_opportunity_summary())
+            exp = db_queries.get_ranked_opportunities(
+                mode="exploratory", show_disqualified=show_dq)
+            # The helper already applies the lane's noise floor; re-filter
+            # defensively so the panel can never regress below it.
+            floor = float(getattr(settings,
+                                  "OPPORTUNITY_UNCONVENTIONAL_MIN_SCORE", 0.3))
+            exp = [r for r in exp
+                   if float(r.get("unconventional_score") or 0.0) >= floor]
+            out["exploratory"] = [self._opportunity_row(r, True)
+                                  for r in exp[:max_rows]]
         except Exception as e:
-            logger.debug("opportunity summary failed: %s", e)
+            logger.debug("opportunities exploratory view failed: %s", e)
+        try:
+            summary = db_queries.get_opportunity_summary()
+            out["observation_count"] = int(summary.get("n_observations", 0))
+            out["detection_latency_ms_p50"] = summary.get(
+                "detection_latency_ms_p50")
+        except Exception as e:
+            logger.debug("opportunities summary failed: %s", e)
+        try:
+            out["notes"] = db_queries.get_opportunity_notes(
+                noteworthy_only=True, limit=max_rows)
+        except Exception as e:
+            logger.debug("opportunities notes failed: %s", e)
         return out
 
     def _snap_balance(self) -> dict:

@@ -415,6 +415,9 @@ OPPORTUNITY_EXPLORATION_ENABLED = True        # surface + study unconventional r
 OPPORTUNITY_UNCONVENTIONAL_MIN_SCORE = 0.3    # test: 0.1-0.6   score below which a row stays out of the exploratory view (noise floor for the lane)
 OPPORTUNITY_GATE_SELF_AUDIT_ENABLED = True    # log counterfactual outcomes on disqualified rows (6c) — LOGS ONLY, never loosens the gate
 
+# Web UI panel (read-only — monitoring, not control)
+OPPORTUNITY_PANEL_MAX_ROWS = 12               # test: 5-30   max rows per view in the dashboard panel
+
 # ══════════════════════════════════════════════════════════════════════════════
 # MOMENTUM SIGNAL (TRACK B)
 # ══════════════════════════════════════════════════════════════════════════════

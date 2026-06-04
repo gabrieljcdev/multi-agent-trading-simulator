@@ -2866,8 +2866,13 @@ def get_opportunity_summary() -> dict:
                     if o.detection_latency_ms is not None]
             if lats:
                 out["mean_detection_latency_ms"] = sum(lats) / len(lats)
+                from statistics import median
+                out["detection_latency_ms_p50"] = int(median(lats))
     except Exception:
         pass
+    # Always-present key (None until any latency is observed) — the web
+    # panel's "detection-layer grade" stat reads this.
+    out.setdefault("detection_latency_ms_p50", None)
     return out
 
 
@@ -2890,6 +2895,94 @@ def get_disqualified_opportunity_cores(limit: int = 200) -> list[dict]:
             .all()
         )
         return [_opportunity_core_to_dict(r) for r in rows]
+
+
+def get_opportunity_notes(noteworthy_only: bool = True,
+                          limit: int = 50) -> list[dict]:
+    """The agent's reasoning posts for the web panel feed — COMPOSED from
+    the hypothesis log, not a new table (the agent build owns all
+    opportunity writers; this is a pure read).
+
+    A "post" is an opportunity_observation row whose decision-time
+    unconventional_rationale is non-empty (the agent wrote prose).
+    noteworthy = unconventional_score >= OPPORTUNITY_UNCONVENTIONAL_MIN_SCORE
+    — the lane's noise floor; below it the post is a routine note. The
+    distinction matters statistically: the noteworthy feed's hit-rate is
+    the meaningful one, while across all posts some routine notes look
+    prescient by chance.
+
+    edge_pct / competitor_trend / reachability come from the joined core
+    row — the closest available stand-in for the at-write snapshot until
+    the agent stamps dedicated copies (the observation row predates any
+    competition data, so the core's values ARE the post-write history).
+
+    was_right is a deterministic outcome stamp derived from the earliest
+    backfilled forward-label horizon: window still opening/open at the
+    horizon → "correct" (the read flagged a window that stayed winnable),
+    closed → "incorrect", closing → "inconclusive"; null until the
+    backfill pass has resolved any horizon. Newest first, capped.
+    """
+    from config import settings
+    floor = float(getattr(settings, "OPPORTUNITY_UNCONVENTIONAL_MIN_SCORE", 0.3))
+    out: list[dict] = []
+    with get_session() as s:
+        rows = (
+            s.query(OpportunityObservation, OpportunityCore)
+            .join(OpportunityCore,
+                  OpportunityObservation.core_id == OpportunityCore.id)
+            .filter(OpportunityObservation.unconventional_rationale.isnot(None))
+            .filter(OpportunityObservation.unconventional_rationale != "")
+            .order_by(desc(OpportunityObservation.first_seen))
+            .all()
+        )
+    for obs, core in rows:
+        noteworthy = float(obs.unconventional_score or 0.0) >= floor
+        if noteworthy_only and not noteworthy:
+            continue
+        was_right, outcome_summary = _opportunity_note_outcome(obs)
+        out.append({
+            "id":               obs.id,
+            "ts":               (obs.first_seen.strftime("%m-%d %H:%M")
+                                 if obs.first_seen else "—"),
+            "body":             obs.unconventional_rationale,
+            "factor_tags":      list(obs.unconventional_factors_json or []),
+            "edge_pct":         core.edge_annualized_pct,
+            "competitor_trend": core.competitor_trend,
+            "reachability":     core.reachability_verdict,
+            "noteworthy":       noteworthy,
+            "was_right":        was_right,
+            "outcome_summary":  outcome_summary,
+        })
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _opportunity_note_outcome(obs) -> tuple[Optional[str], Optional[str]]:
+    """Outcome stamp for one note from its earliest resolved label
+    horizon. (None, None) while the window hasn't resolved."""
+    if obs.label_filled_at is None:
+        return None, None
+    statuses = obs.window_status_at_horizon_json or {}
+    if not statuses:
+        return None, None
+    try:
+        h = min(int(k) for k in statuses)
+    except (TypeError, ValueError):
+        return None, None
+    status = statuses.get(str(h))
+    counts = obs.realized_competitor_count_json or {}
+    count = counts.get(str(h))
+    if status in ("opening", "open"):
+        was_right = "correct"
+    elif status == "closed":
+        was_right = "incorrect"
+    else:
+        was_right = "inconclusive"
+    summary = f"{h}h: window {status}"
+    if count is not None:
+        summary += f", {count} competitor{'s' if count != 1 else ''}"
+    return was_right, summary
 
 
 def get_opportunity_detail(opp_type: str, core_id: int) -> dict:
