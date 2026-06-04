@@ -227,24 +227,25 @@ functions follow the same conventions:
 - All buttons disable on click and re-enable when the next snapshot
   reflects the new server state — never optimistically update local UI.
 
-### LED price ticker (page-level, not a tab panel)
+### LED price grid (page-level drawer, not a tab panel)
 
-A dot-matrix-styled strip pinned at the very top of the page (`#ledWrap`,
-`position: sticky`), above the top bar and the tab nav — visible on every
-view. It scrolls coin / price / 4h-% items right-to-left in a seamless
-loop (items rendered twice + `translateX(-50%)` keyframe). White symbols
-and prices; green-▲ / red-▼ / grey-▬ percentages with glows. Controls
-beneath the strip: exchange dropdown (defaults to
-`TICKER_DEFAULT_EXCHANGE` on every load — deliberately not persisted),
-speed slider (`--tickerDur` CSS var), Pause/Play, and a status LED with
-venue + last-update time.
+A dot-matrix-styled drawer at the very top of the page (`#ledWrap`),
+above the top bar and the tab nav — visible on every view. The header
+bar carries a collapse toggle (▲/▼), a status LED (green live / amber
+fetching / red no-data) with venue + pair count + last-update, and the
+exchange dropdown (defaults to `TICKER_DEFAULT_EXCHANGE` on every load —
+deliberately not persisted). The body is a 4-wide grid of LED tiles
+(`TICKER_GRID_BOXES`, 2-wide under 1100px), each tile listing
+`TICKER_ROWS_PER_BOX` pairs: white symbol, white price, green-▲ /
+red-▼ / grey-▬ 24h % with glows; a null pct renders `▬ —`.
 
 Data comes from `GET /api/ticker` polled every `TICKER_POLL_INTERVAL_S`
 seconds — a plain `fetch`, intentionally separate from the WebSocket
-snapshot. The venue list / default / poll cadence are injected
-server-side into the page by `_load_html` (the `__TICKER_CFG_JSON__`
-placeholder), so they're settings-driven without touching the WS schema.
-A per-coin error renders as a dim `--- COIN N/A ---` segment.
+snapshot. Polls are sequence-tagged so a slow venue's late reply can
+never overwrite a newer selection (the venue-switch race). The venue
+list / default / poll cadence / grid shape are injected server-side into
+the page by `_load_html` (the `__TICKER_CFG_JSON__` placeholder), so
+they're settings-driven without touching the WS schema.
 
 ---
 
@@ -313,24 +314,31 @@ the error string. Never raises to the aiohttp layer.
 
 ### `GET /api/ticker`
 
-Feeds the LED price strip. The browser never calls a venue directly —
-this endpoint fetches `fetch_ticker` + the current 4h candle's open via
-ccxt (reusing MarketData's clients where the venue is already connected,
-lazily building one otherwise) and returns:
+Feeds the LED price grid. The browser never calls a venue directly, and
+neither does this handler: a dedicated worker thread
+(`web_server._TickerWorker`, its own event loop so ccxt's heavy
+load_markets / bulk parsing never starves the dashboard loop) owns the
+venue clients, round-robins every configured venue with one bulk
+`fetch_tickers()` each per `TICKER_POLL_INTERVAL_S` cycle (bounded by
+`TICKER_FETCH_TIMEOUT_S`, 3× on the first markets-loading call), and
+writes finished payloads into a cache. The handler is a pure cache read
+— instant regardless of venue health:
 
 ```json
 {"ok": true, "exchange": "kraken", "label": "Kraken", "ts": "HH:MM:SS",
- "rows": [{"coin": "BTC", "price": 64210.5, "pct": 1.23},
-          {"coin": "ETH", "error": true}]}
+ "rows": [{"coin": "BTC", "symbol": "BTC/USD", "price": 64210.5, "pct": 1.23}]}
 ```
 
-`pct` is the move vs the current 4h open. A failing coin degrades to its
-own `{coin, error: true}` row (endpoint stays `ok: true`); only a total
-failure returns `{ok: false}` — the handler never raises. Responses are
-cached per venue for `TICKER_CACHE_TTL_S`. Unknown `exchange` falls back
-to `TICKER_DEFAULT_EXCHANGE`. Venue/symbol mapping lives in
-`web_server._TICKER_REGISTRY`; coins + venue list come from the
-`TICKER_*` settings.
+Rows are the venue's dollar-quoted pairs (USD/USDT/USDC), deduped per
+base, ranked by 24h quote volume, capped at the grid capacity
+(`TICKER_GRID_BOXES × TICKER_ROWS_PER_BOX`). `pct` is the 24h change
+from the bulk payload (null when the venue omits it); unusable entries
+are skipped. A venue's last good payload is sticky across failed
+refreshes. Before the worker's first payload for a venue the endpoint
+answers `{ok: false, error: "warming up"}`; unknown `exchange` falls
+back to `TICKER_DEFAULT_EXCHANGE`; the handler never raises. The venue
+registry (labels + accepted quotes) lives in
+`web_server._TICKER_REGISTRY`.
 
 ### `/action/kill`
 
@@ -528,12 +536,12 @@ BALANCE_AUTO_DISPATCH             False                 v2 operator-gated dispat
 STABLECOIN_BENCHMARK_APR_PCT      5.0                   funding panel APR colour threshold
 FUNDING_DELTA_TOLERANCE_USD       5.0                   funding position delta colour threshold
 
-TICKER_COINS                      ["BTC","ETH","SOL"]   coins on the LED strip
 TICKER_EXCHANGES                  [kraken,…,hyperliquid] venues in the ticker dropdown
 TICKER_DEFAULT_EXCHANGE           "kraken"              fresh selection each page load
-TICKER_CACHE_TTL_S                8                     server-side per-venue price cache
-TICKER_POLL_INTERVAL_S            15                    frontend /api/ticker poll cadence
-TICKER_FETCH_TIMEOUT_S            10                    per-coin fetch bound (slow venue → error row)
+TICKER_GRID_BOXES                 16                    LED tiles in the grid (4-wide)
+TICKER_ROWS_PER_BOX               5                     pairs per tile (capacity = boxes × rows)
+TICKER_POLL_INTERVAL_S            15                    worker refresh cycle + frontend poll cadence
+TICKER_FETCH_TIMEOUT_S            10                    worker per-venue bulk-fetch bound (3× first call)
 ```
 
 `BALANCE_AUTO_DISPATCH=False` is the v2 default — the operator confirms

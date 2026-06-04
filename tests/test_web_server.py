@@ -1193,49 +1193,88 @@ async def test_halt_logs_event(monkeypatch):
         await client.close()
 
 
-# ── LED ticker endpoint (GET /api/ticker) ──────────────────────────────────
+# ── LED price grid (GET /api/ticker + _TickerWorker row builder) ───────────
 
-def _ticker_stub_client(price: float = 64_000.0, open4h: float = 63_000.0):
-    """ccxt-shaped stub: fetch_ticker returns a fixed last price,
-    fetch_ohlcv one 4h candle whose open is open4h."""
-    client = MagicMock()
-    client.fetch_ticker = AsyncMock(return_value={"last": price})
-    client.fetch_ohlcv = AsyncMock(return_value=[[0, open4h, 0, 0, 0, 0]])
-    return client
+def _bulk_tickers(n: int = 10, quote: str = "USD") -> dict:
+    """fetch_tickers-shaped payload: n pairs, descending 24h volume
+    (C0 highest), all +1.5% on the day."""
+    return {
+        f"C{i}/{quote}": {"last": 100.0 + i, "percentage": 1.5,
+                          "quoteVolume": 1_000.0 * (n - i)}
+        for i in range(n)
+    }
+
+
+def _seed_ticker_cache(ws: WebServer, exchange: str, rows: list) -> dict:
+    payload = {"ok": True, "exchange": exchange, "label": exchange.title(),
+               "ts": "12:00:00", "rows": rows}
+    ws._ticker_cache[exchange] = (time.time(), payload)
+    return payload
+
+
+def test_ticker_rows_from_bulk_sorts_and_caps():
+    """Row builder: dollar-quoted pairs ranked by 24h volume, capped at the
+    grid capacity, highest-volume entries surviving the cap."""
+    cap = settings.TICKER_GRID_BOXES * settings.TICKER_ROWS_PER_BOX
+    rows = WebServer._ticker_rows_from_bulk(_bulk_tickers(300), ("USD",), cap)
+    assert len(rows) == cap
+    assert [r["coin"] for r in rows[:3]] == ["C0", "C1", "C2"]   # volume order
+    assert rows[0]["price"] == pytest.approx(100.0)
+    assert rows[0]["pct"] == pytest.approx(1.5)
+
+
+def test_ticker_rows_from_bulk_skips_unusable():
+    """Entries with no price, a non-dollar quote, or junk shapes are
+    skipped; a missing pct is kept as None (the grid renders it flat)."""
+    tickers = {
+        "GOOD/USD":  {"last": 5.0, "percentage": 2.0, "quoteVolume": 100.0},
+        "NOPX/USD":  {"last": None, "percentage": 1.0, "quoteVolume": 999.0},
+        "EURQ/EUR":  {"last": 9.0, "percentage": 1.0, "quoteVolume": 999.0},
+        "JUNK/USD":  {"last": "not-a-number", "quoteVolume": "x"},
+        "NOPCT/USD": {"last": 7.0, "quoteVolume": 50.0},
+    }
+    rows = WebServer._ticker_rows_from_bulk(tickers, ("USD",), 80)
+    assert {r["coin"] for r in rows} == {"GOOD", "NOPCT"}
+    by = {r["coin"]: r for r in rows}
+    assert by["NOPCT"]["pct"] is None
+
+
+def test_ticker_rows_from_bulk_dedupes_per_base():
+    """A base listed against two quotes keeps only its higher-volume row."""
+    tickers = {
+        "BTC/USD":  {"last": 64_000.0, "percentage": 1.0, "quoteVolume": 500.0},
+        "BTC/USDT": {"last": 64_010.0, "percentage": 1.1, "quoteVolume": 900.0},
+    }
+    rows = WebServer._ticker_rows_from_bulk(tickers, ("USD", "USDT"), 80)
+    assert len(rows) == 1
+    assert rows[0]["symbol"] == "BTC/USDT"   # higher volume wins
 
 
 @pytest.mark.asyncio
-async def test_ticker_endpoint_returns_rows(monkeypatch):
-    """GET /api/ticker?exchange=kraken → ok:true with one row per
-    configured coin, each carrying price + pct vs the 4h open. The venue
-    fetch is mocked — no live network call."""
+async def test_ticker_endpoint_serves_worker_snapshot():
+    """GET /api/ticker is a pure cache read of the worker's payload —
+    instant, no network on the request path."""
     ws = WebServer(coordinator=None, bot=None)
-    stub = _ticker_stub_client(price=64_000.0, open4h=63_000.0)
-    monkeypatch.setattr(ws, "_ticker_get_client", AsyncMock(return_value=stub))
+    payload = _seed_ticker_cache(ws, "kraken",
+                                 [{"coin": "BTC", "symbol": "BTC/USD",
+                                   "price": 64_000.0, "pct": 1.5}])
     client = await _client(ws)
     try:
         r = await client.get("/api/ticker?exchange=kraken")
         assert r.status == 200
         data = await r.json()
-        assert data["ok"] is True
-        assert data["exchange"] == "kraken"
-        coins = [row["coin"] for row in data["rows"]]
-        assert coins == list(settings.TICKER_COINS)
-        for row in data["rows"]:
-            assert row["price"] == pytest.approx(64_000.0)
-            # (64000-63000)/63000*100 = 1.5873 → rounded to 2dp
-            assert row["pct"] == pytest.approx(1.59, abs=0.01)
+        assert data == payload
     finally:
         await client.close()
 
 
 @pytest.mark.asyncio
-async def test_ticker_unknown_exchange_falls_back(monkeypatch):
-    """An unknown ?exchange= falls back to TICKER_DEFAULT_EXCHANGE and the
-    endpoint still answers ok:true."""
+async def test_ticker_unknown_exchange_falls_back():
+    """An unknown ?exchange= falls back to TICKER_DEFAULT_EXCHANGE."""
     ws = WebServer(coordinator=None, bot=None)
-    monkeypatch.setattr(ws, "_ticker_get_client",
-                        AsyncMock(return_value=_ticker_stub_client()))
+    _seed_ticker_cache(ws, settings.TICKER_DEFAULT_EXCHANGE,
+                       [{"coin": "BTC", "symbol": "BTC/USD",
+                         "price": 64_000.0, "pct": 1.5}])
     client = await _client(ws)
     try:
         r = await client.get("/api/ticker?exchange=nonsense_venue")
@@ -1247,40 +1286,31 @@ async def test_ticker_unknown_exchange_falls_back(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_ticker_per_coin_failure_is_isolated(monkeypatch):
-    """One coin's fetch raising marks ONLY that row {error: true}; the other
-    rows keep price/pct and the endpoint stays ok:true."""
+async def test_ticker_warming_when_worker_has_no_snapshot():
+    """Before the worker produces a venue's first payload the endpoint
+    answers {ok: false, error: 'warming up'} — instantly, never hanging."""
     ws = WebServer(coordinator=None, bot=None)
-    stub = _ticker_stub_client()
-
-    async def _tick(symbol):
-        if symbol.startswith("ETH"):
-            raise RuntimeError("venue hiccup")
-        return {"last": 64_000.0}
-
-    stub.fetch_ticker = AsyncMock(side_effect=_tick)
-    monkeypatch.setattr(ws, "_ticker_get_client", AsyncMock(return_value=stub))
     client = await _client(ws)
     try:
         r = await client.get("/api/ticker?exchange=kraken")
+        assert r.status == 200
         data = await r.json()
-        assert data["ok"] is True
-        by_coin = {row["coin"]: row for row in data["rows"]}
-        assert by_coin["ETH"].get("error") is True
-        assert "price" not in by_coin["ETH"]
-        assert by_coin["BTC"]["price"] == pytest.approx(64_000.0)
-        assert by_coin["SOL"]["price"] == pytest.approx(64_000.0)
+        assert data["ok"] is False
+        assert data["error"] == "warming up"
+        assert data["rows"] == []
     finally:
         await client.close()
 
 
 @pytest.mark.asyncio
-async def test_ticker_endpoint_never_raises(monkeypatch):
-    """A total fetch failure (client resolution blows up) returns a JSON
-    {ok: false} — never a 500."""
+async def test_ticker_endpoint_never_raises():
+    """Even a poisoned cache returns a JSON {ok: false} — never a 500."""
+    class _Boom(dict):
+        def get(self, *a, **k):
+            raise RuntimeError("poisoned cache")
+
     ws = WebServer(coordinator=None, bot=None)
-    monkeypatch.setattr(ws, "_ticker_get_client",
-                        AsyncMock(side_effect=RuntimeError("everything down")))
+    ws._ticker_cache = _Boom()
     client = await _client(ws)
     try:
         r = await client.get("/api/ticker?exchange=kraken")
@@ -1293,19 +1323,27 @@ async def test_ticker_endpoint_never_raises(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_ticker_cache_reduces_fetch_calls(monkeypatch):
-    """Two requests inside TICKER_CACHE_TTL_S hit the venue once: the
-    second is served from the per-exchange cache."""
+async def test_ticker_worker_refresh_writes_cache_and_sticky_on_error(monkeypatch):
+    """_TickerWorker._refresh_venue writes a payload into the server cache
+    from one bulk call; a later failing refresh keeps the last good payload
+    (sticky) instead of blanking the grid."""
+    from ui.web_server import _TickerWorker
+
     ws = WebServer(coordinator=None, bot=None)
-    stub = _ticker_stub_client()
-    monkeypatch.setattr(ws, "_ticker_get_client", AsyncMock(return_value=stub))
-    client = await _client(ws)
-    try:
-        r1 = await client.get("/api/ticker?exchange=kraken")
-        r2 = await client.get("/api/ticker?exchange=kraken")
-        assert (await r1.json())["ok"] and (await r2.json())["ok"]
-        # One fetch per coin, once — not twice.
-        assert stub.fetch_ticker.call_count == len(settings.TICKER_COINS)
-        assert stub.fetch_ohlcv.call_count == len(settings.TICKER_COINS)
-    finally:
-        await client.close()
+    worker = _TickerWorker(ws)
+    stub_client = MagicMock()
+    stub_client.fetch_tickers = AsyncMock(return_value=_bulk_tickers(10))
+    stub_client.markets = {"loaded": True}
+    ccxt_stub = MagicMock()
+    clients = {"kraken": stub_client}
+
+    await worker._refresh_venue(ccxt_stub, clients, "kraken")
+    ts1, payload = ws._ticker_cache["kraken"]
+    assert payload["ok"] is True
+    assert payload["rows"][0]["coin"] == "C0"
+
+    # Refresh fails → last good payload stays.
+    stub_client.fetch_tickers = AsyncMock(side_effect=RuntimeError("venue down"))
+    await worker._refresh_venue(ccxt_stub, clients, "kraken")
+    _, payload2 = ws._ticker_cache["kraken"]
+    assert payload2 == payload

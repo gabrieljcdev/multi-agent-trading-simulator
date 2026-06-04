@@ -1332,17 +1332,21 @@ WEB_UI_PUSH_INTERVAL_S = 0.5           # test: 0.25-2.0  (WebSocket push rate, s
 # rows, newest first; the DB is the backing store so they survive restarts.
 WEB_UI_SCALP_FEED_HISTORY = 30         # test: 10, 20, 30, 50
 
-# ── LED price ticker (web UI strip; GET /api/ticker) ────────────────────────
+# ── LED price grid (web UI drawer; GET /api/ticker) ─────────────────────────
 # Prices are PROXIED through the bot (browser never calls a venue directly).
-# Coins/venues are read by both the endpoint and the frontend, so adding a
-# coin is a one-line change here (+ a registry symbol entry in web_server.py
-# for a brand-new venue).
-TICKER_COINS            = ["BTC", "ETH", "SOL"]   # test: any ccxt-listed bases
+# A dedicated worker thread (ui/web_server._TickerWorker, own event loop so
+# heavy ccxt parsing never starves the dashboard) round-robins the venues
+# with one bulk fetch_tickers() each: pairs quoted in USD/USDT/USDC, deduped
+# per base, ranked by 24h quote volume, capped at the grid capacity
+# (TICKER_GRID_BOXES × TICKER_ROWS_PER_BOX). % move is the 24h change from
+# the bulk payload — no per-pair candle calls. GET /api/ticker is a pure
+# cache read of the worker's latest payload.
 TICKER_EXCHANGES        = ["kraken", "binance", "coinbase", "bybit", "hyperliquid"]
 TICKER_DEFAULT_EXCHANGE = "kraken"     # test: any of TICKER_EXCHANGES (fresh each page load)
-TICKER_CACHE_TTL_S      = 8            # test: 5-10   (server-side per-venue price cache)
-TICKER_POLL_INTERVAL_S  = 15           # test: 10-30  (frontend poll cadence)
-TICKER_FETCH_TIMEOUT_S  = 10           # test: 5-20   (per-coin fetch bound; slow/rate-starved venue → error row, never a hung request)
+TICKER_GRID_BOXES       = 16           # test: 8, 12, 16  (4-wide grid of LED tiles)
+TICKER_ROWS_PER_BOX     = 5            # test: 4-6        (pairs per tile; capacity = boxes × rows)
+TICKER_POLL_INTERVAL_S  = 15           # test: 10-30  (worker refresh cycle AND frontend poll cadence)
+TICKER_FETCH_TIMEOUT_S  = 10           # test: 5-20   (per-venue bulk-fetch bound in the worker; 3× on the first, markets-loading call)
 
 # ── Dashboard arb-opportunity panel colour ladder ───────────────────────────
 # Execution rate = executed / above_threshold. Green when we're catching

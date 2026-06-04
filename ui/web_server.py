@@ -28,6 +28,7 @@ import asyncio
 import json
 import logging
 import math
+import threading
 import time
 from collections import Counter, deque
 from datetime import datetime
@@ -57,25 +58,111 @@ _SESSION_TZ = {
     "OFF_HOURS": ("UTC",               "UTC"),
 }
 
-# LED ticker — per-venue symbol registry for GET /api/ticker. Maps a venue id
-# to its display label, the quote used for coins not explicitly listed, and
-# explicit per-coin symbols. Coins/venues themselves come from settings
-# (TICKER_COINS / TICKER_EXCHANGES); adding a NEW venue needs one entry here.
-# Hyperliquid is a ccxt-unified exchange in the installed version (4.5.x), so
-# all venues share the same fetch_ticker / fetch_ohlcv path.
+# LED price grid — per-venue registry for GET /api/ticker. Label + accepted
+# quote currencies (preference order, used only to filter the bulk
+# fetch_tickers payload to dollar-quoted pairs). All five venues support
+# ccxt's bulk fetch_tickers (verified 2026-06-04), so one API call per
+# refresh carries every pair with its 24h % included — no per-pair calls.
 _TICKER_REGISTRY = {
-    "kraken":      {"label": "Kraken",            "quote": "USD",
-                    "symbols": {"BTC": "BTC/USD", "ETH": "ETH/USD", "SOL": "SOL/USD"}},
-    "binance":     {"label": "Binance",           "quote": "USDT",
-                    "symbols": {"BTC": "BTC/USDT", "ETH": "ETH/USDT", "SOL": "SOL/USDT"}},
-    "coinbase":    {"label": "Coinbase",          "quote": "USD",
-                    "symbols": {"BTC": "BTC/USD", "ETH": "ETH/USD", "SOL": "SOL/USD"}},
-    "bybit":       {"label": "Bybit",             "quote": "USDT",
-                    "symbols": {"BTC": "BTC/USDT", "ETH": "ETH/USDT", "SOL": "SOL/USDT"}},
-    "hyperliquid": {"label": "Hyperliquid (DEX)", "quote": "USDC:USDC",
-                    "symbols": {"BTC": "BTC/USDC:USDC", "ETH": "ETH/USDC:USDC",
-                                "SOL": "SOL/USDC:USDC"}},
+    "kraken":      {"label": "Kraken",            "quotes": ("USD", "USDT", "USDC")},
+    "binance":     {"label": "Binance",           "quotes": ("USDT", "USDC")},
+    "coinbase":    {"label": "Coinbase",          "quotes": ("USD", "USDT", "USDC")},
+    "bybit":       {"label": "Bybit",             "quotes": ("USDT", "USDC")},
+    "hyperliquid": {"label": "Hyperliquid (DEX)", "quotes": ("USDC",)},
 }
+
+
+class _TickerWorker(threading.Thread):
+    """Dedicated thread + private event loop for the LED grid's venue fetches.
+
+    ccxt's load_markets / bulk fetch_tickers do heavy JSON parsing — run on
+    the dashboard's event loop they starve the 0.5s WebSocket push and every
+    HTTP request (observed: three concurrent load_markets stalled the whole
+    UI). This worker owns its OWN ccxt clients on its OWN loop (async-ccxt
+    clients are loop-bound, so none are borrowed from MarketData), serially
+    round-robins every configured venue, and writes finished payloads into
+    the server's _ticker_cache. The /api/ticker handler is then a pure cache
+    read — zero network on the request path. A venue's last good payload is
+    sticky: a failed refresh keeps showing it rather than blanking the grid.
+    """
+
+    daemon = True
+
+    def __init__(self, server: "WebServer"):
+        super().__init__(name="led-ticker-worker")
+        self._server = server
+        self._stop_evt = threading.Event()
+
+    def stop(self) -> None:
+        self._stop_evt.set()
+
+    def run(self) -> None:
+        try:
+            asyncio.run(self._main())
+        except Exception as e:
+            logger.warning(f"ticker worker died: {e}")
+
+    async def _main(self) -> None:
+        import ccxt.async_support as ccxt_async
+        clients: dict = {}
+        try:
+            while not self._stop_evt.is_set():
+                venues = [v for v in getattr(settings, "TICKER_EXCHANGES", [])
+                          if v in _TICKER_REGISTRY]
+                for ex in venues:
+                    if self._stop_evt.is_set():
+                        break
+                    await self._refresh_venue(ccxt_async, clients, ex)
+                # Pace the cycle: each venue refreshes about every
+                # TICKER_POLL_INTERVAL_S; 1s ticks keep shutdown snappy.
+                for _ in range(int(getattr(settings, "TICKER_POLL_INTERVAL_S", 15) or 15)):
+                    if self._stop_evt.is_set():
+                        break
+                    await asyncio.sleep(1)
+        finally:
+            for client in clients.values():
+                try:
+                    await client.close()
+                except Exception:
+                    pass
+
+    async def _refresh_venue(self, ccxt_async, clients: dict, ex: str) -> None:
+        reg = _TICKER_REGISTRY[ex]
+        try:
+            client = clients.get(ex)
+            if client is None:
+                klass = getattr(ccxt_async, ex, None)
+                if klass is None:
+                    return
+                client = klass({"enableRateLimit": True})
+                clients[ex] = client
+            timeout = float(getattr(settings, "TICKER_FETCH_TIMEOUT_S", 10) or 10)
+            # First fetch per venue includes load_markets — allow 3×.
+            if not getattr(client, "markets", None):
+                timeout *= 3
+            tickers = await asyncio.wait_for(client.fetch_tickers(), timeout=timeout)
+            cap = (int(getattr(settings, "TICKER_GRID_BOXES", 16) or 16)
+                   * int(getattr(settings, "TICKER_ROWS_PER_BOX", 5) or 5))
+            rows = WebServer._ticker_rows_from_bulk(
+                tickers, tuple(reg.get("quotes") or ("USD", "USDT", "USDC")), cap)
+            if not rows:
+                raise RuntimeError("no usable tickers")
+            self._server._ticker_cache[ex] = (time.time(), {
+                "ok":       True,
+                "exchange": ex,
+                "label":    reg["label"],
+                "ts":       datetime.utcnow().strftime("%H:%M:%S"),
+                "rows":     rows,
+            })
+        except Exception as e:
+            logger.debug(f"ticker worker {ex}: {type(e).__name__}: {e}")
+            # Sticky last-good: only write an error payload when we have
+            # nothing at all for this venue yet.
+            if ex not in self._server._ticker_cache:
+                self._server._ticker_cache[ex] = (time.time(), {
+                    "ok": False, "exchange": ex, "label": reg["label"],
+                    "error": (str(e) or type(e).__name__)[:120], "rows": [],
+                })
 
 
 def _session_for_hour(hour: int) -> str:
@@ -186,11 +273,11 @@ class WebServer:
         self._portfolio_cache: dict = {}
         self._agents_cache: list = []
 
-        # LED ticker — per-venue response cache {exchange_id: (ts, payload)}
-        # and ccxt clients WE built (and therefore must close in stop();
-        # clients borrowed from MarketData are never stored here).
+        # LED ticker — per-venue payload cache {exchange_id: (ts, payload)},
+        # written by the dedicated _TickerWorker thread (started in start());
+        # the /api/ticker handler only ever READS it.
         self._ticker_cache: dict = {}
-        self._ticker_owned_clients: dict = {}
+        self._ticker_worker: Optional[_TickerWorker] = None
 
     # ── Lifecycle ────────────────────────────────────────────────────────
 
@@ -231,6 +318,8 @@ class WebServer:
                                if v in _TICKER_REGISTRY},
                     "default": getattr(settings, "TICKER_DEFAULT_EXCHANGE", "kraken"),
                     "poll_s": int(getattr(settings, "TICKER_POLL_INTERVAL_S", 15) or 15),
+                    "boxes": int(getattr(settings, "TICKER_GRID_BOXES", 16) or 16),
+                    "rows_per_box": int(getattr(settings, "TICKER_ROWS_PER_BOX", 5) or 5),
                 })
                 html = html.replace("__TICKER_CFG_JSON__", cfg)
             except Exception as e:
@@ -260,6 +349,10 @@ class WebServer:
 
         self._running = True
         self._broadcast_task = asyncio.create_task(self._broadcast_loop())
+        # LED grid worker — its own thread + event loop so venue fetching
+        # never competes with the dashboard loop.
+        self._ticker_worker = _TickerWorker(self)
+        self._ticker_worker.start()
         logger.info(
             f"Web UI started at http://{settings.WEB_UI_HOST}:{settings.WEB_UI_PORT}"
         )
@@ -291,13 +384,15 @@ class WebServer:
         if self._log_handler is not None:
             logging.getLogger().removeHandler(self._log_handler)
             self._log_handler = None
-        # Close only the ticker clients WE built (MarketData owns the rest).
-        for client in list(self._ticker_owned_clients.values()):
+        # Stop the LED grid worker; it closes its own clients on its own
+        # loop. Bounded join off-loop so shutdown can't hang on it.
+        if self._ticker_worker is not None:
+            self._ticker_worker.stop()
             try:
-                await client.close()
+                await asyncio.to_thread(self._ticker_worker.join, 3)
             except Exception:
                 pass
-        self._ticker_owned_clients.clear()
+            self._ticker_worker = None
         logger.info("Web UI stopped")
 
     # ── Broadcast loop ───────────────────────────────────────────────────
@@ -673,11 +768,12 @@ class WebServer:
     # ── LED ticker (GET /api/ticker?exchange=<id>) ───────────────────────
 
     async def handle_ticker(self, request) -> web.Response:
-        """Proxied venue prices for the LED strip. NEVER raises — total
-        failure returns {ok: false}; a single coin's failure is isolated to
-        its row ({coin, error: true}) and the endpoint stays ok: true.
-        Responses are cached per venue for TICKER_CACHE_TTL_S so rapid polls
-        / multiple browser clients don't hammer free-tier rate limits."""
+        """Prices for the LED grid — a PURE CACHE READ. The _TickerWorker
+        thread refreshes every venue on its own loop and writes payloads
+        into _ticker_cache; this handler never touches the network, so it
+        answers instantly regardless of venue health. NEVER raises: an
+        unknown venue falls back to the default, a venue the worker hasn't
+        produced yet returns {ok: false, error: "warming up"}."""
         try:
             venues = list(getattr(settings, "TICKER_EXCHANGES", []) or [])
             venues = [v for v in venues if v in _TICKER_REGISTRY]
@@ -690,148 +786,64 @@ class WebServer:
             if exchange_id not in venues:
                 exchange_id = default
 
-            ttl = float(getattr(settings, "TICKER_CACHE_TTL_S", 8) or 8)
             cached = self._ticker_cache.get(exchange_id)
-            if cached is not None and (time.time() - cached[0]) < ttl:
-                return web.json_response(cached[1])
-
-            rows = await self._ticker_fetch_rows(exchange_id)
-            payload = {
-                "ok":       True,
-                "exchange": exchange_id,
-                "label":    _TICKER_REGISTRY[exchange_id]["label"],
-                "ts":       datetime.utcnow().strftime("%H:%M:%S"),
-                "rows":     rows,
-            }
-            self._ticker_cache[exchange_id] = (time.time(), payload)
-            return web.json_response(payload, dumps=lambda o: json.dumps(
+            if cached is None:
+                return web.json_response({
+                    "ok": False, "exchange": exchange_id,
+                    "label": _TICKER_REGISTRY[exchange_id]["label"],
+                    "error": "warming up", "rows": [],
+                })
+            return web.json_response(cached[1], dumps=lambda o: json.dumps(
                 _jsonable(o), default=str, allow_nan=False))
         except Exception as e:
             logger.debug(f"ticker endpoint failed: {e}")
             return web.json_response({"ok": False, "error": str(e)[:200]})
 
-    async def _ticker_fetch_rows(self, exchange_id: str) -> list:
-        """One row per TICKER_COINS coin. Per-coin failures degrade to
-        {coin, error: true}; only a missing client raises (the caller maps
-        that to ok: false)."""
-        client = await self._ticker_get_client(exchange_id)
-        if client is None:
-            raise RuntimeError(f"no exchange client for {exchange_id!r}")
-        timeout = float(getattr(settings, "TICKER_FETCH_TIMEOUT_S", 10) or 10)
-        rows = []
-        for coin in getattr(settings, "TICKER_COINS", ["BTC", "ETH", "SOL"]):
-            symbol = self._ticker_symbol(exchange_id, coin)
-            try:
-                # Bounded — a rate-starved venue (e.g. hyperliquid while the
-                # funding observer is consuming the shared per-IP budget)
-                # degrades to an error row instead of hanging the request.
-                price, pct = await asyncio.wait_for(
-                    self._ticker_fetch_coin(client, symbol), timeout=timeout)
-                rows.append({"coin": coin, "price": price, "pct": round(pct, 2)})
-            except Exception as e:
-                logger.debug(f"ticker {exchange_id} {coin}: {e}")
-                rows.append({"coin": coin, "error": True})
-        return rows
-
     @staticmethod
-    def _ticker_symbol(exchange_id: str, coin: str) -> str:
-        """Venue symbol for a coin: explicit registry entry, else
-        <coin>/<venue default quote> so adding a coin in settings just works."""
-        reg = _TICKER_REGISTRY.get(exchange_id, {})
-        sym = (reg.get("symbols") or {}).get(coin)
-        if sym:
-            return sym
-        return f"{coin}/{reg.get('quote', 'USDT')}"
+    def _ticker_rows_from_bulk(tickers: dict, quotes: tuple, cap: int) -> list:
+        """Filter a fetch_tickers payload to dollar-quoted pairs, keep the
+        highest-volume listing per base, sort by 24h quote volume, cap.
 
-    @staticmethod
-    async def _ticker_fetch_coin(client, symbol: str) -> tuple:
-        """(price, pct_vs_4h_open) for one symbol via ccxt unified methods.
-
-        Price: fetch_ticker last → close → bid/ask mid; falls back to
-        fetch_tickers([symbol]) (ccxt 4.5.x hyperliquid's fetch_ticker raises
-        a NameError internally; the plural form works). 4h open: the current
-        in-progress 4h candle anchored at the 4h boundary; venues without a
-        4h granularity (coinbase: 1h/2h/6h only) fall back to the 1h candle
-        AT the boundary — by definition the same open; last resort is the
-        tail of an unanchored 4h fetch."""
-        try:
-            t = await client.fetch_ticker(symbol)
-        except Exception:
-            t = (await client.fetch_tickers([symbol])).get(symbol) or {}
-        price = t.get("last") or t.get("close")
-        if not price:
-            bid, ask = t.get("bid"), t.get("ask")
-            if bid and ask:
-                price = (float(bid) + float(ask)) / 2.0
-        if not price:
-            raise ValueError("no price in ticker")
-        price = float(price)
-
-        four_h_ms = 4 * 3600 * 1000
-        boundary = int(time.time() * 1000) // four_h_ms * four_h_ms
-        ohlcv = None
-        try:
-            ohlcv = await client.fetch_ohlcv(symbol, timeframe="4h",
-                                             since=boundary, limit=1)
-        except Exception:
-            pass
-        if not ohlcv:
+        pct is ccxt's 24h `percentage` (computed from `open` when absent;
+        None when neither exists — the UI renders those flat/dim). Rows
+        with no usable last/close price are skipped — the bulk analogue of
+        the per-coin error isolation."""
+        best: dict = {}
+        for symbol, t in (tickers or {}).items():
             try:
-                ohlcv = await client.fetch_ohlcv(symbol, timeframe="1h",
-                                                 since=boundary, limit=1)
+                base, _, rest = symbol.partition("/")
+                quote = rest.split(":", 1)[0]
+                if not base or quote not in quotes:
+                    continue
+                price = t.get("last") or t.get("close")
+                if not price:
+                    continue
+                price = float(price)
+                pct = t.get("percentage")
+                if pct is None:
+                    op = t.get("open")
+                    if op:
+                        pct = (price - float(op)) / float(op) * 100.0
+                vol = t.get("quoteVolume")
+                if vol is None:
+                    bv = t.get("baseVolume")
+                    vol = float(bv) * price if bv else 0.0
+                vol = float(vol or 0.0)
+                cur = best.get(base)
+                if cur is None or vol > cur["_vol"]:
+                    best[base] = {
+                        "coin":   base,
+                        "symbol": symbol,
+                        "price":  price,
+                        "pct":    None if pct is None else round(float(pct), 2),
+                        "_vol":   vol,
+                    }
             except Exception:
-                pass
-        if not ohlcv:
-            ohlcv = await client.fetch_ohlcv(symbol, timeframe="4h", limit=2)
-        if not ohlcv:
-            raise ValueError("no 4h candle")
-        open4h = float(ohlcv[-1][1])
-        pct = ((price - open4h) / open4h * 100.0) if open4h > 0 else 0.0
-        return price, pct
-
-    async def _ticker_get_client(self, exchange_id: str):
-        """Resolve a ccxt async client for a venue. Prefers the bot's
-        existing MarketData clients (no extra connections for venues the bot
-        already talks to); otherwise builds one lazily, caches it, and
-        stop() closes it. Returns None when neither path can produce one."""
-        # 1. Borrow from MarketData (binance / kraken / bybit / mexc …).
-        try:
-            bot = self._coordinator.get_primary_bot() if self._coordinator else self._bot
-            md = getattr(bot, "_market_data", None)
-            client = (getattr(md, "_exchanges", {}) or {}).get(exchange_id)
-            if client is not None:
-                return client
-        except Exception:
-            pass
-        # 1b. Borrow the funding-venue plugin's ALREADY-BUILT client (the
-        # funding observer keeps a markets-loaded hyperliquid client; a
-        # second client would redo the big load_markets under the same
-        # per-IP rate budget). Read the cached attr only — never trigger a
-        # build from the web path.
-        try:
-            from execution.funding_venues import REGISTERED_FUNDING_VENUES
-            for venue in REGISTERED_FUNDING_VENUES:
-                if getattr(venue, "venue_id", None) == exchange_id:
-                    client = getattr(venue, "_exchange", None)
-                    if client is not None:
-                        return client
-        except Exception:
-            pass
-        # 2. Lazily build + own (coinbase / hyperliquid …).
-        client = self._ticker_owned_clients.get(exchange_id)
-        if client is not None:
-            return client
-        try:
-            import ccxt.async_support as ccxt_async
-            klass = getattr(ccxt_async, exchange_id, None)
-            if klass is None:
-                return None
-            client = klass({"enableRateLimit": True})
-            self._ticker_owned_clients[exchange_id] = client
-            return client
-        except Exception as e:
-            logger.debug(f"ticker client build {exchange_id}: {e}")
-            return None
+                continue
+        rows = sorted(best.values(), key=lambda r: -r["_vol"])[:cap]
+        for r in rows:
+            r.pop("_vol", None)
+        return rows
 
     # ── Snapshot ─────────────────────────────────────────────────────────
 

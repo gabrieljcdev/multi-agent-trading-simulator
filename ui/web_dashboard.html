@@ -103,61 +103,65 @@
   .pagehead{display:flex;align-items:center;gap:12px;flex-wrap:wrap;
     background:var(--bg0);border:1px solid var(--line);border-radius:4px;padding:8px 10px;margin-bottom:10px}
   .pagetitle{font-weight:bold;text-transform:capitalize;font-size:14px}
-  /* ── LED price ticker (always-dark strip; unaffected by theme toggle) ── */
-  .ledwrap{position:sticky;top:0;z-index:50;margin-bottom:10px}
-  .led{position:relative;height:70px;overflow:hidden;border-radius:6px;
-    background:
-      repeating-linear-gradient(0deg, rgba(255,255,255,.030) 0 1px, transparent 1px 3px),
-      repeating-linear-gradient(90deg, rgba(255,255,255,.030) 0 1px, transparent 1px 3px),
-      #0a0c0a;
-    border:1px solid #1d201d;box-shadow:inset 0 0 18px rgba(0,0,0,.85)}
-  .ledtrack{position:absolute;top:0;left:0;height:100%;display:inline-flex;
-    align-items:center;white-space:nowrap;will-change:transform;
-    animation:ledscroll var(--tickerDur,45s) linear infinite}
-  @keyframes ledscroll{from{transform:translateX(0)}to{transform:translateX(-50%)}}
-  .leditem{display:inline-flex;align-items:baseline;gap:8px;padding:0 18px;
-    font-family:ui-monospace,Menlo,Consolas,monospace;font-size:20px;
-    font-variant-numeric:tabular-nums;letter-spacing:.5px}
-  .ledsym{color:#fff;font-weight:bold;text-transform:uppercase;
+  /* ── LED price grid (always-dark drawer; unaffected by theme toggle) ── */
+  .ledwrap{margin-bottom:10px;border-radius:6px;overflow:hidden;
+    border:1px solid #1d201d;background:#0a0c0a}
+  .ledhead{display:flex;align-items:center;gap:10px;padding:6px 10px;
+    background:#0e100e;border-bottom:1px solid #1d201d;font-size:12px;
+    font-family:ui-monospace,Menlo,Consolas,monospace}
+  .ledtitle{color:#fff;font-weight:bold;letter-spacing:2px;
     text-shadow:0 0 6px rgba(255,255,255,.45)}
-  .ledpx{color:#fff;text-shadow:0 0 4px rgba(255,255,255,.30)}
-  .ledup{color:#27e07d;text-shadow:0 0 7px rgba(39,224,125,.6)}
-  .leddown{color:#ff4d4d;text-shadow:0 0 7px rgba(255,77,77,.6)}
-  .ledflat{color:#9a9a90;text-shadow:0 0 4px rgba(154,154,144,.4)}
+  .ledhead .dim{color:#8b8d84}
+  .ledhead select{background:#1a1c1a;color:#e8e8e0;border:1px solid #2a2d2a;
+    border-radius:3px;padding:2px 6px}
+  .ledhead button{background:#1a1c1a;color:#e8e8e0;border:1px solid #2a2d2a;
+    border-radius:3px;padding:1px 8px;cursor:pointer}
+  .ledgrid{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;padding:8px;
+    background:
+      repeating-linear-gradient(0deg, rgba(255,255,255,.02) 0 1px, transparent 1px 3px),
+      #0a0c0a}
+  @media (max-width:1100px){.ledgrid{grid-template-columns:repeat(2,1fr)}}
+  .ledwrap.closed .ledgrid{display:none}
+  .ledbox{background:
+      repeating-linear-gradient(90deg, rgba(255,255,255,.025) 0 1px, transparent 1px 3px),
+      #0d0f0d;
+    border:1px solid #1d201d;border-radius:4px;padding:6px 8px;
+    box-shadow:inset 0 0 12px rgba(0,0,0,.8);
+    font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px;
+    font-variant-numeric:tabular-nums}
+  .ledrow{display:flex;align-items:baseline;gap:6px;padding:1.5px 0;
+    white-space:nowrap;overflow:hidden}
+  .ledsym{color:#fff;font-weight:bold;text-transform:uppercase;width:5.5em;
+    overflow:hidden;text-overflow:ellipsis;
+    text-shadow:0 0 5px rgba(255,255,255,.40)}
+  .ledpx{color:#fff;margin-left:auto;text-shadow:0 0 4px rgba(255,255,255,.25)}
+  .ledpct{width:6.2em;text-align:right}
+  .ledup{color:#27e07d;text-shadow:0 0 6px rgba(39,224,125,.55)}
+  .leddown{color:#ff4d4d;text-shadow:0 0 6px rgba(255,77,77,.55)}
+  .ledflat{color:#9a9a90}
   .lederr{color:#55584f}
-  .ledsep{color:#3a3d38;padding:0 2px}
-  .ledfade{position:absolute;top:0;bottom:0;width:64px;pointer-events:none;z-index:2}
-  .ledfade.left{left:0;background:linear-gradient(90deg,#0a0c0a,transparent)}
-  .ledfade.right{right:0;background:linear-gradient(270deg,#0a0c0a,transparent)}
-  .ledctl{display:flex;align-items:center;gap:10px;flex-wrap:wrap;
-    padding:4px 2px 0;font-size:12px}
-  .ledctl select,.ledctl input[type=range]{background:var(--bg2);color:var(--tx0);
-    border:1px solid var(--line);border-radius:3px;padding:2px 6px}
   .leddot{display:inline-block;width:9px;height:9px;border-radius:50%;
     background:#555;box-shadow:0 0 5px rgba(0,0,0,.4)}
   .leddot.ok{background:#27e07d;box-shadow:0 0 6px rgba(39,224,125,.8)}
   .leddot.bad{background:#ff4d4d;box-shadow:0 0 6px rgba(255,77,77,.8)}
+  .leddot.wait{background:#e0c44d;box-shadow:0 0 6px rgba(224,196,77,.8)}
 </style>
 </head>
 <body>
 <div class="wrap" id="root">
 
-  <!-- LED PRICE TICKER (page-level; pinned above everything incl. tab nav;
+  <!-- LED PRICE GRID (page-level drawer; above everything incl. tab nav;
        data proxied via GET /api/ticker — the browser never calls a venue) -->
   <div class="ledwrap" id="ledWrap">
-    <div class="led">
-      <div class="ledtrack" id="ledTrack"></div>
-      <div class="ledfade left"></div><div class="ledfade right"></div>
-    </div>
-    <div class="ledctl">
+    <div class="ledhead">
+      <button id="ledToggle" title="collapse / expand">▲</button>
+      <span class="ledtitle">PRICES</span>
       <span class="leddot" id="ledDot"></span>
-      <span id="ledStatus" class="dim">ticker —</span>
+      <span id="ledStatus" class="dim">—</span>
       <span class="spacer"></span>
       <label class="dim">venue <select id="ledExchange"></select></label>
-      <label class="dim">speed <input type="range" id="ledSpeed" min="10" max="120" value="45"
-        title="seconds per loop"></label>
-      <button id="ledPause">Pause</button>
     </div>
+    <div class="ledgrid" id="ledGrid"></div>
   </div>
 
   <!-- TOP BAR (always visible) -->
@@ -1410,52 +1414,65 @@ function connect(){
   };
   ws.onerror = () => { try{ ws.close(); }catch(e){} };
 }
-/* ---------- LED price ticker ---------- */
+/* ---------- LED price grid ---------- */
 /* Config is injected by web_server._load_html (settings-driven); the literal
    below is only the fallback if the page is served raw from disk. */
 let TICKER_CFG = {exchanges:["kraken","binance","coinbase","bybit","hyperliquid"],
-                  labels:{}, default:"kraken", poll_s:15};
+                  labels:{}, default:"kraken", poll_s:15, boxes:16, rows_per_box:5};
 try{
   const inj = '__TICKER_CFG_JSON__';
   if (inj.charAt(0) === "{") TICKER_CFG = JSON.parse(inj);
 }catch(e){ console.error("ticker cfg parse:", e); }
 
-let ledTimer = null;
+let ledTimer = null, ledSeq = 0;
 function ledFmtPrice(p){
   if (p >= 1000) return p.toLocaleString(undefined,{maximumFractionDigits:0});
   if (p >= 10)   return p.toFixed(2);
-  return p.toFixed(4);
+  if (p >= 0.1)  return p.toFixed(4);
+  return p.toPrecision(3);
 }
-function ledItemHtml(r){
-  if (r.error) return `<span class="leditem lederr">--- ${esc(r.coin)} N/A ---</span>` +
-                      `<span class="ledsep">●</span>`;
-  const pct = (r.pct == null) ? 0 : r.pct;
-  const dir = pct > 0.05 ? "up" : (pct < -0.05 ? "down" : "flat");
-  const arrow = dir === "up" ? "▲" : (dir === "down" ? "▼" : "▬");
-  const sign = pct > 0 ? "+" : "";
-  return `<span class="leditem">` +
-    `<span class="ledsym">${esc(r.coin)}</span>` +
-    `<span class="ledpx">${ledFmtPrice(r.price)}</span>` +
-    `<span class="led${dir}">${arrow} ${sign}${pct.toFixed(2)}%</span>` +
-    `</span><span class="ledsep">●</span>`;
+function ledRowHtml(r){
+  const pct = r.pct;
+  let cls = "ledflat", arrow = "▬", txt = "—";
+  if (pct != null){
+    cls   = pct > 0.05 ? "ledup" : (pct < -0.05 ? "leddown" : "ledflat");
+    arrow = pct > 0.05 ? "▲" : (pct < -0.05 ? "▼" : "▬");
+    txt   = (pct > 0 ? "+" : "") + pct.toFixed(2) + "%";
+  }
+  return `<div class="ledrow"><span class="ledsym">${esc(r.coin)}</span>` +
+         `<span class="ledpx">${ledFmtPrice(r.price)}</span>` +
+         `<span class="ledpct ${cls}">${arrow} ${txt}</span></div>`;
 }
-function ledRender(data){
-  const dot = $("ledDot"), status = $("ledStatus"), track = $("ledTrack");
+function ledRender(data, seq){
+  if (seq !== ledSeq) return;   // superseded by a newer poll / venue switch
+  const dot = $("ledDot"), status = $("ledStatus"), grid = $("ledGrid");
   const label = (TICKER_CFG.labels||{})[data.exchange] || data.exchange || "?";
   const rows = data.rows || [];
-  const live = data.ok && rows.some(r => !r.error);
+  const live = data.ok && rows.length > 0;
   dot.className = "leddot " + (live ? "ok" : "bad");
-  status.textContent = `${label} · ${live ? "live" : "no data"} · ${data.ts || "--:--:--"}`;
-  if (!rows.length){ track.innerHTML = ""; return; }
-  const seg = rows.map(ledItemHtml).join("");
-  track.innerHTML = seg + seg;   // duplicate → seamless -50% loop
+  status.textContent = `${label} · ${live ? rows.length + " pairs" : "no data"} · ${data.ts || "--:--:--"}`;
+  if (!live){
+    grid.innerHTML = `<div class="ledbox lederr">no data from ${esc(label)}</div>`;
+    return;
+  }
+  const per = TICKER_CFG.rows_per_box || 5, nbox = TICKER_CFG.boxes || 16;
+  let html = "";
+  for (let b = 0; b < nbox; b++){
+    const chunk = rows.slice(b * per, (b + 1) * per);
+    if (!chunk.length) break;
+    html += `<div class="ledbox">${chunk.map(ledRowHtml).join("")}</div>`;
+  }
+  grid.innerHTML = html;
 }
 async function ledPoll(){
+  const seq = ++ledSeq;          // tag the request; stale replies are dropped
   const ex = $("ledExchange").value || TICKER_CFG.default;
+  $("ledDot").className = "leddot wait";
   try{
     const res = await fetch(`/api/ticker?exchange=${encodeURIComponent(ex)}`);
-    ledRender(await res.json());
+    ledRender(await res.json(), seq);
   }catch(e){
+    if (seq !== ledSeq) return;
     $("ledDot").className = "leddot bad";
     $("ledStatus").textContent = `${ex} · fetch failed`;
   }
@@ -1466,14 +1483,10 @@ function ledInit(){
   sel.innerHTML = (TICKER_CFG.exchanges||[]).map(v =>
     `<option value="${esc(v)}"${v===TICKER_CFG.default?" selected":""}>` +
     `${esc((TICKER_CFG.labels||{})[v]||v)}</option>`).join("");
-  sel.onchange = () => ledPoll();
-  $("ledSpeed").oninput = (e) =>
-    $("ledWrap").style.setProperty("--tickerDur", e.target.value + "s");
-  $("ledPause").onclick = () => {
-    const t = $("ledTrack");
-    const paused = t.style.animationPlayState === "paused";
-    t.style.animationPlayState = paused ? "running" : "paused";
-    $("ledPause").textContent = paused ? "Pause" : "Play";
+  sel.onchange = () => { $("ledStatus").textContent = "switching…"; ledPoll(); };
+  $("ledToggle").onclick = () => {
+    const closed = $("ledWrap").classList.toggle("closed");
+    $("ledToggle").textContent = closed ? "▼" : "▲";
   };
   ledPoll();
   ledTimer = setInterval(ledPoll, (TICKER_CFG.poll_s || 15) * 1000);
