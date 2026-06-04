@@ -1044,10 +1044,16 @@ class WebServer:
     @staticmethod
     def _status_from(agent, *, observation_attr: str = "observation_mode") -> str:
         """Map a (possibly None) agent's state to the panel's
-        RUNNING / OBSERVATION / OFFLINE / ERROR taxonomy."""
+        RUNNING / SIM-TRADING / OBSERVATION / OFFLINE / ERROR taxonomy.
+
+        SIM-TRADING = the agent is still observation-gated for live but is
+        running a bounded sim-capital trial (e.g. funding Phase 2a) — shown
+        distinctly so the operator can see the trial is actually trading."""
         if agent is None:
             return "OFFLINE"
         try:
+            if bool(getattr(agent, "_sim_trading", False)):
+                return "SIM-TRADING"
             if bool(getattr(agent, observation_attr, False)):
                 return "OBSERVATION"
             running = bool(getattr(agent, "_running", False))
@@ -1159,6 +1165,8 @@ class WebServer:
         out = {
             "status":         "OFFLINE",
             "capital_usd":    float(getattr(settings, "FUNDING_CAPITAL_USD", 0.0) or 0.0),
+            "sim_capital_usd": 0.0,
+            "margin_in_use_usd": 0.0,
             "venue":          "binance",
             "symbols":        [],
             "positions":      [],
@@ -1179,6 +1187,20 @@ class WebServer:
         }
         agent = self._get_agent("funding_arb")
         out["status"] = self._status_from(agent)
+        # Sim-capital trial (Phase 2a): the working capital the panel should
+        # show is the sim budget — FUNDING_CAPITAL_USD stays 0 by design
+        # (BalanceAgent ledger contract), so without this the panel reads $0
+        # while the agent is actively sim-trading.
+        try:
+            if bool(getattr(agent, "_sim_trading", False)):
+                sim_cap = float(getattr(settings, "FUNDING_SIM_CAPITAL_USD", 0.0) or 0.0)
+                out["sim_capital_usd"] = sim_cap
+                out["capital_usd"] = max(out["capital_usd"], sim_cap)
+                out["margin_in_use_usd"] = round(sum(
+                    float(getattr(p, "margin_used", 0.0) or 0.0)
+                    for p in (getattr(agent, "_positions", {}) or {}).values()), 2)
+        except Exception:
+            pass
         try:
             if agent is not None:
                 positions = getattr(agent, "_positions", None) or {}
@@ -1609,10 +1631,22 @@ class WebServer:
                         manually_halted = bool(halted_check(agent_id))
                     except Exception:
                         manually_halted = False
+                capital = round(float(getattr(a, "capital_allocated", 0.0) or 0.0), 2)
+                status = getattr(a, "status", "OFFLINE")
+                # Funding sim-capital trial: the allocation attr stays 0 by
+                # design (BalanceAgent ledger contract) — show the sim budget
+                # on the card so the trial is visible. Display-only; the
+                # coordinator's portfolio totals are untouched.
+                if agent_id == "funding_arb":
+                    live = self._get_agent("funding_arb")
+                    if bool(getattr(live, "_sim_trading", False)):
+                        capital = max(capital, round(float(getattr(
+                            settings, "FUNDING_SIM_CAPITAL_USD", 0.0) or 0.0), 2))
+                        status = "SIM-TRADING" if status == "RUNNING" else status
                 out.append({
                     "id":              agent_id,
-                    "status":          getattr(a, "status", "OFFLINE"),
-                    "capital":         round(float(getattr(a, "capital_allocated", 0.0) or 0.0), 2),
+                    "status":          status,
+                    "capital":         capital,
                     "daily_pnl":       round(float(getattr(a, "daily_pnl", 0.0) or 0.0), 2),
                     "trades_today":    int(getattr(a, "trades_today", 0) or 0),
                     "win_rate":        round(float(getattr(a, "win_rate_today", 0.0) or 0.0) * 100, 1),

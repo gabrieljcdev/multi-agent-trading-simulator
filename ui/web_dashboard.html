@@ -955,8 +955,11 @@ function fundingPanelHtml(f){
   const bApr = ts.blended_apr_pct || 0;
   const bench = STABLECOIN_BENCH_APR_FALLBACK;
   const aprCls = bApr >= bench ? "pos" : "dim";
+  const simNote = (f.sim_capital_usd||0) > 0
+    ? ` · margin $${(f.margin_in_use_usd||0).toFixed(0)}/$${(f.sim_capital_usd||0).toFixed(0)} sim`
+    : "";
   const header = obsHeader(
-    `<b>FUNDING</b> · ${esc(f.status||"OFFLINE")} · $${(f.capital_usd||0).toFixed(0)} · ` +
+    `<b>FUNDING</b> · ${esc(f.status||"OFFLINE")} · $${(f.capital_usd||0).toFixed(0)}${simNote} · ` +
     `venue: ${esc(f.venue||"—")} · blended APR ` +
     `<span class="${aprCls}">${bApr.toFixed(2)}%</span> · ` +
     `utilisation ${(ts.utilisation_pct||0).toFixed(0)}%`,
