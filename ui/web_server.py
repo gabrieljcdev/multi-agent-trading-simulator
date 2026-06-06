@@ -2136,6 +2136,18 @@ class WebServer:
             "claude_summary": getattr(sig, "claude_reasoning", "") or "",
         }
 
+    @staticmethod
+    def _fmt_exit_px(v) -> str:
+        """Compact price for the exit_target string: thousands get commas,
+        small prices keep 4 significant decimals."""
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return "—"
+        if abs(f) >= 1000:
+            return f"{f:,.0f}"
+        return (f"{f:.4f}".rstrip("0").rstrip(".")) or "0"
+
     def _snap_positions(self, bot) -> list:
         try:
             open_trades = db_queries.get_open_trades() or []
@@ -2165,14 +2177,33 @@ class WebServer:
                     pnl_pct = pnl_usd = 0.0
                 opened = getattr(t, "timestamp_open", None)
                 age_s = int((now - opened).total_seconds()) if opened else 0
+                # Deploying agent (item 5). Trade.strategy is only an agent
+                # id for the non-signal funds (scalp / funding_arb write
+                # their own names); the OrderRouter writes the ACTIVE
+                # strategy-PROFILE name ("default", "arb_only", …) for
+                # signal-fund trades, so anything that isn't a registered
+                # agent id maps to "signal" rather than leaking the profile
+                # name into the agent column / per-agent position filters.
+                strategy = getattr(t, "strategy", None) or ""
+                agent_id = strategy if strategy in _VALID_AGENTS else "signal"
+                # Exit the watcher is looking for (item 5): TP/SL from the
+                # trade row; funding/no-target rows fall back to "—".
+                tp = getattr(t, "take_profit", None)
+                sl = getattr(t, "stop_loss", None)
+                exit_parts = []
+                if tp:
+                    exit_parts.append(f"TP {self._fmt_exit_px(tp)}")
+                if sl:
+                    exit_parts.append(f"SL {self._fmt_exit_px(sl)}")
                 out.append({
-                    "agent":       getattr(t, "strategy", None) or "signal",
+                    "agent":       agent_id,
                     # Originating strategy/track (funding_arb | momentum |
                     # reversion | arb | ...). signal_type is the true track;
                     # strategy (the active strategy-profile name) is only a
                     # fallback for legacy rows written before signal_type.
                     "track":       getattr(t, "signal_type", None)
                                    or getattr(t, "strategy", None) or "signal",
+                    "exit_target": " / ".join(exit_parts) or "—",
                     "pair":        getattr(t, "pair", "?"),
                     "direction":   side or "—",
                     "entry":       round(entry, 4),

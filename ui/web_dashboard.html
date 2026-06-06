@@ -877,12 +877,14 @@ function signalFeedHtml(rows){
      || `<tr><td colspan="5" class="muted">no signals</td></tr>`) + `</tbody></table>`;
 }
 function positionsHtml(rows){
-  return `<table><thead><tr><th>agent</th><th>strat</th><th>pair</th><th>dir</th><th>entry</th><th>cur</th><th>size</th><th>P&amp;L</th><th>age</th></tr></thead><tbody>` +
+  // exit = the target the position watcher is looking for next
+  // ("TP x / SL y", server-derived exit_target; "—" when no targets).
+  return `<table><thead><tr><th>agent</th><th>strat</th><th>pair</th><th>dir</th><th>entry</th><th>cur</th><th>exit</th><th>size</th><th>P&amp;L</th><th>age</th></tr></thead><tbody>` +
     ((rows||[]).map(x =>
       `<tr><td class="dim">${esc(x.agent)}</td><td>${stratTagHtml(x.track||x.strategy)}</td><td>${esc(x.pair)}</td><td>${esc(x.direction)}</td>
-       <td>${x.entry}</td><td>${x.current}</td><td>${fmtUsd(x.size_usd)}</td>
+       <td>${x.entry}</td><td>${x.current}</td><td class="dim">${esc(x.exit_target||"—")}</td><td>${fmtUsd(x.size_usd)}</td>
        <td class="${cls(x.pnl_usd)}">${fmtUsd(x.pnl_usd)} ${fmtPct(x.pnl_pct)}</td><td class="dim">${fmtAge(x.age_s)}</td></tr>`).join("")
-     || `<tr><td colspan="9" class="muted">no open positions</td></tr>`) + `</tbody></table>`;
+     || `<tr><td colspan="10" class="muted">no open positions</td></tr>`) + `</tbody></table>`;
 }
 /* ---------- per-agent pause/play (Web UI v2 fixes item 3) ----------------
    RUNNING/SIM-TRADING/OBSERVATION → ⏸ Pause. PAUSED → ▶ Resume.
