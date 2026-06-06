@@ -2448,19 +2448,28 @@ def get_funding_today_summary() -> dict:
 
 def _capital_movement_to_dict(r) -> dict:
     """Stable dict shape the web layer renders. Used by both
-    get_capital_movements_recent and get_capital_movements_in_transit."""
+    get_capital_movements_recent and get_capital_movements_in_transit.
+    ts shows time-only for today's rows, date+time for older ones."""
     ts = r.timestamp
+    if ts is None:
+        ts_str = "—"
+    elif ts.date() == datetime.utcnow().date():
+        ts_str = ts.strftime("%H:%M:%S")
+    else:
+        ts_str = ts.strftime("%m-%d %H:%M")
     return {
         "id":            r.id,
-        "ts":            ts.strftime("%H:%M:%S") if ts else "—",
+        "ts":            ts_str,
         "from_fund":     r.from_fund,
         "to_fund":       r.to_fund,
         "from_exchange": r.from_exchange,
         "to_exchange":   r.to_exchange,
         "asset":         r.asset or "USDT",
         "amount_usd":    float(r.amount_usd or 0.0),
+        "mode":          r.mode or "sim",
         "state":         r.state or "pending",
         "initiated_by":  r.initiated_by or "",
+        "note":          r.note or "",
         "error":         r.error,
     }
 

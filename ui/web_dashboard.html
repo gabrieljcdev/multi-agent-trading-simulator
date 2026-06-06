@@ -296,6 +296,14 @@
            sit directly below Open Positions); Live Arb Feed and the four
            v2 panels moved into per-agent detail pages below. -->
       <div id="dashboard-content">
+        <!-- Capital deployment + movements (Web UI v2 fixes item 1) —
+             where capital sits per agent and the history of moves. -->
+        <div class="grid2" style="margin-bottom:10px">
+          <div class="card"><h2>Capital</h2><div id="capital"></div></div>
+          <div class="card"><h2>Capital Movements</h2>
+            <div class="scroll" id="capmoves" style="max-height:160px"></div></div>
+        </div>
+
         <div class="grid2" style="margin-bottom:10px">
           <div class="card"><h2>Regime</h2><div id="regime"></div></div>
           <div class="card"><h2>Sentiment</h2><div id="sentiment"></div></div>
@@ -688,6 +696,10 @@ function updateUI(s){
   $("m-wr-today").textContent   = (p.win_rate_today==null?"—":p.win_rate_today.toFixed(1)+"%");
   $("m-wr-alltime").textContent = (p.win_rate_alltime==null?"—":p.win_rate_alltime.toFixed(1)+"%");
 
+  // capital deployment + movements (Web UI v2 fixes item 1)
+  safeRender("capital",  () => capitalPanelHtml(s.capital));
+  safeRender("capmoves", () => capitalMovementsHtml((s.capital||{}).recent_movements));
+
   // agents — all six in a uniform grid; click sets activeAgentId.
   const byId = {}; (s.agents||[]).forEach(a => byId[a.id]=a);
   $("agents").innerHTML = AGENT_ORDER.map(id => {
@@ -842,6 +854,48 @@ function positionsHtml(rows){
        <td class="${cls(x.pnl_usd)}">${fmtUsd(x.pnl_usd)} ${fmtPct(x.pnl_pct)}</td><td class="dim">${fmtAge(x.age_s)}</td></tr>`).join("")
      || `<tr><td colspan="9" class="muted">no open positions</td></tr>`) + `</tbody></table>`;
 }
+/* ---------- capital deployment + movements (Web UI v2 fixes item 1) ----- */
+function stateChipHtml(state){
+  // pending / in_transit → amber, completed → green, failed → red.
+  const k = state==="failed" ? "err" : (state==="completed" ? "exec" : "warn");
+  return `<span class="chip ${k}">${esc(state||"—")}</span>`;
+}
+function capitalPanelHtml(c){
+  c = c || {};
+  const head =
+    `<div><span class="dim">Equity</span> <b>${fmtUsd(c.total_equity)}</b> · ` +
+    `<span class="dim">Deployed</span> <b>${fmtUsd(c.total_deployed)}</b> · ` +
+    `<span class="dim">Idle</span> <b>${fmtUsd(c.total_idle)}</b></div>`;
+  const rows = (c.per_agent||[]).map(r => {
+    const rod = r.return_on_deployed_pct;
+    return `<tr><td class="dim">${esc(r.id)}</td><td>${fmtUsd(r.allocation)}</td>
+      <td>${fmtUsd(r.deployed)}</td><td class="dim">${fmtUsd(r.idle)}</td>
+      <td class="${cls(rod)}">${rod==null?"—":fmtPct(rod)}</td></tr>`;
+  }).join("") || `<tr><td colspan="5" class="muted">no agents</td></tr>`;
+  const table =
+    `<table><thead><tr><th>agent</th><th>alloc</th><th>deployed</th>` +
+    `<th>idle</th><th>RoD %</th></tr></thead><tbody>${rows}</tbody></table>`;
+  const it = c.in_transit || [];
+  const transit = it.length
+    ? `<h2 class="dim" style="margin-top:8px">In transit</h2>` +
+      it.map(t =>
+        `<div>${esc(t.from_fund)}${t.from_exchange?` <span class="dim">(${esc(t.from_exchange)})</span>`:""}` +
+        ` → ${esc(t.to_fund)}${t.to_exchange?` <span class="dim">(${esc(t.to_exchange)})</span>`:""}` +
+        ` ${fmtUsd(t.amount_usd)} ${stateChipHtml(t.state)}</div>`).join("")
+    : "";
+  return head + table + transit;
+}
+function capitalMovementsHtml(rows){
+  rows = rows || [];                       // newest first (server-ordered)
+  if(!rows.length) return `<span class="muted">No movements yet</span>`;
+  return rows.map(m =>
+    `<div class="logline"><span class="dim">${esc(m.ts)}</span> ` +
+    `${esc(m.from_fund)} → ${esc(m.to_fund)} <b>${fmtUsd(m.amount_usd)}</b> ` +
+    `<span class="chip">${esc(m.mode||"sim")}</span>${stateChipHtml(m.state)} ` +
+    `<span class="dim">${esc(m.initiated_by||"")}</span>` +
+    `${m.note?` <span class="dim">· ${esc(m.note)}</span>`:""}</div>`).join("");
+}
+
 function arbFeedHtml(rows){
   return `<table><thead><tr><th>t</th><th>pair</th><th>route</th><th>gap%</th><th>net</th><th>fees</th></tr></thead><tbody>` +
     ((rows||[]).map(x =>

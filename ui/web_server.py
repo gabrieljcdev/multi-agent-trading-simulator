@@ -1060,6 +1060,8 @@ class WebServer:
             "funding":        self._snap_funding(),
             "balance":        self._snap_balance(),
             "opportunities":  self._snap_opportunities(),
+            # Web UI v2 fixes — capital deployment + movements visibility.
+            "capital":        self._snap_capital(),
         }
 
     # ── Web UI v2 panel snapshots ───────────────────────────────────────
@@ -1614,6 +1616,98 @@ class WebServer:
         except Exception as e:
             logger.debug("balance pending_plan failed: %s", e)
 
+        return out
+
+    # Agent_id → fund_id for fund_capital_efficiency lookups. The scalp
+    # agent stewards the "mexc_scalp" fund (same mapping as _snap_balance).
+    _FUND_OF_AGENT = {"signal": "signal", "arb": "arb", "scalp": "mexc_scalp"}
+
+    def _snap_capital(self) -> dict:
+        """Web UI v2 fixes item 1 — where capital is deployed + the history
+        of moves. Snapshot iron rule: every key always present, every read
+        wrapped, safe fallback on failure — never raises.
+
+        per_agent reads the LIVE get_capital_allocation() /
+        get_open_position_notional() per registered agent (not the cached
+        stats row) so the panel tracks BalanceAgent rebalances as they land.
+        """
+        out = {
+            "total_equity":     0.0,
+            "total_deployed":   0.0,
+            "total_idle":       0.0,
+            "per_agent":        [],
+            "in_transit":       [],
+            "recent_movements": [],
+        }
+        try:
+            out["total_equity"] = round(float(
+                (self._portfolio_cache or {}).get("total_equity", 0.0) or 0.0), 2)
+        except Exception as e:
+            logger.debug("capital total_equity read failed: %s", e)
+
+        # Latest return-on-deployed% per fund (None until a row exists).
+        eff_by_fund: dict = {}
+        try:
+            for r in (db_queries.get_fund_efficiency_summary(24) or []):
+                eff_by_fund[r.get("fund")] = r.get("return_on_deployed_pct")
+        except Exception as e:
+            logger.debug("capital fund efficiency read failed: %s", e)
+
+        total_deployed = 0.0
+        for a in (self._agents_cache or []):
+            try:
+                agent_id = getattr(a, "agent_id", "?")
+                live = self._get_agent(agent_id)
+                # Live allocation; cached stats row is the fallback.
+                try:
+                    allocation = float(live.get_capital_allocation()) \
+                        if live is not None else \
+                        float(getattr(a, "capital_allocated", 0.0) or 0.0)
+                except Exception:
+                    allocation = float(getattr(a, "capital_allocated", 0.0) or 0.0)
+                try:
+                    deployed = float(live.get_open_position_notional()) \
+                        if live is not None else \
+                        float(getattr(a, "capital_deployed", 0.0) or 0.0)
+                except Exception:
+                    deployed = float(getattr(a, "capital_deployed", 0.0) or 0.0)
+                fund = self._FUND_OF_AGENT.get(agent_id, agent_id)
+                rod = eff_by_fund.get(fund)
+                out["per_agent"].append({
+                    "id":                      agent_id,
+                    "allocation":              round(allocation, 2),
+                    "deployed":                round(deployed, 2),
+                    "idle":                    round(allocation - deployed, 2),
+                    "return_on_deployed_pct":  (None if rod is None
+                                                else round(float(rod), 2)),
+                })
+                total_deployed += deployed
+            except Exception:
+                continue
+        out["total_deployed"] = round(total_deployed, 2)
+        out["total_idle"]     = round(out["total_equity"] - total_deployed, 2)
+
+        try:
+            out["in_transit"] = [
+                {
+                    "from_fund":     m.get("from_fund"),
+                    "to_fund":       m.get("to_fund"),
+                    "from_exchange": m.get("from_exchange"),
+                    "to_exchange":   m.get("to_exchange"),
+                    "amount_usd":    m.get("amount_usd", 0.0),
+                    "state":         m.get("state", "in_transit"),
+                }
+                for m in (db_queries.get_capital_movements_in_transit() or [])
+            ]
+        except Exception as e:
+            logger.debug("capital in_transit read failed: %s", e)
+
+        try:
+            n = int(getattr(settings, "WEB_UI_CAPITAL_MOVEMENTS_N", 15) or 15)
+            out["recent_movements"] = \
+                db_queries.get_capital_movements_recent(n) or []
+        except Exception as e:
+            logger.debug("capital recent_movements read failed: %s", e)
         return out
 
     @staticmethod

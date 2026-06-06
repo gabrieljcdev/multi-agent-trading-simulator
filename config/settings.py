@@ -1395,6 +1395,8 @@ WEB_UI_PUSH_INTERVAL_S = 0.5           # test: 0.25-2.0  (WebSocket push rate, s
 # scalp trades persist in the snapshot's scalp.closed_trades up to this many
 # rows, newest first; the DB is the backing store so they survive restarts.
 WEB_UI_SCALP_FEED_HISTORY = 30         # test: 10, 20, 30, 50
+# Rows in the dashboard's Capital Movements list (snapshot capital.recent_movements).
+WEB_UI_CAPITAL_MOVEMENTS_N = 15        # test: 10-50
 
 # ── LED price grid (web UI drawer; GET /api/ticker) ─────────────────────────
 # Prices are PROXIED through the bot (browser never calls a venue directly).
