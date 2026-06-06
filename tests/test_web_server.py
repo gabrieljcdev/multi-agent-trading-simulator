@@ -1597,6 +1597,62 @@ async def test_opportunity_notes_endpoint_safe_on_error(monkeypatch):
         await client.close()
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# Web UI v2 fixes item 4 — win-rate convention pinning.
+#
+# Verdict of the source→screen trace: NOT inverted. The convention is
+#   - query / agent layer:  FRACTION 0–1, win = pnl > 0
+#       get_signal_win_rate → wins/total          (queries.py)
+#       get_arb_stats       → wins/total          (queries.py)
+#       ScalpingAgent._win_rate_today → wins/len  (scalping_agent.py)
+#   - AgentStats.win_rate_today / win_rate_alltime: fraction (base.py)
+#   - coordinator.get_portfolio_stats overall_win_rate_today:
+#       trade-weighted mean of fractions → fraction
+#   - ui/web_server.py multiplies by 100 EXACTLY ONCE
+#       (_snap_portfolio + _snap_agents)
+#   - frontend renders toFixed(1)+"%" with no further transform.
+# These tests pin that contract so a future 1-x / double-×100 regression
+# fails loudly.
+# ════════════════════════════════════════════════════════════════════════════
+
+
+def test_win_rate_convention_query_fraction_snapshot_percent(web_temp):
+    """3 wins of 4 closed trades → 0.75 at the query layer, 75.0 in the box."""
+    wsm, db, q = web_temp
+    for pnl in (1.0, 2.0, 0.5):
+        _seed_trade(db, pnl_usd=pnl, pnl_pct=pnl)
+    _seed_trade(db, pnl_usd=-1.0, pnl_pct=-1.0)
+    wr = q.get_signal_win_rate(days=1, exclude_strategy="scalp")
+    assert wr["total"] == 4 and wr["wins"] == 3 and wr["losses"] == 1
+    assert wr["win_rate"] == pytest.approx(0.75)      # fraction at this layer
+    snap = wsm.WebServer(coordinator=None, bot=None)._build_snapshot()
+    # ×100 exactly once on the way to the Win Rate box — 75.0, not 25.0,
+    # not 0.75, not 7500.0.
+    assert snap["portfolio"]["win_rate_alltime"] == pytest.approx(75.0)
+
+
+@pytest.mark.asyncio
+async def test_win_rate_today_and_agent_cards_not_inverted():
+    """portfolio.win_rate_today and agents[].win_rate are percent renderings
+    of the coordinator's 0–1 fractions — no 1−x, no second ×100."""
+    rows = [SimpleNamespace(agent_id="signal", status="RUNNING",
+                            capital_allocated=100.0, daily_pnl=0.0,
+                            trades_today=4, win_rate_today=0.75)]
+    coord = SimpleNamespace(
+        get_agent=lambda aid: None,
+        get_primary_bot=lambda: None,
+        get_portfolio_stats=AsyncMock(
+            return_value={"overall_win_rate_today": 0.75}),
+        get_agent_stats=AsyncMock(return_value=rows),
+    )
+    ws = WebServer(coordinator=coord, bot=None)
+    await ws._refresh_coordinator()
+    snap = ws._build_snapshot()
+    assert snap["portfolio"]["win_rate_today"] == pytest.approx(75.0)
+    agents = {a["id"]: a for a in snap["agents"]}
+    assert agents["signal"]["win_rate"] == pytest.approx(75.0)
+
+
 def test_note_outcome_badge_field_present(web_temp):
     """A note whose window resolved carries the was_right stamp + summary;
     an unresolved note has them null (the UI renders no badge)."""
