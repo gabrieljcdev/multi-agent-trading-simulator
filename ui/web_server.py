@@ -1860,14 +1860,23 @@ class WebServer:
                         manually_halted = bool(halted_check(agent_id))
                     except Exception:
                         manually_halted = False
+                # Web UI v2 fixes item 2 — the card shows the LIVE deployable
+                # allocation (BalanceAgent rebalances land between stat
+                # refreshes), not the cached stats row. Cached value stays
+                # the fallback when the live agent isn't reachable.
                 capital = round(float(getattr(a, "capital_allocated", 0.0) or 0.0), 2)
+                live = self._get_agent(agent_id)
+                if live is not None:
+                    try:
+                        capital = round(float(live.get_capital_allocation()), 2)
+                    except Exception:
+                        pass
                 status = getattr(a, "status", "OFFLINE")
                 # Funding sim-capital trial: the allocation attr stays 0 by
                 # design (BalanceAgent ledger contract) — show the sim budget
                 # on the card so the trial is visible. Display-only; the
                 # coordinator's portfolio totals are untouched.
                 if agent_id == "funding_arb":
-                    live = self._get_agent("funding_arb")
                     if bool(getattr(live, "_sim_trading", False)):
                         capital = max(capital, round(float(getattr(
                             settings, "FUNDING_SIM_CAPITAL_USD", 0.0) or 0.0), 2))

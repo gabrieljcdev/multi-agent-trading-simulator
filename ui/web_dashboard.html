@@ -451,6 +451,8 @@ const SCALP_MAX_HOLD_SEC = 180;   // colour hold red past this (mirrors SCALP_MA
 /* current top-level view, driven by the hash router */
 let CURRENT = {view:"dashboard", agent:null, session:null};
 let detailTimer = null;
+/* Item 2 — previous snapshot's per-agent capital, for the ▲/▼ rebalance cue. */
+const AGENT_PREV_CAP = {};
 
 /* ---------- dark mode ---------- */
 function applyDark(on){
@@ -704,6 +706,13 @@ function updateUI(s){
   const byId = {}; (s.agents||[]).forEach(a => byId[a.id]=a);
   $("agents").innerHTML = AGENT_ORDER.map(id => {
     const a = byId[id] || {id, status:"OFFLINE", capital:0, daily_pnl:0, trades_today:0, win_rate:0};
+    // Item 2 — allocation-change cue: ▲/▼ beside cap for the one push cycle
+    // where the live get_capital_allocation() value moved (a rebalance
+    // landing). Compares against the previous snapshot only — CSS-free flash.
+    const prevCap = AGENT_PREV_CAP[id];
+    const capDelta = (prevCap!=null && a.capital!==prevCap)
+      ? ` <span class="${a.capital>prevCap?"pos":"neg"}">${a.capital>prevCap?"▲":"▼"}</span>` : "";
+    AGENT_PREV_CAP[id] = a.capital;
     const off    = (a.status==="OFFLINE");
     const obs    = OBSERVATION_AGENTS.has(id);
     const active = (activeAgentId === id);
@@ -718,7 +727,7 @@ function updateUI(s){
         aria-pressed="${active}">
       <div class="id">${esc((AGENT_NAME[id]||id).replace(" Agent",""))}</div>
       <div><span class="st ${esc(a.status)}">${esc(a.status)}</span></div>
-      <div class="dim">cap ${fmtUsd(a.capital)}</div>
+      <div class="dim">cap ${fmtUsd(a.capital)}${capDelta}</div>
       <div class="${cls(a.daily_pnl)}">${fmtUsd(a.daily_pnl)}</div>
       <div class="dim">${a.trades_today||0} tr · ${(a.win_rate||0).toFixed(1)}% wr</div>
     </div>`;
