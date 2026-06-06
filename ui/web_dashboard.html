@@ -95,6 +95,10 @@
   .agent.clickable:focus{outline:2px solid var(--tx1);outline-offset:1px}
   .agent.active-card{outline:2px solid var(--tx0);outline-offset:1px;background:var(--bg2)}
   .agent .id{font-weight:bold;text-transform:capitalize}
+  /* per-agent pause/play (Web UI v2 fixes item 3) */
+  .agpause{font-size:10px;padding:1px 6px;margin-top:3px}
+  .agpause.warnbtn{color:var(--warn);border-color:var(--warn)}
+  .agp-confirm{margin-top:3px}
   .st{font-size:11px;padding:1px 6px;border-radius:3px;background:var(--bg2)}
   .st.RUNNING{color:var(--pos)} .st.HALTED,.st.ERROR{color:var(--neg)} .st.PAUSED{color:var(--warn)}
   /* Web UI v3.1 — operator-initiated halt badge. Amber so it reads distinct
@@ -453,6 +457,12 @@ let CURRENT = {view:"dashboard", agent:null, session:null};
 let detailTimer = null;
 /* Item 2 — previous snapshot's per-agent capital, for the ▲/▼ rebalance cue. */
 const AGENT_PREV_CAP = {};
+/* Item 3 — per-agent pause/play. The five trading agents get a toggle;
+   observation-only scanner + balance do not. AG_PAUSE_ARM holds the armed
+   breaker-override confirm per agent ({reason, until}) — mirrors the kill
+   button's 3s arm→auto-disarm pattern. */
+const PAUSABLE_AGENTS = new Set(["signal","arb","scalp","xchain","funding_arb"]);
+const AG_PAUSE_ARM = {};
 
 /* ---------- dark mode ---------- */
 function applyDark(on){
@@ -730,6 +740,7 @@ function updateUI(s){
       <div class="dim">cap ${fmtUsd(a.capital)}${capDelta}</div>
       <div class="${cls(a.daily_pnl)}">${fmtUsd(a.daily_pnl)}</div>
       <div class="dim">${a.trades_today||0} tr · ${(a.win_rate||0).toFixed(1)}% wr</div>
+      ${agPauseBtnHtml(id, a)}
     </div>`;
   }).join("");
   document.querySelectorAll("#agents .agent").forEach(el => {
@@ -740,6 +751,16 @@ function updateUI(s){
     };
     el.onclick = go;
     el.onkeydown = (e) => { if(e.key==="Enter"||e.key===" "){ e.preventDefault(); go(); } };
+  });
+  // Pause/play buttons sit inside the clickable cards — stopPropagation so
+  // a toggle doesn't also navigate to the agent's detail page. Disabled on
+  // click; the next snapshot re-render restores them from server status.
+  document.querySelectorAll("#agents .agpause").forEach(b => {
+    b.onclick = (e) => {
+      e.stopPropagation();
+      b.disabled = true;
+      agPauseClick(b.dataset.agent);
+    };
   });
 
   // regime — coloured labels (Change 3a) + ADX/Hurst meters (Change 3b)
@@ -863,6 +884,71 @@ function positionsHtml(rows){
        <td class="${cls(x.pnl_usd)}">${fmtUsd(x.pnl_usd)} ${fmtPct(x.pnl_pct)}</td><td class="dim">${fmtAge(x.age_s)}</td></tr>`).join("")
      || `<tr><td colspan="9" class="muted">no open positions</td></tr>`) + `</tbody></table>`;
 }
+/* ---------- per-agent pause/play (Web UI v2 fixes item 3) ----------------
+   RUNNING/SIM-TRADING/OBSERVATION → ⏸ Pause. PAUSED → ▶ Resume.
+   HALTED (circuit breaker) → ▶ Resume in warning colour; the FIRST click
+   never overrides — the server answers halted_by_breaker + the reason, and
+   the card expands an inline arm→confirm ("Override & resume?", 3s
+   auto-disarm, same UX as the kill button). Only the second, explicit click
+   posts override_breaker:true. Drawdown halts get an extra warning line
+   (RUNBOOK: no automatic resume — manual review required). */
+function agPauseBtnHtml(id, a){
+  if(!PAUSABLE_AGENTS.has(id)) return "";
+  const st = String(a.status||"").toUpperCase();
+  if(st === "OFFLINE" || st === "STOPPED") return "";
+  const arm = AG_PAUSE_ARM[id];
+  if(arm && Date.now() < arm.until){
+    const dd = /drawdown/i.test(arm.reason)
+      ? `<div class="neg" style="font-size:10px">drawdown halt — manual review advised</div>` : "";
+    return `<div class="agp-confirm" style="font-size:10px">
+      <div class="warn">Halted: ${esc(arm.reason)}</div>${dd}
+      <button class="agpause armed" data-agent="${esc(id)}">Override &amp; resume?</button></div>`;
+  }
+  if(st === "HALTED")
+    return `<div><button class="agpause warnbtn" data-agent="${esc(id)}">▶ Resume</button></div>`;
+  if(st === "PAUSED")
+    return `<div><button class="agpause" data-agent="${esc(id)}">▶ Resume</button></div>`;
+  return `<div><button class="agpause" data-agent="${esc(id)}">⏸ Pause</button></div>`;
+}
+async function agPauseClick(id){
+  const a = ((STATE && STATE.agents) || []).find(x => x.id === id) || {};
+  const st = String(a.status||"").toUpperCase();
+  const arm = AG_PAUSE_ARM[id];
+  if(arm && Date.now() < arm.until){
+    // Second, explicit click — the deliberate breaker override.
+    delete AG_PAUSE_ARM[id];
+    const r = await postAction("/action/agent_pause",
+      {agent_id:id, paused:false, override_breaker:true});
+    if(!r.ok) console.error("agent_pause override failed:", r.error);
+    return;
+  }
+  delete AG_PAUSE_ARM[id];
+  if(st === "PAUSED" || st === "HALTED"){
+    // Plain play. On a breaker-halted agent the server refuses and returns
+    // the reason — that arms the inline confirm instead of resuming.
+    const r = await postAction("/action/agent_pause",
+      {agent_id:id, paused:false, override_breaker:false});
+    if(!r.ok && r.error === "halted_by_breaker"){
+      armAgPauseOverride(id, r.breaker_reason);
+    }else if(!r.ok){
+      console.error("agent_pause resume failed:", r.error);
+    }
+    return;
+  }
+  const r = await postAction("/action/agent_pause", {agent_id:id, paused:true});
+  if(!r.ok) console.error("agent_pause pause failed:", r.error);
+}
+function armAgPauseOverride(id, reason){
+  AG_PAUSE_ARM[id] = {reason: reason || "circuit_breaker", until: Date.now() + 3000};
+  setTimeout(() => {        // auto-disarm + repaint, kill-button style
+    if(AG_PAUSE_ARM[id] && Date.now() >= AG_PAUSE_ARM[id].until){
+      delete AG_PAUSE_ARM[id];
+      if(STATE && STATE.ts) updateUI(STATE);
+    }
+  }, 3100);
+  if(STATE && STATE.ts) updateUI(STATE);
+}
+
 /* ---------- capital deployment + movements (Web UI v2 fixes item 1) ----- */
 function stateChipHtml(state){
   // pending / in_transit → amber, completed → green, failed → red.

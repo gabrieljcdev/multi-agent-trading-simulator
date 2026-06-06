@@ -310,6 +310,7 @@ class WebServer:
             web.post("/action/rebalance",      self.handle_rebalance),
             web.post("/action/agent/{agent_id}/halt",   self.handle_agent_halt),
             web.post("/action/agent/{agent_id}/resume", self.handle_agent_resume),
+            web.post("/action/agent_pause",             self.handle_agent_pause),
         ])
         return app
 
@@ -726,6 +727,118 @@ class WebServer:
                 and result.get("error") == "agent_not_found"):
             return web.json_response(result, status=404)
         return web.json_response(result)
+
+    @staticmethod
+    def _breaker_state(agent) -> tuple:
+        """(halted_by_breaker, reason) for an agent. A circuit-breaker halt
+        is distinct from an operator PAUSE: signal carries it on
+        bot._cb_state (with the reason string the breaker fired with), arb
+        on the engine's HALTED status (reason synthesised from its
+        counters), anything else on a literal HALTED lifecycle status.
+        Never raises."""
+        try:
+            # Signal agent — CryptoBot's CircuitBreakerState is authoritative.
+            bot = getattr(agent, "bot", None) or getattr(agent, "_bot", None)
+            cb = getattr(bot, "_cb_state", None)
+            if cb is not None and bool(getattr(cb, "halted", False)):
+                return True, str(getattr(cb, "halt_reason", None)
+                                 or "circuit_breaker")
+            # Arb agent — engine flips to HALTED while _cb_triggered() holds.
+            # No reason string on the engine; synthesise from the counters.
+            engine = getattr(agent, "_engine", None)
+            if (engine is not None
+                    and str(getattr(engine, "_status", "")).upper() == "HALTED"):
+                losses = int(getattr(engine, "_consecutive_losses", 0) or 0)
+                pnl = float(getattr(engine, "_daily_pnl_usd", 0.0) or 0.0)
+                if losses >= int(getattr(settings, "ARB_CONSECUTIVE_LOSS_HALT",
+                                         10**9) or 10**9):
+                    return True, f"consecutive_loss {losses}"
+                return True, f"daily_loss ${pnl:.2f}"
+            # Generic — any agent whose lifecycle status reads HALTED.
+            if str(getattr(agent, "status", "")).upper() == "HALTED":
+                return True, "circuit_breaker"
+        except Exception:
+            pass
+        return False, ""
+
+    async def handle_agent_pause(self, request) -> web.Response:
+        """Web UI v2 fixes item 3 — POST /action/agent_pause
+        body: {"agent_id": str, "paused": bool, "override_breaker": bool}
+
+        paused=true  → await agent.pause()                (AGENT_PAUSE)
+        paused=false → await agent.resume()               (AGENT_RESUME)
+          - breaker-halted + override_breaker=false →
+              {"ok": false, "error": "halted_by_breaker",
+               "breaker_reason": "<reason>"} WITHOUT resuming. The frontend
+              then prompts the explicit arm→confirm override.
+          - breaker-halted + override_breaker=true → clear the breaker for
+            this agent, resume, and log a distinct AGENT_BREAKER_OVERRIDE
+            event. The breakers themselves are untouched — this is the
+            audited operator escape hatch the RUNBOOK warns about, never a
+            silent bypass.
+        Always {"ok": bool, ...}; never raises to aiohttp."""
+        coord = self._coordinator
+        if coord is None or not hasattr(coord, "get_agent"):
+            return web.json_response({"ok": False, "error": "no coordinator"})
+        body = await self._body(request)
+        agent_id = str(body.get("agent_id", "") or "")
+        try:
+            agent = coord.get_agent(agent_id)
+        except Exception:
+            agent = None
+        if agent is None:
+            return web.json_response({"ok": False, "error": "unknown agent"})
+        paused = bool(body.get("paused", True))
+        override = bool(body.get("override_breaker", False))
+
+        def _log(event_type: str, detail: str = "") -> None:
+            try:
+                db_queries.log_agent_event(
+                    agent_id, event_type,
+                    "source=web_ui" + (f" {detail}" if detail else ""))
+            except Exception as e:
+                logger.debug("log %s: %s", event_type, e)
+
+        try:
+            if paused:
+                await agent.pause()
+                _log("AGENT_PAUSE")
+                return web.json_response(
+                    {"ok": True, "status": getattr(agent, "status", "PAUSED")})
+
+            # Resume / play.
+            halted, reason = self._breaker_state(agent)
+            if halted and not override:
+                return web.json_response({
+                    "ok": False, "error": "halted_by_breaker",
+                    "breaker_reason": reason,
+                })
+            if halted and override:
+                # Deliberate operator override — clear this agent's CB state
+                # plus the coordinator-level trackers (same set resume_agent
+                # clears), logged loudly and as its own event type.
+                try:
+                    agent.clear_circuit_breakers()
+                except Exception as e:
+                    logger.debug("clear_circuit_breakers(%s): %s", agent_id, e)
+                try:
+                    fund_halted = getattr(coord, "_fund_halted", None)
+                    if fund_halted is not None:
+                        fund_halted.discard(agent_id)
+                    if getattr(coord, "_halted_by_portfolio_cb", False):
+                        coord._halted_by_portfolio_cb = False
+                except Exception:
+                    pass
+                logger.critical(
+                    "BREAKER OVERRIDE — operator resumed %s past '%s' via "
+                    "web UI", agent_id, reason)
+                _log("AGENT_BREAKER_OVERRIDE", f"breaker_reason={reason}")
+            await agent.resume()
+            _log("AGENT_RESUME")
+            return web.json_response(
+                {"ok": True, "status": getattr(agent, "status", "RUNNING")})
+        except Exception as e:
+            return web.json_response({"ok": False, "error": str(e)})
 
     async def handle_approve_window(self, request) -> web.Response:
         bot = self._resolve_bot()
