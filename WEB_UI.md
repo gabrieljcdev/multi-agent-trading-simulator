@@ -32,14 +32,14 @@ Top-level keys, in order:
 | `paused` | bool | bot._paused |
 | `approval_mode` | `"per_trade"\|"window"\|"autonomous"` | `settings.APPROVAL_MODE` |
 | `portfolio` | dict | `_snap_portfolio()` — bankroll, daily P&L, exposure, win rate |
-| `agents` | list[dict] | coordinator.get_agent_stats(), one row per registered agent (each row carries `manually_halted: bool` — Web UI v3.1) |
+| `agents` | list[dict] | coordinator.get_agent_stats(), one row per registered agent (each row carries `manually_halted: bool` — Web UI v3.1; `capital` reads the LIVE `agent.get_capital_allocation()` per push, cached stats as fallback — v2 fixes) |
 | `circuit_breakers` | dict | bot._cb_state + `settings.CIRCUIT_BREAKERS` |
 | `regime` | dict | `core.regime_detector` |
 | `sentiment` | dict | bot._sentiment latest |
 | `exchanges` | list[dict] | bot._market_data |
 | `signals` | list[dict] | `queries.get_signal_history(days=1)` |
 | `pending_signal` | dict\|null | bot.peek_pending() |
-| `positions` | list[dict] | `queries.get_open_trades()` + live prices |
+| `positions` | list[dict] | `queries.get_open_trades()` + live prices — each row carries the deploying `agent` (Trade.strategy mapped to a registered agent id; strategy-PROFILE names like "default" map to `signal`), the originating `track` (signal_type), and `exit_target` ("TP x / SL y", "—" when no targets) — v2 fixes |
 | `scalp` | dict | scalp agent + `queries.get_scalp_trade_history` |
 | `arb_feed` | list[dict] | recent arb trades |
 | `session_pnl` | dict | `queries.get_session_pnl_today()` |
@@ -53,6 +53,7 @@ Top-level keys, in order:
 | **`funding`** *(v2)* | dict | funding-rate panel — status, capital, venue, symbols, positions, today_summary |
 | **`balance`** *(v2)* | dict | balance-agent panel — status, pool, funds, nodes, in_transit, halted_pairs, today, pending_plan |
 | **`opportunities`** | dict | Opportunity Scanner panel (read-only; $0 observation) — enabled, observation_count, detection_latency_ms_p50, standard, exploratory, notes |
+| **`capital`** *(v2 fixes)* | dict | capital deployment + movements — totals, per-agent live allocation/deployed/idle + return-on-deployed%, in-transit moves, recent capital_movements rows |
 
 ### `arb` (v2)
 
@@ -170,6 +171,44 @@ neither list while `OPPORTUNITY_SHOW_DISQUALIFIED=False`, and the 6c
 counterfactual self-audit is deliberately NOT surfaced (DB-only, for
 later analysis).
 
+### `capital` (v2 fixes)
+
+```
+{
+  total_equity:     float,          # coordinator.get_portfolio_stats()
+  total_deployed:   float,          # Σ per_agent[].deployed
+  total_idle:       float,          # total_equity − total_deployed
+  per_agent: [{                     # one row per registered agent
+    id, allocation,                 # LIVE agent.get_capital_allocation()
+    deployed,                       # LIVE agent.get_open_position_notional()
+    idle,                           # allocation − deployed
+    return_on_deployed_pct          # latest fund_capital_efficiency row's
+  }],                               #   figure per fund; null until one exists
+  in_transit:       [{from_fund, to_fund, from_exchange, to_exchange,
+                      amount_usd, state}],
+  recent_movements: [               # last WEB_UI_CAPITAL_MOVEMENTS_N rows,
+    {ts, from_fund, to_fund,        #   newest first. ts is time-only for
+     from_exchange, to_exchange,    #   today's rows, date+time for older.
+     asset, amount_usd, mode,       #   mode: sim | live
+     state,                         #   pending|in_transit|completed|failed
+     initiated_by, note, error}
+  ]
+}
+```
+
+Sources: `coordinator.get_portfolio_stats()` (cached by the push loop),
+live per-agent reads via `coordinator.get_agent()` (the cached stats row
+is the fallback — this is what makes a BalanceAgent rebalance visible the
+push after it lands), `queries.get_fund_efficiency_summary(24)` (scalp
+agent → `mexc_scalp` fund), `queries.get_capital_movements_in_transit()`,
+`queries.get_capital_movements_recent(n)`.
+
+Renders as the **Capital** + **Capital Movements** cards at the top of the
+dashboard view: equity/deployed/idle header, per-agent table (return%
+coloured pos/neg), an In-transit subsection shown only when non-empty, and
+a scrollable newest-first movements list with mode + state chips
+("No movements yet" empty state).
+
 ---
 
 ## Navigation model (v3)
@@ -186,12 +225,14 @@ These are global; their behaviour does not depend on which agent — if any
 `activeAgentId` (default `null`):
 
 - `activeAgentId == null` → the **dashboard view** renders below the
-  agent grid: metrics row, regime + sentiment, signal feed + approval,
-  circuit breakers + exchanges, **Open Positions**, **Session P&L**,
-  and the **Opportunity Scanner panel** (read-only; standard +
-  exploratory views, reasoning feed — see the `opportunities` snapshot
-  block). The v2 inline panels and the standalone Live Arb Feed remain
-  gone from this view.
+  agent grid: metrics row, **Capital + Capital Movements** (v2 fixes —
+  see the `capital` snapshot block), regime + sentiment, signal feed +
+  approval, circuit breakers + exchanges, **Open Positions** (with
+  per-track colour badges and the `exit_target` column), and
+  **Session P&L**. The Opportunity Scanner panel moved to the scanner's
+  agent detail page — it previously rendered in both places and the
+  dashboard copy was removed as a duplicate. The v2 inline panels and
+  the standalone Live Arb Feed remain gone from this view.
 - `activeAgentId == "<agent_id>"` → the **agent detail page** for that
   agent replaces the dashboard view content below the grid. The agent
   grid itself stays visible above so the operator can switch agents
@@ -216,6 +257,19 @@ Observation-mode agents (`xchain`, `funding_arb`,
 `opportunity_scanner`) render at 70% opacity per the v2 OBS
 convention.
 
+Two v2-fixes additions on the cards:
+
+- a one-push **▲/▼ cue** beside the cap figure when the live allocation
+  moved since the previous snapshot (a BalanceAgent rebalance landing);
+- a **pause/play toggle** on the five trading agents (`signal`, `arb`,
+  `scalp`, `xchain`, `funding_arb`) wired to `/action/agent_pause` (see
+  below). RUNNING/SIM-TRADING/OBSERVATION → ⏸ Pause; PAUSED → ▶ Resume;
+  HALTED (circuit breaker) → ▶ Resume in warning colour whose FIRST
+  click never overrides — the card expands an inline arm→confirm
+  ("Override & resume?", 3s auto-disarm, kill-button UX) with an extra
+  warning line on drawdown halts. Buttons disable on click and re-render
+  from server status on the next push — no optimistic flip.
+
 ## Per-agent detail pages
 
 Each detail page starts with a uniform header strip:
@@ -230,13 +284,13 @@ UI. The render function dispatched per agent_id:
 
 | Agent | Body |
 |---|---|
-| `signal`      | open positions filtered to `agent=="signal"`; recent signal feed; self-review insights |
+| `signal`      | open positions filtered to `agent=="signal"`; recent signal feed; self-review insights. The signal agent is a shared execution layer — it executes on behalf of funding_arb / momentum / reversion etc., so the feed deliberately shows ALL tracks, each labelled with its colour badge (`.tag.strat-*`: funding_arb cyan, momentum orange, reversion purple, arb blue, scalp green, signal yellow, unknown grey — same map in the positions table and trade log) |
 | `arb`         | full `arbFundPanelHtml(arb, arb_feed, arb_history)` — exchanges table, gap distribution, recent fills, today's performance |
 | `scalp`       | OFI strip (placeholder — pending engine surface); open scalp positions (filtered `agent=="scalp"`); live + closed scalp feed (`scalpFeedHtml`); today's perf (placeholder) |
 | `xchain`      | full `xchainPanelHtml(xchain)` |
 | `funding_arb` | full `fundingPanelHtml(funding)` |
 | `balance`     | full `balancePanelHtml(balance)` — includes the arm/confirm/cancel control block, which now lives on this detail page rather than on the dashboard |
-| `opportunity_scanner` | full `opportunityPanelHtml(opportunities)` — the same read-only panel as the dashboard card (standard + exploratory views, reasoning feed) |
+| `opportunity_scanner` | full `opportunityPanelHtml(opportunities)` — the read-only panel (standard + exploratory views, reasoning feed); this detail page is now its ONLY surface — the duplicate dashboard card was removed |
 
 The four `*PanelHtml` functions (`arbFundPanelHtml`, `xchainPanelHtml`,
 `fundingPanelHtml`, `balancePanelHtml`) are unchanged from v2 — they
@@ -244,8 +298,12 @@ produce the same HTML they always have. They moved from inline panels
 on the dashboard into the corresponding agent's detail page.
 
 **Per-agent open positions** filter from `snapshot.positions[]` via the
-existing `agent` field (`_snap_positions` already tags every row with
-the owning agent_id; `signal` is the default when `strategy` is unset).
+`agent` field. `_snap_positions` maps `Trade.strategy` to a registered
+agent id: the non-signal funds write their own names (`scalp`,
+`funding_arb`, …), while router-written signal trades carry the ACTIVE
+strategy-PROFILE name ("default", "arb_only", …) — anything not in the
+registered set maps to `signal` (v2 fixes; previously the profile name
+leaked through and broke these filters).
 
 **Follow-up engine work** (placeholders rendered today, no server-side
 work in this build):
@@ -353,6 +411,7 @@ the error string. Never raises to the aiohttp layer.
 | `/action/rebalance` | see below | three-action arm/confirm/cancel |
 | `/action/agent/{agent_id}/halt`   | `{}` | `coordinator.halt_agent(id)`; logs `HALT_MANUAL` (v3.1) |
 | `/action/agent/{agent_id}/resume` | `{}` | `coordinator.resume_agent(id)`; logs `RESUME_MANUAL` (v3.1) |
+| `/action/agent_pause` | `{agent_id, paused, override_breaker?}` | `BaseAgent.pause()/resume()`; breaker-halted resume requires the explicit override; logs `AGENT_PAUSE` / `AGENT_RESUME` / `AGENT_BREAKER_OVERRIDE` (v2 fixes) |
 
 ### GET endpoints
 
@@ -537,6 +596,42 @@ update.
 (`BaseAgent._manually_halted`). A bot restart resets every agent to
 unhalted. Persisting halt state across restarts is a follow-up build.
 
+### `/action/agent_pause` (v2 fixes)
+
+```
+POST /action/agent_pause
+{"agent_id": "scalp", "paused": true|false, "override_breaker": false}
+
+→ {"ok": true,  "status": "<new status>"}
+| {"ok": false, "error": "unknown agent"}
+| {"ok": false, "error": "halted_by_breaker", "breaker_reason": "<reason>"}
+| {"ok": false, "error": "<exception string>"}
+```
+
+Wired to the existing `BaseAgent` lifecycle — `paused: true` →
+`await agent.pause()` (logs `AGENT_PAUSE`), `paused: false` →
+`await agent.resume()` (logs `AGENT_RESUME`), both `source=web_ui`.
+
+**Breaker override.** When the agent is halted by a **circuit breaker**
+(signal: `bot._cb_state.halted` with its reason string; arb: the
+engine's HALTED status with a reason synthesised from its counters;
+generic: a literal HALTED lifecycle status), a plain play returns
+`halted_by_breaker` + the reason WITHOUT resuming. Only an explicit
+`override_breaker: true` (the UI's second, armed confirm click) clears
+the agent's CB state (`clear_circuit_breakers()`) plus the
+coordinator's fund/portfolio trackers, resumes, and logs a distinct
+`AGENT_BREAKER_OVERRIDE` event carrying the overridden reason. The
+breakers themselves are never weakened — this is the audited operator
+escape hatch the RUNBOOK warns about (drawdown halts surface an extra
+warning in the confirm step: manual review required).
+
+**Pause vs halt (v3.1) — two different levers.** Halt skips the agent's
+*entry-creation path only* while exits keep running; pause flips the
+`BaseAgent` lifecycle status to PAUSED (the same mechanism the per-fund
+circuit breaker uses via `coordinator._safe_pause`). An operator pause
+on a fund whose CB condition still holds will be re-paused by the next
+monitor pass after a plain resume — that's deliberate.
+
 ---
 
 ## Adding a new agent
@@ -582,6 +677,7 @@ WEB_UI_HOST                       "localhost"           bind address
 WEB_UI_PORT                       8765                  bind port
 WEB_UI_PUSH_INTERVAL_S            0.5                   broadcast cadence
 WEB_UI_SCALP_FEED_HISTORY         30                    closed-trade cap on the scalp panel
+WEB_UI_CAPITAL_MOVEMENTS_N        15                    rows in the Capital Movements list
 
 REBALANCE_CONFIRM_WINDOW_S        3                     arm→confirm click window
 REBALANCE_ARM_TIMEOUT_S           10                    in-memory arm-token TTL
