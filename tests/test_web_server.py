@@ -34,6 +34,8 @@ _TOP_LEVEL_KEYS = (
     "arb", "xchain", "funding", "balance",
     # Opportunity Scanner panel (read-only; $0 observation).
     "opportunities",
+    # Web UI v2 fixes — capital deployment + movements visibility.
+    "capital",
 )
 
 
@@ -1595,6 +1597,333 @@ async def test_opportunity_notes_endpoint_safe_on_error(monkeypatch):
         assert "error" in d
     finally:
         await client.close()
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Web UI v2 fixes — capital block (item 1), live agent caps (item 2),
+# per-agent pause/play + breaker override (item 3), open-positions agent +
+# exit_target (item 5).
+# ════════════════════════════════════════════════════════════════════════════
+
+_CAPITAL_KEYS = ("total_equity", "total_deployed", "total_idle",
+                 "per_agent", "in_transit", "recent_movements")
+
+
+class _PausableAgent:
+    """BaseAgent-shaped stub with a togglable circuit-breaker halt exposed
+    the way the signal agent exposes it (bot._cb_state)."""
+
+    def __init__(self, *, allocation=100.0, deployed=0.0):
+        self.status = "RUNNING"
+        self.allocation = allocation
+        self.deployed = deployed
+        self.cb_halted = False
+        self.halt_reason = None
+        self.cleared_breakers = False
+
+    async def pause(self):
+        self.status = "PAUSED"
+
+    async def resume(self):
+        self.status = "RUNNING"
+
+    def clear_circuit_breakers(self):
+        self.cleared_breakers = True
+        self.cb_halted = False
+
+    def get_capital_allocation(self):
+        return self.allocation
+
+    def get_open_position_notional(self):
+        return self.deployed
+
+    @property
+    def bot(self):
+        return SimpleNamespace(_cb_state=SimpleNamespace(
+            halted=self.cb_halted, halt_reason=self.halt_reason))
+
+
+def _stats_row(agent_id, *, allocated=100.0, deployed=0.0, wr=0.0):
+    return SimpleNamespace(agent_id=agent_id, status="RUNNING",
+                           capital_allocated=allocated,
+                           capital_deployed=deployed, daily_pnl=0.0,
+                           trades_today=0, win_rate_today=wr)
+
+
+def _fixes_coordinator(agents_by_id, rows, *, portfolio=None):
+    return SimpleNamespace(
+        get_agent=lambda aid: agents_by_id.get(aid),
+        get_primary_bot=lambda: None,
+        get_portfolio_stats=AsyncMock(return_value=portfolio or {}),
+        get_agent_stats=AsyncMock(return_value=rows),
+        _fund_halted=set(),
+        _halted_by_portfolio_cb=False,
+    )
+
+
+# ── Item 1 — capital block ──────────────────────────────────────────────────
+
+def test_snapshot_capital_block_present_with_no_sources():
+    """coordinator=None, bot=None → block present, every key, zeroed/empty."""
+    ws = WebServer(coordinator=None, bot=None)
+    cap = ws._build_snapshot()["capital"]
+    for k in _CAPITAL_KEYS:
+        assert k in cap, f"missing capital.{k}"
+    assert cap["per_agent"] == []
+    assert isinstance(cap["in_transit"], list)
+    assert isinstance(cap["recent_movements"], list)
+
+
+@pytest.mark.asyncio
+async def test_snapshot_capital_safe_when_sources_raise(monkeypatch):
+    """Raising queries + raising coordinator getters → block still present
+    with safe defaults; the snapshot never raises."""
+    def boom(*a, **k):
+        raise RuntimeError("db down")
+    monkeypatch.setattr(
+        "ui.web_server.db_queries.get_capital_movements_recent", boom)
+    monkeypatch.setattr(
+        "ui.web_server.db_queries.get_capital_movements_in_transit", boom)
+    monkeypatch.setattr(
+        "ui.web_server.db_queries.get_fund_efficiency_summary", boom)
+
+    async def coord_boom():
+        raise RuntimeError("coordinator down")
+    coord = SimpleNamespace(get_portfolio_stats=coord_boom,
+                            get_agent_stats=coord_boom,
+                            get_primary_bot=lambda: None)
+    ws = WebServer(coordinator=coord, bot=None)
+    await ws._refresh_coordinator()
+    cap = ws._build_snapshot()["capital"]      # must not raise
+    for k in _CAPITAL_KEYS:
+        assert k in cap
+    assert cap["in_transit"] == []
+    assert cap["recent_movements"] == []
+
+
+@pytest.mark.asyncio
+async def test_capital_per_agent_reflects_live_allocation():
+    """per_agent rows read the LIVE get_capital_allocation() /
+    get_open_position_notional(), totals derive from them (item 1+2)."""
+    live = _PausableAgent(allocation=350.0, deployed=120.0)
+    coord = _fixes_coordinator(
+        {"signal": live}, [_stats_row("signal", allocated=100.0)],
+        portfolio={"total_equity": 1000.0})
+    ws = WebServer(coordinator=coord, bot=None)
+    await ws._refresh_coordinator()
+    cap = ws._build_snapshot()["capital"]
+    row = {r["id"]: r for r in cap["per_agent"]}["signal"]
+    assert row["allocation"] == pytest.approx(350.0)   # live, not cached 100
+    assert row["deployed"] == pytest.approx(120.0)
+    assert row["idle"] == pytest.approx(230.0)
+    assert cap["total_equity"] == pytest.approx(1000.0)
+    assert cap["total_deployed"] == pytest.approx(120.0)
+    assert cap["total_idle"] == pytest.approx(880.0)
+    assert "return_on_deployed_pct" in row
+
+
+def test_capital_movements_populate_from_helpers(monkeypatch):
+    """recent_movements / in_transit relay the query helpers' dicts."""
+    recent = [{"ts": "12:00:00", "from_fund": "signal", "to_fund": "scalp",
+               "amount_usd": 25.0, "mode": "sim", "state": "completed",
+               "initiated_by": "balance_agent", "note": ""}]
+    transit = [{"from_fund": "arb", "to_fund": "signal",
+                "from_exchange": "binance", "to_exchange": "kraken",
+                "amount_usd": 10.0, "state": "in_transit"}]
+    monkeypatch.setattr(
+        "ui.web_server.db_queries.get_capital_movements_recent",
+        lambda n: recent)
+    monkeypatch.setattr(
+        "ui.web_server.db_queries.get_capital_movements_in_transit",
+        lambda: transit)
+    ws = WebServer(coordinator=None, bot=None)
+    cap = ws._build_snapshot()["capital"]
+    assert cap["recent_movements"] == recent
+    assert cap["in_transit"] == [{
+        "from_fund": "arb", "to_fund": "signal",
+        "from_exchange": "binance", "to_exchange": "kraken",
+        "amount_usd": 10.0, "state": "in_transit"}]
+
+
+def test_capital_movements_query_helpers_roundtrip(web_temp):
+    """End-to-end: a seeded capital_movements row surfaces in the snapshot
+    with mode/state/initiated_by/note intact."""
+    wsm, db, q = web_temp
+    import database.models as m
+    with db.get_session() as s:
+        s.add(m.CapitalMovement(
+            from_fund="signal", to_fund="mexc_scalp", amount_usd=33.0,
+            mode="sim", state="completed", initiated_by="web_ui",
+            note="test move"))
+    cap = wsm.WebServer(coordinator=None, bot=None)._build_snapshot()["capital"]
+    assert len(cap["recent_movements"]) == 1
+    mv = cap["recent_movements"][0]
+    assert (mv["from_fund"], mv["to_fund"]) == ("signal", "mexc_scalp")
+    assert mv["amount_usd"] == pytest.approx(33.0)
+    assert mv["mode"] == "sim" and mv["state"] == "completed"
+    assert mv["initiated_by"] == "web_ui" and mv["note"] == "test move"
+    assert cap["in_transit"] == []                  # completed ≠ in transit
+
+
+# ── Item 2 — agent cards read live allocation ───────────────────────────────
+
+@pytest.mark.asyncio
+async def test_agent_card_capital_reads_live_allocation():
+    live = _PausableAgent(allocation=777.0)
+    coord = _fixes_coordinator(
+        {"signal": live}, [_stats_row("signal", allocated=100.0)])
+    ws = WebServer(coordinator=coord, bot=None)
+    await ws._refresh_coordinator()
+    agents = {a["id"]: a for a in ws._build_snapshot()["agents"]}
+    assert agents["signal"]["capital"] == pytest.approx(777.0)
+    # Live agent unreachable → cached stats row is the fallback.
+    coord2 = _fixes_coordinator({}, [_stats_row("arb", allocated=55.0)])
+    ws2 = WebServer(coordinator=coord2, bot=None)
+    await ws2._refresh_coordinator()
+    agents2 = {a["id"]: a for a in ws2._build_snapshot()["agents"]}
+    assert agents2["arb"]["capital"] == pytest.approx(55.0)
+
+
+# ── Item 3 — /action/agent_pause ────────────────────────────────────────────
+
+def _pause_events(monkeypatch):
+    events = []
+    monkeypatch.setattr(
+        "ui.web_server.db_queries.log_agent_event",
+        lambda aid, evt, detail="": events.append((aid, evt, detail)))
+    return events
+
+
+@pytest.mark.asyncio
+async def test_agent_pause_and_resume_roundtrip(monkeypatch):
+    events = _pause_events(monkeypatch)
+    agent = _PausableAgent()
+    coord = _fixes_coordinator({"scalp": agent}, [])
+    client = await _client(WebServer(coordinator=coord, bot=None))
+    try:
+        d = await (await client.post(
+            "/action/agent_pause",
+            json={"agent_id": "scalp", "paused": True})).json()
+        assert d["ok"] is True and agent.status == "PAUSED"
+        d = await (await client.post(
+            "/action/agent_pause",
+            json={"agent_id": "scalp", "paused": False})).json()
+        assert d["ok"] is True and agent.status == "RUNNING"
+        kinds = [e[1] for e in events]
+        assert "AGENT_PAUSE" in kinds and "AGENT_RESUME" in kinds
+        assert all("source=web_ui" in e[2] for e in events)
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_agent_pause_unknown_agent(monkeypatch):
+    _pause_events(monkeypatch)
+    coord = _fixes_coordinator({}, [])
+    client = await _client(WebServer(coordinator=coord, bot=None))
+    try:
+        d = await (await client.post(
+            "/action/agent_pause",
+            json={"agent_id": "nope", "paused": True})).json()
+        assert d == {"ok": False, "error": "unknown agent"}
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_agent_resume_refused_when_breaker_halted(monkeypatch):
+    """Plain play on a breaker-halted agent NEVER resumes — it returns
+    halted_by_breaker + the reason, and the agent stays halted."""
+    events = _pause_events(monkeypatch)
+    agent = _PausableAgent()
+    agent.status = "HALTED"
+    agent.cb_halted = True
+    agent.halt_reason = "drawdown -5.20%"
+    coord = _fixes_coordinator({"signal": agent}, [])
+    client = await _client(WebServer(coordinator=coord, bot=None))
+    try:
+        d = await (await client.post(
+            "/action/agent_pause",
+            json={"agent_id": "signal", "paused": False})).json()
+        assert d == {"ok": False, "error": "halted_by_breaker",
+                     "breaker_reason": "drawdown -5.20%"}
+        assert agent.cb_halted is True                  # untouched
+        assert agent.status == "HALTED"
+        assert not any(e[1] == "AGENT_RESUME" for e in events)
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_agent_resume_with_breaker_override(monkeypatch):
+    """override_breaker=true clears the breaker, resumes, and logs the
+    distinct AGENT_BREAKER_OVERRIDE event with the overridden reason."""
+    events = _pause_events(monkeypatch)
+    agent = _PausableAgent()
+    agent.status = "HALTED"
+    agent.cb_halted = True
+    agent.halt_reason = "consecutive_loss 5"
+    coord = _fixes_coordinator({"signal": agent}, [])
+    coord._fund_halted = {"signal"}
+    coord._halted_by_portfolio_cb = True
+    client = await _client(WebServer(coordinator=coord, bot=None))
+    try:
+        d = await (await client.post(
+            "/action/agent_pause",
+            json={"agent_id": "signal", "paused": False,
+                  "override_breaker": True})).json()
+        assert d["ok"] is True
+        assert agent.cleared_breakers is True
+        assert agent.status == "RUNNING"
+        # Coordinator-level trackers cleared too (same set resume_agent clears).
+        assert coord._fund_halted == set()
+        assert coord._halted_by_portfolio_cb is False
+        ovr = [e for e in events if e[1] == "AGENT_BREAKER_OVERRIDE"]
+        assert len(ovr) == 1
+        assert "source=web_ui" in ovr[0][2]
+        assert "consecutive_loss 5" in ovr[0][2]
+        assert any(e[1] == "AGENT_RESUME" for e in events)
+    finally:
+        await client.close()
+
+
+# ── Item 5 — open positions: agent mapping + exit_target ───────────────────
+
+def _open_trade(**kw):
+    base = dict(entry_price=100.0, side="long", size_usd=50.0,
+                pair="BTC/USDT", exchange="binance",
+                timestamp_open=datetime.utcnow(), signal_type="momentum",
+                strategy="default", stop_loss=98.0, take_profit=64210.0)
+    base.update(kw)
+    return SimpleNamespace(**base)
+
+
+def test_positions_agent_mapped_and_exit_target(monkeypatch):
+    """strategy-profile names map to "signal"; real agent ids pass through;
+    exit_target renders TP/SL or the "—" fallback."""
+    monkeypatch.setattr("ui.web_server.db_queries.get_open_trades", lambda: [
+        _open_trade(),                                          # "default"
+        _open_trade(strategy="scalp", signal_type="scalp"),
+        _open_trade(strategy="funding_arb", signal_type="funding_arb",
+                    stop_loss=None, take_profit=None),
+    ])
+    ws = WebServer(coordinator=None, bot=None)
+    rows = ws._snap_positions(None)
+    assert [r["agent"] for r in rows] == ["signal", "scalp", "funding_arb"]
+    assert rows[0]["exit_target"] == "TP 64,210 / SL 98"
+    assert rows[1]["take_profit"] == 64210.0          # raw fields still ride
+    assert rows[2]["exit_target"] == "—"
+
+
+def test_positions_seeded_open_trade_has_agent_and_exit(web_temp):
+    """End-to-end on a seeded open trade: agent + exit_target keys present
+    in the snapshot positions rows."""
+    wsm, db, q = web_temp
+    _seed_trade(db, size_usd=40.0, open_only=True)    # strategy="default"
+    rows = wsm.WebServer(coordinator=None, bot=None)._build_snapshot()["positions"]
+    assert len(rows) == 1
+    assert rows[0]["agent"] == "signal"               # profile name mapped
+    assert "exit_target" in rows[0]
 
 
 # ════════════════════════════════════════════════════════════════════════════
