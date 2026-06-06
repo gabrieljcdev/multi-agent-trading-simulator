@@ -58,6 +58,34 @@
   .metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:10px}
   .metric .v{font-size:20px;font-weight:bold}
   .metric .sub{font-size:11px;color:var(--tx2);margin-top:2px}
+  /* UI updates — win-rate today/all-time split (Change 1) */
+  .wrsplit{display:flex;gap:18px;margin-top:2px}
+  .wrsplit .lbl{font-size:10px;text-transform:uppercase;letter-spacing:.06em;color:var(--tx2)}
+  .wrsplit .val{font-size:18px;font-weight:bold;color:var(--pos)}
+  /* UI updates — inline fees badge on the Daily P&L headline (Change 2).
+     var(--bg2) is the "slightly lighter than card" tone in BOTH themes
+     (the spec's rgba(255,255,255,.07) example would vanish on light). */
+  .feebadge{display:inline-block;background:var(--bg2);border-radius:4px;font-size:.7rem;
+    color:var(--tx2);padding:2px 8px;margin-left:6px;vertical-align:middle;font-weight:normal}
+  /* UI updates — regime label colours (Change 3a) */
+  .regime-TRENDING{color:#00bcd4} .regime-RANGING{color:#f59e0b}
+  .regime-HIGH_VOL{color:#ef4444} .regime-UNKNOWN{color:#6b7280}
+  /* UI updates — ADX / Hurst inline meters (Change 3b) */
+  .meter{display:inline-flex;align-items:center;gap:6px;margin-right:14px}
+  .meter .mlbl{font-size:10px;text-transform:uppercase;color:var(--tx2)}
+  .meter .mval{font-weight:bold;color:var(--tx0)}
+  .meter .mbar{position:relative;width:120px;height:4px;background:var(--bg2);
+    border-radius:2px;flex:none}
+  .meter .mbar i{position:absolute;left:0;top:0;height:100%;border-radius:2px}
+  .meter .mbar b{position:absolute;top:-2px;width:1px;height:8px;background:var(--tx1)}
+  /* UI updates — agent-panel sub-tabs (Changes 4b/5). Same font/sizing as
+     the top-level .tab; active = light bottom-border + brighter text. */
+  .subtabs{display:flex;gap:6px;margin-bottom:10px}
+  .subtab{padding:6px 14px;border-bottom:2px solid transparent;color:var(--tx1)}
+  .subtab.active{color:var(--tx0);font-weight:bold;border-bottom:2px solid var(--tx0)}
+  /* UI updates — KPI cards above history tables at ~80% scale */
+  .histkpis .v{font-size:16px}
+  .histkpis h2{font-size:10px}
   /* agent grid */
   .agents{display:grid;grid-template-columns:repeat(6,1fr);gap:10px;margin-bottom:10px}
   .agent.offline{opacity:.4}
@@ -81,6 +109,19 @@
   .tag{font-size:10px;padding:0 5px;border-radius:3px;font-weight:bold}
   .tag.win{background:var(--pos);color:#fff} .tag.loss{background:var(--neg);color:#fff}
   .tag.live{background:var(--warn);color:#fff}
+  /* strategy/track badges — one colour map used everywhere a track shows
+     (open positions, signal trade log, signal live feed). Coloured text on
+     var(--bg2) (the .chip convention) so they read in both themes. */
+  .tag.strat{background:var(--bg2);font-weight:bold}
+  .tag.strat-funding_arb{color:#00bcd4}
+  .tag.strat-momentum{color:#f59e0b}
+  .tag.strat-reversion{color:#a78bfa}
+  .tag.strat-arb{color:#2b6cb0}
+  .dark .tag.strat-arb{color:#6aa9e8}
+  .tag.strat-scalp,.tag.strat-mexc_scalp{color:var(--pos)}
+  .tag.strat-signal{color:#b8a008}
+  .dark .tag.strat-signal{color:#e8d44d}
+  .tag.strat-unknown{color:var(--tx2)}
   /* bars */
   .bar{height:8px;background:var(--bg2);border-radius:4px;overflow:hidden;margin:3px 0 8px}
   .bar > i{display:block;height:100%}
@@ -223,10 +264,10 @@
   <!-- ───────────────────────── DASHBOARD VIEW ───────────────────────── -->
   <div id="view-dashboard" class="view">
 
-    <!-- TABS (Insights tab removed — insights live on agent pages) -->
+    <!-- TABS (Insights tab removed — insights live on agent pages;
+         Arb History moved into the Arb Agent panel's History tab) -->
     <div class="tabs">
       <button class="tab active" data-tab="dashboard">Dashboard</button>
-      <button class="tab" data-tab="arb">Arb History</button>
       <button class="tab" data-tab="log">Log</button>
     </div>
 
@@ -236,11 +277,14 @@
         <div class="card metric"><h2>Total Bankroll</h2>
           <div class="v" id="m-bank">—</div><div class="sub" id="m-bank-sub">—</div></div>
         <div class="card metric"><h2>Daily P&amp;L</h2>
-          <div class="v" id="m-dpnl">—</div><div class="sub" id="m-dfees">—</div></div>
+          <div class="v" id="m-dpnl">—</div></div>
         <div class="card metric"><h2>Exposure</h2>
           <div class="v" id="m-exp">—</div><div class="sub" id="m-exp-sub">—</div></div>
         <div class="card metric"><h2>Win Rate</h2>
-          <div class="v" id="m-wr">—</div><div class="sub" id="m-wr-sub">—</div></div>
+          <div class="wrsplit">
+            <div><div class="lbl">Today</div><div class="val" id="m-wr-today">—</div></div>
+            <div><div class="lbl">All-Time</div><div class="val" id="m-wr-alltime">—</div></div>
+          </div></div>
       </div>
 
       <!-- Agent grid — always visible. Clicking a card sets activeAgentId
@@ -285,12 +329,9 @@
           <h2>Session P&amp;L</h2><div class="sessions" id="sessions"></div>
         </div>
 
-        <!-- Opportunity Scanner — READ-ONLY window onto the $0 observation
-             agent. No action controls; the feed's Noteworthy/All-posts
-             dropdown is the only interactive element and fires a GET read. -->
-        <div class="card" style="margin-top:10px">
-          <h2>Opportunity Scanner</h2><div id="opportunities"></div>
-        </div>
+        <!-- Opportunity Scanner panel removed from the dashboard — it now
+             renders only inside the scanner's agent detail page
+             (opportunityDetailHtml), avoiding the duplicate view. -->
       </div>
 
       <!-- Per-agent detail page — visible only when activeAgentId != null.
@@ -318,17 +359,6 @@
         <div id="ad-error" class="livebanner" style="margin-bottom:8px"></div>
         <div id="ad-body"></div>
       </div>
-    </div>
-
-    <!-- ARB HISTORY -->
-    <div id="panel-arb" class="panel">
-      <div class="metrics" style="grid-template-columns:repeat(4,1fr)">
-        <div class="card metric"><h2>Arb Trades</h2><div class="v" id="a-n">—</div></div>
-        <div class="card metric"><h2>Net P&amp;L</h2><div class="v" id="a-pnl">—</div></div>
-        <div class="card metric"><h2>Fees</h2><div class="v" id="a-fees">—</div></div>
-        <div class="card metric"><h2>Avg Fill</h2><div class="v" id="a-fill">—</div></div>
-      </div>
-      <div class="card"><h2>All Arb Trades</h2><div class="scroll" id="arbTable"></div></div>
     </div>
 
     <!-- LOG -->
@@ -400,6 +430,9 @@ const OBSERVATION_AGENTS = new Set(["xchain","funding_arb","opportunity_scanner"
 // that agent's detail page in place of the dashboard content". Lives in
 // JS memory only; survives WebSocket reconnects but resets on refresh.
 let activeAgentId = null;
+// UI updates — which sub-tab of the agent detail panel is showing.
+// Resets to "overview" whenever the operator opens a different agent.
+let agentDetailTab = "overview";
 const SESSION_KEYS = ["LONDON","NEW_YORK","ASIA","OFF_HOURS"];
 const SESSION_TZ = {
   LONDON:["Europe/London","LON"], NEW_YORK:["America/New_York","NYC"],
@@ -470,6 +503,15 @@ $("backToDashboardBtn").onclick = () => {
   activeAgentId = null;
   if(STATE && STATE.ts) updateUI(STATE);   // repaint immediately
 };
+
+/* Agent-panel sub-tabs (Overview / History) — delegated on the stable
+   #ad-body container so the binding survives the 2Hz innerHTML re-render. */
+$("ad-body").addEventListener("click", (e) => {
+  const b = e.target && e.target.closest ? e.target.closest(".subtab") : null;
+  if(!b) return;
+  agentDetailTab = b.dataset.subtab === "history" ? "history" : "overview";
+  if(STATE && STATE.ts) updateUI(STATE);
+});
 
 /* Web UI v3.1 — per-agent Halt/Resume toggle.
    Single-click (no arm/confirm). The button is disabled the instant the
@@ -567,6 +609,29 @@ function localTime(tz){
   }catch(e){ return "--:--"; }
 }
 
+/* ---------- regime colour + meter helpers (Changes 3a/3b) ---------- */
+const REGIME_LABELS = new Set(["TRENDING","RANGING","HIGH_VOL","UNKNOWN"]);
+function regimeLblHtml(v){
+  // Coloured TEXT (not a badge) — same font/size as before; any label
+  // outside the known set falls back to the UNKNOWN grey.
+  const k = String(v==null?"":v).toUpperCase();
+  const c = REGIME_LABELS.has(k) ? k : "UNKNOWN";
+  return `<span class="regime-${c}">${esc(v==null?"—":v)}</span>`;
+}
+function meterHtml(label, val, max, threshold){
+  // Thin 120×4px fill bar with a vertical threshold tick. Green fill when
+  // the value clears the threshold (trending/persistent), grey below.
+  const v    = (val==null || isNaN(+val)) ? null : +val;
+  const pct  = v==null ? 0 : Math.max(0, Math.min(100, v/max*100));
+  const tick = Math.max(0, Math.min(100, threshold/max*100));
+  const fill = (v!=null && v >= threshold) ? "var(--pos)" : "var(--tx2)";
+  const txt  = v==null ? "—" : (max===1 ? v.toFixed(2) : String(Math.round(v)));
+  return `<span class="meter" title="${esc(label)} ${txt} · threshold ${threshold}">` +
+    `<span class="mlbl">${esc(label)}</span><span class="mval">${txt}</span>` +
+    `<span class="mbar"><i style="width:${pct}%;background:${fill}"></i>` +
+    `<b style="left:${tick}%"></b></span></span>`;
+}
+
 /* ---------- hash router ---------- */
 function showView(id){
   document.querySelectorAll(".view").forEach(v => v.hidden = (v.id !== id));
@@ -616,14 +681,12 @@ function updateUI(s){
   $("m-bank-sub").innerHTML =
     `<span class="${cls(ap)}">${(ap==null?"—":(ap>=0?"+$":"-$")+Math.abs(ap).toFixed(2))} since start</span>`;
   $("m-dpnl").innerHTML =
-    `<span class="${cls(p.daily_pnl)}">${fmtUsd(p.daily_pnl)} (${fmtPct(p.daily_pnl_pct)})</span>`;
-  $("m-dfees").textContent = "Fees: " + fmtUsd(p.daily_fees);
+    `<span class="${cls(p.daily_pnl)}">${fmtUsd(p.daily_pnl)} (${fmtPct(p.daily_pnl_pct)})</span>` +
+    `<span class="feebadge">fees ${fmtUsd(p.daily_fees)}</span>`;
   $("m-exp").textContent = (p.exposure_pct==null?"—":p.exposure_pct.toFixed(1)+"%");
   $("m-exp-sub").textContent = (p.exposure_usd==null?"—":fmtUsd(p.exposure_usd)+" deployed");
-  $("m-wr").textContent = (p.win_rate_today==null?"—":p.win_rate_today.toFixed(1)+"%");
-  $("m-wr-sub").textContent =
-    `${p.win_rate_today==null?"—":p.win_rate_today.toFixed(1)}% today · ` +
-    `${p.win_rate_alltime==null?"—":p.win_rate_alltime.toFixed(1)}% all-time`;
+  $("m-wr-today").textContent   = (p.win_rate_today==null?"—":p.win_rate_today.toFixed(1)+"%");
+  $("m-wr-alltime").textContent = (p.win_rate_alltime==null?"—":p.win_rate_alltime.toFixed(1)+"%");
 
   // agents — all six in a uniform grid; click sets activeAgentId.
   const byId = {}; (s.agents||[]).forEach(a => byId[a.id]=a);
@@ -650,6 +713,7 @@ function updateUI(s){
   }).join("");
   document.querySelectorAll("#agents .agent").forEach(el => {
     const go = () => {
+      if(activeAgentId !== el.dataset.agent) agentDetailTab = "overview";
       activeAgentId = el.dataset.agent;
       updateUI(STATE);                       // re-render against the cached snapshot
     };
@@ -657,12 +721,16 @@ function updateUI(s){
     el.onkeydown = (e) => { if(e.key==="Enter"||e.key===" "){ e.preventDefault(); go(); } };
   });
 
-  // regime
+  // regime — coloured labels (Change 3a) + ADX/Hurst meters (Change 3b)
   const r = s.regime || {};
   $("regime").innerHTML =
-    `<div><b>${esc(r.dominant||"—")}</b> <span class="dim">ADX ${r.adx??"—"} · H ${r.hurst??"—"}</span></div>` +
+    `<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">` +
+      `<b>${regimeLblHtml(r.dominant)}</b>` +
+      meterHtml("ADX", r.adx, 100, 25) +
+      meterHtml("H", r.hurst, 1, 0.5) +
+    `</div>` +
     `<table><tbody>` + (r.pairs||[]).slice(0,8).map(x =>
-      `<tr><td>${esc(x.pair)}</td><td class="dim">${esc(x.regime)}</td></tr>`).join("") + `</tbody></table>`;
+      `<tr><td>${esc(x.pair)}</td><td>${regimeLblHtml(x.regime)}</td></tr>`).join("") + `</tbody></table>`;
 
   // sentiment
   const se = s.sentiment || {};
@@ -727,19 +795,9 @@ function updateUI(s){
     el.onkeydown = (e) => { if(e.key==="Enter"||e.key===" "){ e.preventDefault(); go(); } };
   });
 
-  // Opportunity Scanner panel (read-only; $0 observation). Binding runs
-  // after BOTH render paths (dashboard panel + the scanner's detail page,
-  // rendered above) so the feed dropdown works in either context.
-  safeRender("opportunities", () => opportunityPanelHtml(s.opportunities));
-  bindOppNotesFilters();
-
-  // arb history tab
-  const ah = s.arb_history || [];
-  $("a-n").textContent = ah.length;
-  $("a-pnl").innerHTML = `<span class="${cls(ah.reduce((a,x)=>a+(x.net_pnl||0),0))}">${fmtUsd(ah.reduce((a,x)=>a+(x.net_pnl||0),0))}</span>`;
-  $("a-fees").textContent = fmtUsd(ah.reduce((a,x)=>a+(x.fees||0),0));
-  $("a-fill").textContent = ah.length? (ah.reduce((a,x)=>a+(x.fill_ms||0),0)/ah.length).toFixed(0)+"ms" : "—";
-  $("arbTable").innerHTML = arbTableHtml(ah);
+  // Opportunity Scanner panel now lives ONLY on the scanner's detail page
+  // (opportunityDetailHtml via renderAgentDetail above); its notes-feed
+  // dropdown is bound there, right after that render.
 
   renderLog();
 
@@ -755,20 +813,34 @@ function barRow(label, val, limit){
   return `<div>${label} <span class="dim">${(+val).toFixed(2)} / ${(+limit).toFixed(2)}</span></div>
     <div class="bar"><i style="width:${pct}%;background:${col}"></i></div>`;
 }
+/* Strategy/track badge — single colour map (see .tag.strat-* in the style
+   block) used everywhere a track appears: open positions table, signal
+   trade log, and the signal live feed. Unknown tracks render grey/dim. */
+const STRAT_TRACKS = new Set(
+  ["funding_arb","momentum","reversion","arb","scalp","mexc_scalp","signal"]);
+function stratTagHtml(track){
+  const t = String(track||"").toLowerCase();
+  const cls = STRAT_TRACKS.has(t) ? "strat-"+t : "strat-unknown";
+  return `<span class="tag strat ${cls}">${esc(t||"—")}</span>`;
+}
+/* NOTE: the signal agent is a shared execution layer — it can execute
+   trades on behalf of funding_arb, momentum, reversion etc. The `track`
+   field identifies the originating strategy, so this feed intentionally
+   shows ALL tracks (no track filter), each labelled with its badge. */
 function signalFeedHtml(rows){
   return `<table><thead><tr><th>t</th><th>pair</th><th>trk</th><th>score</th><th>action</th></tr></thead><tbody>` +
     ((rows||[]).map(x =>
-      `<tr><td class="dim">${esc(x.ts)}</td><td>${esc(x.pair)}</td><td class="dim">${esc(x.track)}</td>
+      `<tr><td class="dim">${esc(x.ts)}</td><td>${esc(x.pair)}</td><td>${stratTagHtml(x.track)}</td>
        <td>${x.score}</td><td class="${x.action==="exec"?"pos":(x.action==="skip"?"warn":"dim")}">${esc(x.action)}</td></tr>`).join("")
      || `<tr><td colspan="5" class="muted">no signals</td></tr>`) + `</tbody></table>`;
 }
 function positionsHtml(rows){
-  return `<table><thead><tr><th>agent</th><th>pair</th><th>dir</th><th>entry</th><th>cur</th><th>size</th><th>P&amp;L</th><th>age</th></tr></thead><tbody>` +
+  return `<table><thead><tr><th>agent</th><th>strat</th><th>pair</th><th>dir</th><th>entry</th><th>cur</th><th>size</th><th>P&amp;L</th><th>age</th></tr></thead><tbody>` +
     ((rows||[]).map(x =>
-      `<tr><td class="dim">${esc(x.agent)}</td><td>${esc(x.pair)}</td><td>${esc(x.direction)}</td>
+      `<tr><td class="dim">${esc(x.agent)}</td><td>${stratTagHtml(x.track||x.strategy)}</td><td>${esc(x.pair)}</td><td>${esc(x.direction)}</td>
        <td>${x.entry}</td><td>${x.current}</td><td>${fmtUsd(x.size_usd)}</td>
        <td class="${cls(x.pnl_usd)}">${fmtUsd(x.pnl_usd)} ${fmtPct(x.pnl_pct)}</td><td class="dim">${fmtAge(x.age_s)}</td></tr>`).join("")
-     || `<tr><td colspan="8" class="muted">no open positions</td></tr>`) + `</tbody></table>`;
+     || `<tr><td colspan="9" class="muted">no open positions</td></tr>`) + `</tbody></table>`;
 }
 function arbFeedHtml(rows){
   return `<table><thead><tr><th>t</th><th>pair</th><th>route</th><th>gap%</th><th>net</th><th>fees</th></tr></thead><tbody>` +
@@ -786,10 +858,8 @@ function arbTableHtml(rows){
        <td class="${cls(x.net_pnl)}">${fmtUsd(x.net_pnl)}</td><td class="dim">${fmtUsd(x.fees)}</td><td class="dim">${x.fill_ms}ms</td><td class="dim">${esc(x.status)}</td></tr>`).join("")
      || `<tr><td colspan="10" class="muted">no arb trades</td></tr>`) + `</tbody></table>`;
 }
-function scalpFeedHtml(scalp){
+function scalpViabilityCardHtml(scalp){
   scalp = scalp || {};
-  const live = scalp.live_trades || [];
-  const closed = scalp.closed_trades || [];
   const fv = scalp.fee_viability || {};
   const basis = scalp.fee_basis || "?";
   const fvRows = Object.keys(fv).map(ex => {
@@ -803,15 +873,26 @@ function scalpFeedHtml(scalp){
       <td><span class="tag ${ok?'win':'loss'}">${ok?'viable':'blocked'}</span></td>
       <td>${rt}</td><td>${wr}</td><td class="dim">${tp}/${sl}</td></tr>`;
   }).join("") || `<tr><td colspan="5" class="muted">no fee data yet</td></tr>`;
-  const viabCard = `<div class="card" style="margin-bottom:10px">
+  return `<div class="card" style="margin-bottom:10px">
       <h2>Fee Viability <span class="dim">(${esc(basis)} basis)</span></h2>
       <div class="scroll"><table><thead><tr><th>ex</th><th>status</th><th>rt bps</th><th>breakeven WR</th><th>tp/sl bps</th></tr></thead>
       <tbody>${fvRows}</tbody></table></div></div>`;
+}
+function scalpLiveCardHtml(scalp){
+  scalp = scalp || {};
+  const live = scalp.live_trades || [];
   const liveRows = live.map(x =>
     `<tr><td class="dim">${esc(x.exchange)}</td><td>${esc(x.symbol)}</td><td>${esc(x.direction)}</td>
      <td>${x.entry_price}</td><td class="${cls(x.unrealised_bps)}">${fmtBps(x.unrealised_bps)}</td>
      <td class="dim">${x.hold_sec}s</td></tr>`).join("")
     || `<tr><td colspan="6" class="muted">no live scalp trades</td></tr>`;
+  return `<div class="card" style="margin-bottom:10px"><h2>Live (${live.length})</h2>
+      <div class="scroll"><table><thead><tr><th>ex</th><th>sym</th><th>dir</th><th>entry</th><th>unreal</th><th>hold</th></tr></thead>
+      <tbody>${liveRows}</tbody></table></div></div>`;
+}
+function scalpClosedCardHtml(scalp){
+  scalp = scalp || {};
+  const closed = scalp.closed_trades || [];
   const closedRows = closed.map(x => {
     const w = x.outcome === "WIN";
     const holdCls = (x.hold_sec >= SCALP_MAX_HOLD_SEC) ? "neg" : "dim";
@@ -820,12 +901,15 @@ function scalpFeedHtml(scalp){
       <td class="${cls(x.net_bps)}">${fmtBps(x.net_bps)}</td>
       <td class="dim">${esc(x.exit_reason)}</td><td class="${holdCls}">${x.hold_sec}s</td></tr>`;
   }).join("") || `<tr><td colspan="7" class="muted">no closed scalp trades yet</td></tr>`;
-  return viabCard + `<div class="card" style="margin-bottom:10px"><h2>Live (${live.length})</h2>
-      <div class="scroll"><table><thead><tr><th>ex</th><th>sym</th><th>dir</th><th>entry</th><th>unreal</th><th>hold</th></tr></thead>
-      <tbody>${liveRows}</tbody></table></div></div>
-    <div class="card"><h2>History (last ${closed.length})</h2>
+  return `<div class="card"><h2>History (last ${closed.length})</h2>
       <div class="scroll" style="max-height:320px"><table><thead><tr><th>t</th><th>sym</th><th>dir</th><th>out</th><th>net</th><th>reason</th><th>hold</th></tr></thead>
       <tbody>${closedRows}</tbody></table></div></div>`;
+}
+function scalpFeedHtml(scalp){
+  // Legacy #/agent/scalp page keeps the full three-card stack; the v3
+  // detail page renders the cards individually (History lives in its tab).
+  return scalpViabilityCardHtml(scalp) + scalpLiveCardHtml(scalp) +
+    scalpClosedCardHtml(scalp);
 }
 function renderPending(pend){
   if(pend){
@@ -1401,22 +1485,220 @@ function setDetailHeader(agent, agentId){
   }
 }
 
+/* ---------- UI updates — agent-panel History tabs ----------
+   Agents whose history rows come from GET /api/agent/{id} (the others
+   render straight from the 2Hz snapshot: arb ← arb_history, opportunity
+   scanner ← standard/exploratory lists). xchain / funding_arb / balance
+   currently get [] back from that endpoint — their tables render the
+   spec'd columns with the "no history yet" placeholder until the backend
+   surfaces rows (see notes in prompts/ui_updates.md follow-ups). */
+const HIST_API_AGENTS = new Set(["signal","scalp","xchain","funding_arb","balance"]);
+let histCache = {agent:null, rows:null, at:0, loading:false};
+
+function ensureAgentHistory(id){
+  const now = Date.now();
+  if(histCache.agent === id && (histCache.loading || (now - histCache.at) < 5000)) return;
+  if(histCache.agent !== id) histCache = {agent:id, rows:null, at:0, loading:false};
+  histCache.loading = true;
+  fetchAgentDetail(id).then(d => {
+    if(histCache.agent !== id) return;       // operator moved on
+    histCache = {agent:id, rows:(d && d.trades) || [], at:Date.now(), loading:false};
+    if(activeAgentId === id && agentDetailTab === "history" && STATE && STATE.ts)
+      updateUI(STATE);
+  });
+}
+
+function subTabBarHtml(active){
+  return `<div class="subtabs">` +
+    [["overview","Overview"],["history","History"]].map(([k,lbl]) =>
+      `<button class="subtab ${active===k?"active":""}" data-subtab="${k}">${lbl}</button>`
+    ).join("") + `</div>`;
+}
+
+function histKpisHtml(cards){
+  // [[title, valueHtml], ...] — same .card.metric component as the
+  // top-level KPI row, at ~80% scale via .histkpis.
+  return `<div class="metrics histkpis" style="grid-template-columns:repeat(${cards.length},1fr)">` +
+    cards.map(([t,v]) =>
+      `<div class="card metric"><h2>${t}</h2><div class="v">${v}</div></div>`).join("") +
+    `</div>`;
+}
+
+function histTableCard(title, cols, rowsHtml, count){
+  const body = count
+    ? `<table><thead><tr>${cols.map(c=>`<th>${c}</th>`).join("")}</tr></thead><tbody>${rowsHtml}</tbody></table>`
+    : `<span class="muted">no history yet</span>`;
+  return `<div class="card"><h2>${title}</h2><div class="scroll" style="max-height:400px">${body}</div></div>`;
+}
+
+function tradeKpis(rows, pnlOf){
+  const n = rows.length;
+  const pnl = rows.reduce((a,x)=>a+(pnlOf(x)||0), 0);
+  const wins = rows.filter(x => (pnlOf(x)||0) > 0).length;
+  return [
+    ["Total Trades", String(n)],
+    ["Net P&amp;L", `<span class="${cls(pnl)}">${fmtUsd(pnl)}</span>`],
+    ["Win Rate", n ? (wins/n*100).toFixed(1)+"%" : "—"],
+  ];
+}
+
+function arbHistoryTabHtml(state){
+  // Exactly the old top-level Arb History tab, relocated. Same snapshot
+  // key (arb_history = all arb trades), same KPI maths, same table.
+  const ah = state.arb_history || [];
+  const pnl  = ah.reduce((a,x)=>a+(x.net_pnl||0),0);
+  const fees = ah.reduce((a,x)=>a+(x.fees||0),0);
+  const fill = ah.length ? (ah.reduce((a,x)=>a+(x.fill_ms||0),0)/ah.length).toFixed(0)+"ms" : "—";
+  return histKpisHtml([
+      ["Arb Trades", String(ah.length)],
+      ["Net P&amp;L", `<span class="${cls(pnl)}">${fmtUsd(pnl)}</span>`],
+      ["Fees", fmtUsd(fees)],
+      ["Avg Fill", fill],
+    ]) +
+    `<div class="card"><h2>All Arb Trades</h2><div class="scroll" style="max-height:400px">${arbTableHtml(ah)}</div></div>`;
+}
+
+function signalHistoryTabHtml(rows){
+  // duration is not in the /api/agent/signal payload (backend follow-up);
+  // the endpoint only returns closed trades, so status is always "closed".
+  const rowsHtml = rows.map(x =>
+    `<tr class="${x.outcome==="WIN"?"win":"loss"}">
+     <td class="dim">${esc(x.ts)}</td><td>${esc(x.pair)}</td><td>${esc(x.direction)}</td>
+     <td>${x.entry_price}</td><td>${x.exit_price==null?"—":x.exit_price}</td>
+     <td>${fmtUsd(x.size_usd)}</td>
+     <td class="${cls(x.pnl_usd)}">${fmtUsd(x.pnl_usd)}</td>
+     <td class="${cls(x.pnl_pct)}">${fmtPct(x.pnl_pct)}</td>
+     <td class="dim">${esc(x.duration||"—")}</td>
+     <td class="dim">${esc(x.status||"closed")}</td></tr>`).join("");
+  return histKpisHtml(tradeKpis(rows, x=>x.pnl_usd)) +
+    histTableCard("All Trades",
+      ["t","pair","dir","entry","exit","size","P&amp;L $","P&amp;L %","duration","status"],
+      rowsHtml, rows.length);
+}
+
+function scalpHistoryTabHtml(rows){
+  const rowsHtml = rows.map(x => {
+    const holdCls = (x.hold_sec >= SCALP_MAX_HOLD_SEC) ? "neg" : "dim";
+    return `<tr class="${x.outcome==="WIN"?"win":"loss"}">
+     <td class="dim">${esc(x.ts||x.closed_at)}</td><td class="dim">${esc(x.exchange)}</td>
+     <td>${esc(x.symbol)}</td><td>${esc(x.direction)}</td>
+     <td>${x.entry_price}</td><td>${x.exit_price}</td>
+     <td class="${cls(x.net_bps)}">${fmtBps(x.net_bps)}</td>
+     <td class="${holdCls}">${x.hold_sec}s</td></tr>`;
+  }).join("");
+  return histKpisHtml(tradeKpis(rows, x=>x.pnl_usd)) +
+    histTableCard("All Scalp Trades",
+      ["t","ex","sym","dir","entry","exit","P&amp;L","hold"],
+      rowsHtml, rows.length);
+}
+
+function xchainHistoryTabHtml(rows){
+  // No executed cross-chain transfers are surfaced yet — /api/agent/xchain
+  // returns []. Field mapping below matches the noted backend follow-up.
+  const rowsHtml = rows.map(x =>
+    `<tr><td class="dim">${esc(x.ts)}</td><td>${esc(x.from_chain)}</td><td>${esc(x.to_chain)}</td>
+     <td>${esc(x.asset)}</td><td>${fmtUsd(x.amount_usd)}</td><td class="dim">${fmtUsd(x.gas_cost_usd)}</td>
+     <td class="${cls(x.net_pnl_usd)}">${fmtUsd(x.net_pnl_usd)}</td>
+     <td class="dim">${esc(x.status)}</td></tr>`).join("");
+  return histTableCard("All Cross-Chain Transfers",
+    ["t","from chain","to chain","asset","amount","gas","net P&amp;L","status"],
+    rowsHtml, rows.length);
+}
+
+function fundingHistoryTabHtml(rows){
+  // No closed funding positions are surfaced yet — /api/agent/funding_arb
+  // returns []. Field mapping matches the noted backend follow-up.
+  const rowsHtml = rows.map(x =>
+    `<tr><td class="dim">${esc(x.opened_at)}</td><td class="dim">${esc(x.closed_at)}</td>
+     <td>${esc(x.symbol)}</td><td>${x.spot_qty}</td><td>${x.perp_qty}</td>
+     <td class="pos">${fmtUsd(x.funding_earned_usd)}</td>
+     <td class="neg">${fmtUsd(x.funding_paid_usd)}</td>
+     <td class="${cls(x.net_pnl_usd)}">${fmtUsd(x.net_pnl_usd)}</td>
+     <td>${x.apr_pct==null?"—":(+x.apr_pct).toFixed(2)+"%"}</td>
+     <td class="dim">${esc(x.hold||"—")}</td></tr>`).join("");
+  return histTableCard("All Closed Funding Positions",
+    ["t opened","t closed","symbol","spot qty","perp qty","funding earned","funding paid","net P&amp;L","APR %","hold"],
+    rowsHtml, rows.length);
+}
+
+function balanceHistoryTabHtml(rows){
+  // /api/agent/balance returns [] today; once it relays capital_movements
+  // rows (see backend follow-up note) this renders them unchanged.
+  const fees = rows.reduce((a,x)=>a+(x.fee_usd||x.fees_usd||0), 0);
+  const rowsHtml = rows.map(x =>
+    `<tr><td class="dim">${esc(x.ts)}</td><td>${esc(x.from_fund)}</td><td>${esc(x.to_fund)}</td>
+     <td>${fmtUsd(x.amount_usd)}</td><td class="dim">${esc(x.reason||x.initiated_by||"—")}</td>
+     <td class="dim">${(x.fee_usd!=null||x.fees_usd!=null)?fmtUsd(x.fee_usd!=null?x.fee_usd:x.fees_usd):"—"}</td>
+     <td class="dim">${esc(x.state||x.status||"—")}</td></tr>`).join("");
+  return histKpisHtml([
+      ["Total Transfers", String(rows.length)],
+      ["Total Fees Paid", fmtUsd(fees)],
+    ]) +
+    histTableCard("All Rebalance Transfers",
+      ["t","from fund","to fund","amount","reason","fees","status"],
+      rowsHtml, rows.length);
+}
+
+function oppHistoryTabHtml(state){
+  // Rendered from the snapshot's standard + exploratory lists (the only
+  // logged-opportunity surfaces the API exposes; each capped server-side
+  // at OPPORTUNITY_PANEL_MAX_ROWS). Agent is $0 observation-mode, so
+  // outcome is always "obs".
+  const o = state.opportunities || {};
+  const rows = (o.standard||[]).map(r => ({...r, _type:"ACTIONABLE"}))
+    .concat((o.exploratory||[]).map(r => ({...r, _type:"EXPLORATORY"})));
+  const rowsHtml = rows.map(r =>
+    `<tr><td class="dim">${esc(r.first_seen||"—")}</td><td class="dim">${esc(r._type)}</td>
+     <td>${oppMarketHtml(r)}</td><td>${oppEdgeHtml(r)}</td>
+     <td>${oppChip(r.reachability, OPP_REACH_CHIP)}</td>
+     <td class="dim">obs</td>
+     <td class="dim">${esc(r.unconventional_rationale||"—")}</td></tr>`).join("");
+  return histTableCard("All Logged Opportunities",
+    ["t","type","market","edge","reach","outcome","notes"],
+    rowsHtml, rows.length);
+}
+
+function agentHistoryTabHtml(state, id){
+  if(id === "arb") return arbHistoryTabHtml(state);
+  if(id === "opportunity_scanner") return oppHistoryTabHtml(state);
+  const rows = (histCache.agent === id) ? histCache.rows : null;
+  if(rows == null)
+    return `<div class="card"><span class="muted">loading…</span></div>`;
+  switch(id){
+    case "signal":      return signalHistoryTabHtml(rows);
+    case "scalp":       return scalpHistoryTabHtml(rows);
+    case "xchain":      return xchainHistoryTabHtml(rows);
+    case "funding_arb": return fundingHistoryTabHtml(rows);
+    case "balance":     return balanceHistoryTabHtml(rows);
+    default:            return `<div class="card"><span class="muted">no history yet</span></div>`;
+  }
+}
+
+function agentOverviewHtml(state, id){
+  switch(id){
+    case "signal":      return signalDetailHtml(state);
+    case "arb":         return arbDetailHtml(state);
+    case "scalp":       return scalpDetailHtml(state);
+    case "xchain":      return xchainDetailHtml(state);
+    case "funding_arb": return fundingDetailHtml(state);
+    case "balance":     return balanceDetailHtml(state);
+    case "opportunity_scanner": return opportunityDetailHtml(state);
+    default:            return `<span class="muted">unknown agent: ${esc(id)}</span>`;
+  }
+}
+
 function renderAgentDetail(state, id){
   const agent = (state.agents||[]).find(a => a.id === id)
     || {id, status:"OFFLINE", capital:0, daily_pnl:0, trades_today:0, win_rate:0};
   setDetailHeader(agent, id);
-  safeRender("ad-body", () => {
-    switch(id){
-      case "signal":      return signalDetailHtml(state);
-      case "arb":         return arbDetailHtml(state);
-      case "scalp":       return scalpDetailHtml(state);
-      case "xchain":      return xchainDetailHtml(state);
-      case "funding_arb": return fundingDetailHtml(state);
-      case "balance":     return balanceDetailHtml(state);
-      case "opportunity_scanner": return opportunityDetailHtml(state);
-      default:            return `<span class="muted">unknown agent: ${esc(id)}</span>`;
-    }
-  });
+  const tab = (agentDetailTab === "history") ? "history" : "overview";
+  if(tab === "history" && HIST_API_AGENTS.has(id)) ensureAgentHistory(id);
+  safeRender("ad-body", () =>
+    subTabBarHtml(tab) +
+    (tab === "history" ? agentHistoryTabHtml(state, id) : agentOverviewHtml(state, id)));
+  // The opportunity panel renders only here now (it left the dashboard),
+  // so its notes-feed dropdown is (re)bound right after this render.
+  if(id === "opportunity_scanner") bindOppNotesFilters();
 }
 
 function signalDetailHtml(state){
@@ -1446,7 +1728,7 @@ function scalpDetailHtml(state){
       <span class="muted">per-pair OFI not surfaced — pending engine work</span></div>
     <div class="card" style="margin-bottom:10px">
       <h2>Open Positions (Scalp)</h2><div class="scroll">${positionsHtml(myPos)}</div></div>
-    ${scalpFeedHtml(state.scalp)}
+    ${scalpViabilityCardHtml(state.scalp)}${scalpLiveCardHtml(state.scalp)}
     <div class="card" style="margin-top:10px">
       <h2>Today</h2>
       <span class="muted">evaluated / would-enter / closed counters not surfaced — pending engine work</span></div>`;
@@ -1518,14 +1800,15 @@ function agentTradeLogHtml(id, trades){
           <td><span class="tag ${w?"win":"loss"}">${esc(x.outcome)}</span></td></tr>`;
       }).join("") + `</tbody></table>`;
   }
-  // signal (and any default)
+  // signal (and any default) — the signal agent is a shared execution
+  // layer; the track badge identifies which strategy originated each trade.
   if(!trades.length) return `<span class="muted">no closed trades</span>`;
   return `<table><thead><tr><th>t</th><th>pair</th><th>track</th><th>dir</th><th>entry</th><th>exit</th>
     <th>P&amp;L</th><th>out</th></tr></thead><tbody>` +
     trades.map(x => {
       const w = x.outcome==="WIN";
       return `<tr class="${w?"win":"loss"}"><td class="dim">${esc(x.ts)}</td><td>${esc(x.pair)}</td>
-        <td class="dim">${esc(x.track)}</td><td>${esc(x.direction)}</td><td>${x.entry_price}</td>
+        <td>${stratTagHtml(x.track)}</td><td>${esc(x.direction)}</td><td>${x.entry_price}</td>
         <td>${x.exit_price==null?"—":x.exit_price}</td>
         <td class="${cls(x.pnl_usd)}">${fmtUsd(x.pnl_usd)} ${fmtPct(x.pnl_pct)}</td>
         <td><span class="tag ${w?"win":"loss"}">${esc(x.outcome)}</span></td></tr>`;

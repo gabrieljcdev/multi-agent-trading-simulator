@@ -483,8 +483,14 @@ class WebServer:
     # ── WebSocket + static handlers ──────────────────────────────────────
 
     async def handle_index(self, request) -> web.Response:
-        return web.Response(text=self._html or self._load_html(),
-                            content_type="text/html")
+        # Re-read the HTML from disk on every GET and forbid browser caching.
+        # The old startup-cached self._html meant UI edits silently required a
+        # bot restart AND a hard refresh to show up — a stale tab's WebSocket
+        # reconnects after a restart, so the page looks live while running old
+        # markup. Disk read is ~85KB on localhost; cost is negligible.
+        return web.Response(text=self._load_html(),
+                            content_type="text/html",
+                            headers={"Cache-Control": "no-store"})
 
     async def handle_ws(self, request) -> web.WebSocketResponse:
         ws = web.WebSocketResponse(heartbeat=30)
@@ -1945,6 +1951,12 @@ class WebServer:
                 age_s = int((now - opened).total_seconds()) if opened else 0
                 out.append({
                     "agent":       getattr(t, "strategy", None) or "signal",
+                    # Originating strategy/track (funding_arb | momentum |
+                    # reversion | arb | ...). signal_type is the true track;
+                    # strategy (the active strategy-profile name) is only a
+                    # fallback for legacy rows written before signal_type.
+                    "track":       getattr(t, "signal_type", None)
+                                   or getattr(t, "strategy", None) or "signal",
                     "pair":        getattr(t, "pair", "?"),
                     "direction":   side or "—",
                     "entry":       round(entry, 4),
