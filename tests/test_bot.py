@@ -161,7 +161,22 @@ async def test_cycle_skips_dead_zone():
 async def test_cycle_runs_outside_dead_zone():
     bot = _make_bot()
     outside_dead_zone = datetime(2026, 5, 20, 13, 0, 0)  # 13:00 UTC
-    with patch("core.bot.datetime") as mock_dt:
+    # This test isolates the dead-zone gate: outside the dead zone, the scan
+    # must run. The cycle has two further gates between the dead-zone check and
+    # run_scan — the sentiment session-floor and the macro hard-block / pre-event
+    # pause — both reading module-level singletons (sentiment / macro_monitor)
+    # and, for macro, the real calendar against the real clock. Left live they
+    # make this test order- and time-dependent (a sibling test that leaves the
+    # sentiment singleton in a blocking state, or a real HIGH-impact event near
+    # "now", silently swallows the scan). Hold them open so only the dead-zone
+    # behaviour is under test; the guards have their own dedicated tests.
+    from sentiment import sentiment as sentiment_agg
+    from macro import macro_monitor
+    with patch("core.bot.datetime") as mock_dt, \
+         patch.object(sentiment_agg, "passes_session_floor",
+                      return_value=(True, "")), \
+         patch.object(macro_monitor, "is_hard_blocked", return_value=False), \
+         patch.object(macro_monitor, "get_pending_events", return_value=[]):
         mock_dt.utcnow.return_value = outside_dead_zone
         mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
         await bot._cycle()
