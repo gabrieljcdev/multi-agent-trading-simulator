@@ -1533,6 +1533,13 @@ function walletflowPanelHtml(w){
         `watched ${s.watched||0} · events ${s.events_seen||0} · ` +
         `signals ${s.signals_emitted||0} · available ${s.available?"yes":"no"}</div>`).join("")
     : `<span class="muted">no sources</span>`;
+  // Best-effort / gap banner — public RPC drops data; never imply completeness.
+  const bestEffort = srcs.some(s => s.best_effort);
+  const gaps24 = srcs.reduce((n, s) => n + (s.gaps_24h||0), 0);
+  const gapHtml = bestEffort
+    ? `<div class="tag warn" title="public RPC is lossy; history may be incomplete">` +
+      `data: best-effort (public RPC), ${gaps24} gap${gaps24===1?"":"s"} in last 24h</div>`
+    : ``;
 
   return header +
     `<div class="muted" style="font-size:11px;margin:4px 0 6px">` +
@@ -1543,6 +1550,7 @@ function walletflowPanelHtml(w){
     `<h2 class="dim" style="margin-top:10px">Net-flow spikes (per token / exchange)</h2>` +
     `<div class="scroll" style="max-height:200px">${spHtml}</div>` +
     `<h2 class="dim" style="margin-top:10px">System health</h2>` +
+    gapHtml +
     `<div>${srcHtml}</div>` +
     `<div class="dim" style="font-size:11px;margin-top:4px">label set: ` +
       `${stale.count||0} addrs · last verified ${esc(stale.last_verified_at||"never")} · ` +

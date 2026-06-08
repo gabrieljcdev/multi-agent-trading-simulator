@@ -96,6 +96,56 @@ def _seed_resolved(addr, n, *, wins=None, first_mover=True, latency_s=5,
             resolved=rb - timedelta(minutes=(n - i)), first_mover=first_mover)
 
 
+# ── Standard Solana RPC transaction fixture builders (post-rewire) ──────────
+# The data layer now consumes standard RPC `jsonParsed` transactions, not the
+# retired Helius enhanced shape. These build minimal fixtures for sol_parse.
+
+def _rpc_tx(*, block_time=None, signers=None, instructions=None, signature="sig"):
+    bt = block_time if block_time is not None else int(_now().timestamp())
+    keys = [{"pubkey": s, "signer": True} for s in (signers or [])]
+    return {
+        "blockTime": bt,
+        "transaction": {
+            "message": {"accountKeys": keys, "instructions": instructions or []},
+            "signatures": [signature],
+        },
+    }
+
+
+def _sys_transfer_ix(src, dst, lamports=1_000_000):
+    from follow import sol_parse
+    return {"program": "system", "programId": sol_parse.SYSTEM_PROGRAM_ID,
+            "parsed": {"type": "transfer",
+                       "info": {"source": src, "destination": dst,
+                                "lamports": lamports}}}
+
+
+def _spl_transfer_ix(authority, dst, mint="MINT", amount="100"):
+    from follow import sol_parse
+    return {"program": "spl-token", "programId": sol_parse.TOKEN_PROGRAM_ID,
+            "parsed": {"type": "transferChecked",
+                       "info": {"authority": authority, "source": "srcTok",
+                                "destination": dst, "mint": mint,
+                                "tokenAmount": {"amount": amount}}}}
+
+
+def _dex_ix(payer, name="raydium"):
+    from follow import sol_parse
+    return {"programId": sol_parse.DEX_PROGRAM_IDS[name],
+            "accounts": [payer], "data": "x"}
+
+
+def _launch_ix(payer):
+    from follow import sol_parse
+    return {"programId": sol_parse.LAUNCHPAD_PROGRAM_IDS["pumpfun"],
+            "accounts": [payer], "data": "x"}
+
+
+def _unknown_ix(payer):
+    return {"programId": "Unkn0wnProgram1111111111111111111111111111",
+            "accounts": [payer], "data": "x"}
+
+
 # ─────────────────────────────────────────────────────────────────────────
 # 1. Plugin compliance — capital-free observer, no execution path
 # ─────────────────────────────────────────────────────────────────────────
@@ -227,11 +277,9 @@ def test_signals_only_from_manual_or_confirmed(_temp_db):
     w.refresh_watchlist()
     assert {cand, conf} <= w._watchlist
 
-    now = datetime.utcnow().timestamp()
-
     def _swap_tx(payer):
-        return {"type": "SWAP", "feePayer": payer, "timestamp": now,
-                "events": {"swap": {"tokenOutputs": [{"mint": "X"}]}}}
+        # Standard RPC fixture: a known-DEX (raydium) instruction by the payer.
+        return _rpc_tx(signers=[payer], instructions=[_dex_ix(payer)])
 
     # Candidate activity: observed (persisted) but NO signal emitted.
     w._handle_raw_tx(_swap_tx(cand))
@@ -500,15 +548,10 @@ def test_exchange_flow_event_and_netflow(_temp_db):
 
     w = WalletFlowWatcher()
     w._watchlist = {wallet}                       # observe this wallet
-    now = datetime.utcnow().timestamp()
-    tx = {
-        "type": "TRANSFER", "feePayer": wallet, "timestamp": now,
-        "signature": "sig1",
-        "tokenTransfers": [{
-            "fromUserAccount": wallet, "toUserAccount": exchange,
-            "mint": "SOL", "tokenAmount": 10, "usdValue": 1500.0,
-        }],
-    }
+    # Standard RPC fixture: a native-SOL transfer from the wallet to the
+    # labelled exchange address.
+    tx = _rpc_tx(signers=[wallet], signature="sig1",
+                 instructions=[_sys_transfer_ix(wallet, exchange, 5_000_000_000)])
     events = w._handle_raw_tx(tx)
     # A transfer TO a labelled exchange is classified transfer_in (pre-sell tell).
     assert any(e.action == "transfer_in" for e in events)
@@ -516,8 +559,238 @@ def test_exchange_flow_event_and_netflow(_temp_db):
     ti = [r for r in rows if r["action"] == "transfer_in"]
     assert ti and ti[0]["actor_id"] == wallet and ti[0]["venue"] == "binance"
 
-    # Net-flow aggregates the inflow per (asset, venue, window).
+    # Net-flow aggregates the transfer per (asset, venue, window). Public RPC
+    # carries no USD valuation (no price oracle) — size_usd is None and net_usd
+    # is 0; the aggregation is verified by event count, the honest signal here.
     flows = q.get_wallet_net_flows([1, 24])
     match = [f for f in flows if f["venue"] == "binance" and f["asset"] == "SOL"]
-    assert match and any(f["inflow_usd"] >= 1500.0 and f["net_usd"] >= 1500.0
-                         for f in match)
+    assert match and any(f["events"] >= 1 for f in match)
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# PUBLIC-RPC REWIRE — new tests (21–27)
+# ═════════════════════════════════════════════════════════════════════════
+
+# ─────────────────────────────────────────────────────────────────────────
+# 21. sol_parse decodes fixtures into the right ActorEvent actions
+# ─────────────────────────────────────────────────────────────────────────
+
+def test_sol_parse_actions():
+    from follow import sol_parse
+    W, T = "Wwallet", "Texchange"
+    watch = {W}
+    term = {T}
+    is_terminal = lambda a: a in term
+    det = 1_000.0
+
+    def _parse(instrs, signers=(W,)):
+        return sol_parse.parse_transaction(
+            _rpc_tx(signers=list(signers), instructions=instrs),
+            watch, is_terminal, detected_at=det)
+
+    # SOL transfer to a terminal exchange -> transfer_in.
+    ev = _parse([_sys_transfer_ix(W, T)])
+    assert [e.action for e in ev] == ["transfer_in"]
+    # SPL transfer (authority=W) to a terminal -> transfer_in.
+    ev = _parse([_spl_transfer_ix(W, T)])
+    assert any(e.action == "transfer_in" for e in ev)
+    # Known-DEX swap by the payer -> swap.
+    ev = _parse([_dex_ix(W)])
+    assert [e.action for e in ev] == ["swap"]
+    # Launchpad (pump.fun) by the payer -> launch.
+    ev = _parse([_launch_ix(W)])
+    assert [e.action for e in ev] == ["launch"]
+    # Unknown program touching the watched payer -> unparsed (never dropped),
+    # carrying the raw program id in meta.
+    ev = _parse([_unknown_ix(W)])
+    assert len(ev) == 1 and ev[0].action == "unparsed"
+    assert ev[0].meta.get("program_ids")
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# 22. sol_parse is pure (no network)
+# ─────────────────────────────────────────────────────────────────────────
+
+def test_sol_parse_is_pure():
+    from follow import sol_parse
+    src = inspect.getsource(sol_parse)
+    for net in ("aiohttp", "websockets", "import requests", "httpx",
+                "get_session", "asyncio"):
+        assert net not in src, f"sol_parse must be network/IO-free (found {net})"
+    # Runs with no RPC client at all.
+    ev = sol_parse.parse_transaction(
+        _rpc_tx(signers=["W"], instructions=[_sys_transfer_ix("W", "T")]),
+        {"W"}, lambda a: a == "T", detected_at=1.0)
+    assert ev and ev[0].action == "transfer_in"
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# 23. Rate limiter caps RPS + backs off on a simulated 429 (no real network)
+# ─────────────────────────────────────────────────────────────────────────
+
+def test_rate_limiter_and_backoff():
+    from follow.rpc import RateLimiter, SolanaRpc, RpcThrottled
+
+    # Limiter spacing — fake clock + recording sleep, no real waiting.
+    clock = {"t": 0.0}
+    slept = []
+
+    async def fake_sleep(d):
+        slept.append(d)
+        clock["t"] += d
+
+    rl = RateLimiter(4, time_fn=lambda: clock["t"], sleep_fn=fake_sleep)
+
+    async def _spam():
+        for _ in range(3):
+            await rl.acquire()
+    asyncio.run(_spam())
+    # 4 rps -> 0.25s spacing; first acquire free, next two each wait one slot.
+    assert len(slept) == 2
+    assert all(abs(s - 0.25) < 1e-9 for s in slept)
+
+    # Backoff — transport throttles twice then succeeds; backoff is base*2^n.
+    calls = {"n": 0}
+    backoff = []
+
+    async def transport(payload):
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            raise RpcThrottled("429")
+        return {"result": "ok"}
+
+    async def nosleep(_d):
+        pass
+
+    rpc = SolanaRpc(
+        "u", "w",
+        limiter=RateLimiter(1000, time_fn=lambda: 0.0, sleep_fn=nosleep),
+        max_retries=5, backoff_base=1.0,
+        transport=transport, sleep_fn=lambda d: backoff.append(d) or nosleep(d))
+    res = asyncio.run(rpc.call("getX", []))
+    assert res == "ok"
+    assert backoff == [1.0, 2.0]
+    assert calls["n"] == 3
+    assert rpc.throttle_events == 2
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# 24. Stream gap is logged + does NOT crash; get_stats reports best-effort
+# ─────────────────────────────────────────────────────────────────────────
+
+def test_stream_gap_tolerant():
+    w = WalletFlowWatcher()
+    # Malformed frame -> records a gap, never raises.
+    asyncio.run(w._on_raw_message("not-json"))
+    # logsNotification with no signature -> another gap.
+    asyncio.run(w._on_raw_message({
+        "method": "logsNotification",
+        "params": {"result": {"value": {"err": None}}},
+    }))
+    st = w.get_stats()
+    assert st["best_effort"] is True
+    assert st["data_source"] == "public_rpc"
+    assert st["stream_gaps"] >= 2
+    assert st["gaps_24h"] >= 2
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# 25. Derived funding-source: first inbound SOL sender, stop-list, cached
+# ─────────────────────────────────────────────────────────────────────────
+
+def test_derived_funding_source_cached():
+    from follow import funding
+    funding.clear_cache()
+    wallet, funder = "FUNDEDwallet", "FUNDERterminal"
+
+    class FakeRpc:
+        def __init__(self):
+            self.sig_calls = 0
+            self.tx_calls = 0
+            self._sigs = [{"signature": "new"}, {"signature": "old"}]
+            self._txs = {
+                # oldest tx carries the first inbound SOL transfer.
+                "old": _rpc_tx(signers=[funder],
+                               instructions=[_sys_transfer_ix(funder, wallet)]),
+                "new": _rpc_tx(signers=[wallet],
+                               instructions=[_dex_ix(wallet)]),
+            }
+
+        async def get_signatures_for_address(self, address, *, before=None, limit=1000):
+            self.sig_calls += 1
+            return self._sigs if before is None else []
+
+        async def get_transaction(self, sig):
+            self.tx_calls += 1
+            return self._txs.get(sig)
+
+    rpc = FakeRpc()
+    # funder is stop-listed terminal — we return it and stop (can't trace inside).
+    f1 = asyncio.run(funding.first_funder(wallet, rpc,
+                                          is_terminal=lambda a: a == funder))
+    assert f1 == funder
+    tx_after = rpc.tx_calls
+    assert tx_after > 0
+    # Second call is served from cache — NO new RPC calls.
+    f2 = asyncio.run(funding.first_funder(wallet, rpc,
+                                          is_terminal=lambda a: a == funder))
+    assert f2 == funder
+    assert rpc.tx_calls == tx_after
+    assert funding.cached_funder(wallet) == funder
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# 26. Narrow subscription — watchlist + labels ONLY, not a firehose
+# ─────────────────────────────────────────────────────────────────────────
+
+def test_subscription_is_narrow(_temp_db):
+    import json as _json
+    w1, ex = "W1wallet", "EXlabel"
+    provenance.propose_candidate(w1)
+    q.upsert_exchange_label(ex, "exchange", exchange_name="binance", source="seed")
+    w = WalletFlowWatcher()
+    w.refresh_watchlist()
+
+    class FakeWs:
+        def __init__(self):
+            self.sent = []
+
+        async def send(self, payload):
+            self.sent.append(_json.loads(payload))
+
+    ws = FakeWs()
+    asyncio.run(w._subscribe(ws))
+    assert ws.sent, "expected subscriptions"
+    methods = {p["method"] for p in ws.sent}
+    assert methods == {"logsSubscribe"}
+    mentioned = set()
+    for p in ws.sent:
+        filt = p["params"][0]
+        # Narrow: each subscription is a single-address `mentions` filter,
+        # never the firehose "all"/"allWithVotes".
+        assert isinstance(filt, dict) and "mentions" in filt
+        assert filt != "all" and filt != "allWithVotes"
+        mentioned.update(filt["mentions"])
+    assert w1 in mentioned and ex in mentioned
+    # No firehose subscription anywhere.
+    assert all(p["params"][0] not in ("all", "allWithVotes") for p in ws.sent)
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# 27. The three invariants did NOT regress after the rewire
+# ─────────────────────────────────────────────────────────────────────────
+
+def test_invariants_intact_after_rewire(_temp_db):
+    from agents.follow_agent import FollowAgent
+    # (a) no execution path on the source or the host agent.
+    w = WalletFlowWatcher()
+    fa = FollowAgent()
+    for obj in (w, fa):
+        for forbidden in ("submit", "execute", "place_order", "trade",
+                          "route_order"):
+            assert not hasattr(obj, forbidden)
+    assert fa.capital_allocation == 0.0
+    # (b) discovery can only write candidate — never confirmed.
+    assert q.transition_provenance("X", "confirmed", by="discovery")["ok"] is False
+    # (c) single shared point-in-time function (import identity).
+    assert discovery.resolved_actions_as_of is skill_scorer.resolved_actions_as_of

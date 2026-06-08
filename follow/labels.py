@@ -96,6 +96,16 @@ def staleness() -> dict:
                 "warn_days": 7, "is_stale": True}
 
 
+def all_addresses() -> list[str]:
+    """Every labelled terminal address — the watcher subscribes to these (plus
+    the watchlist) so it observes flow INTO exchanges. Never raises."""
+    try:
+        return q.get_exchange_label_addresses()
+    except Exception as e:
+        logger.debug("labels.all_addresses: %s", e)
+        return []
+
+
 def is_available() -> bool:
     """True once the label set is non-empty — the watcher requires it to
     classify flow, so it is part of WalletFlowWatcher.is_available()."""
@@ -107,5 +117,5 @@ def is_available() -> bool:
 
 __all__ = [
     "load_seed_labels", "lookup", "is_terminal_address",
-    "staleness", "is_available",
+    "staleness", "is_available", "all_addresses",
 ]

@@ -459,6 +459,21 @@ WALLETFLOW_LABEL_STALENESS_WARN_DAYS = 7    # test: [3, 7, 14]     exchange-labe
 # FollowAgent maintenance pass — runs discovery + trust-lifecycle enforcement
 WALLETFLOW_MAINTENANCE_INTERVAL_S = 3600    # test: [900, 3600, 21600]  cadence of the discovery + trust-expiry maintenance pass
 
+# Data layer — FREE public Solana RPC (no paid keys). The endpoint is ONE
+# swappable value: flip to a free Helius/QuickNode key later by editing the URL
+# only. Public RPC is throttled + lossy, so the client self-throttles and the
+# watcher is gap-tolerant by design.
+WALLETFLOW_RPC_URL = "https://api.mainnet-beta.solana.com"   # test: any RPC url; swap to free key later
+WALLETFLOW_RPC_WS_URL = "wss://api.mainnet-beta.solana.com"  # test: matching ws endpoint
+WALLETFLOW_RPC_MAX_RPS = 4                # test: [2, 4, 8]   stay well under public limits
+WALLETFLOW_RPC_BACKOFF_BASE_S = 1.0       # test: [0.5, 1.0, 2.0]   exponential backoff base on 429/timeout
+WALLETFLOW_RPC_MAX_RETRIES = 5            # test: [3, 5, 8]
+WALLETFLOW_FUNDING_CACHE_TTL_DAYS = 365   # first-funder is immutable; cache hard
+WALLETFLOW_FUNDING_CACHE_MAX = 50000      # test: [10000, 50000]   first-funder cache cap
+WALLETFLOW_FUNDING_CRAWL_MAX_SIGS = 1000  # cap pagination depth per wallet; test: [500, 1000, 2000]
+WALLETFLOW_PARSE_DEXES = ["raydium", "orca"]   # the 1-2 DEXs parsed; everything else -> "unparsed"
+WALLETFLOW_PARSE_LAUNCHPADS = ["pumpfun"]      # launchpad instruction formats parsed (capability; subscription stays narrow)
+
 # ══════════════════════════════════════════════════════════════════════════════
 # MOMENTUM SIGNAL (TRACK B)
 # ══════════════════════════════════════════════════════════════════════════════

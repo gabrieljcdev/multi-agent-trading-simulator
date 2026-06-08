@@ -3354,6 +3354,13 @@ def is_terminal_address(address: str) -> bool:
         return s.query(ExchangeLabel).filter_by(address=address).first() is not None
 
 
+def get_exchange_label_addresses() -> list[str]:
+    """Every labelled address — the watcher subscribes to these (plus the
+    watchlist) so it sees flow INTO exchanges, not just wallet-side actions."""
+    with get_session() as s:
+        return [r[0] for r in s.query(ExchangeLabel.address).all()]
+
+
 def label_set_staleness() -> dict:
     """Coverage + staleness metadata for the label set. is_stale is True when
     the most-recently-verified label is older than

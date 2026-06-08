@@ -35,7 +35,7 @@ from typing import Optional
 
 from config import settings
 from database import queries as q
-from follow import provenance
+from follow import provenance, funding
 # Bind the SHARED point-in-time functions by reference — discovery must route
 # through the one definition in skill_scorer, never a copy (asserted by test).
 from follow.skill_scorer import score_wallet, resolved_actions_as_of
@@ -58,8 +58,15 @@ def _meme_rug_rate(funder: Optional[str]) -> Optional[float]:
 
 
 def _funder_of(address: str) -> Optional[str]:
-    """Best-effort funding source from the wallet's earliest observed event
-    meta. None when we have no funding provenance for the wallet."""
+    """Best-effort funding source. Reads the DERIVED first-funder cache
+    (follow/funding.py), which the FollowAgent's slow background crawl populates
+    from public RPC — the call-site swap off the old endpoint. Falls back to a
+    funder stamped on the wallet's earliest observed event meta. This stays SYNC
+    + offline (cache-only): discovery never blocks on or blasts the RPC, and the
+    gating logic below is unchanged."""
+    cached = funding.cached_funder(address)
+    if cached:
+        return cached
     try:
         actions = q.get_wallet_resolved_actions(address)
     except Exception:

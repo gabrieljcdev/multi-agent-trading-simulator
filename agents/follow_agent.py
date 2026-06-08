@@ -31,7 +31,7 @@ from agents.base import (
     RUNNING, OFFLINE, STOPPED,
 )
 from follow import REGISTERED_FOLLOW_SOURCES, BaseStreamingDataSource
-from follow import discovery, provenance, labels
+from follow import discovery, provenance, labels, funding
 
 log = logging.getLogger(__name__)
 
@@ -192,11 +192,38 @@ class FollowAgent(BaseAgent):
                 await asyncio.sleep(interval)
                 if self._manually_halted:
                     continue
+                # Slow background first-funder crawl (async, through the shared
+                # rate limiter) populates the cache discovery then reads.
+                await self._funding_crawl()
                 await asyncio.to_thread(self._run_maintenance)
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 log.exception("[Follow] maintenance loop: %s", e)
+
+    async def _funding_crawl(self) -> None:
+        """SLOW background first-funder crawl through the watcher's shared
+        rate-limited RPC client, populating follow.funding's cache. Best-effort:
+        skips entirely when the watcher / RPC isn't live (e.g. disabled). The
+        limiter paces it — never a burst — which is acceptable for an observer."""
+        watcher = self.get_source("wallet_flow")
+        rpc = getattr(watcher, "_rpc", None) if watcher is not None else None
+        if rpc is None:
+            return
+        try:
+            universe = await asyncio.to_thread(db_queries.get_distinct_flow_actors)
+        except Exception as e:
+            log.debug("[Follow] funding crawl universe: %s", e)
+            return
+        for addr in universe:
+            if not self._running:
+                break
+            if funding.is_cached(addr):
+                continue
+            try:
+                await funding.first_funder(addr, rpc)
+            except Exception as e:
+                log.debug("[Follow] funding crawl %s: %s", addr, e)
 
     def _run_maintenance(self) -> None:
         """Discovery (writes only candidates) + trust expiry on confirmed
