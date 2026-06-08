@@ -497,6 +497,41 @@ COPYTRADE_LEADERBOARD_REFRESH_S = 300            # test: [120, 300, 600]  leader
 COPYTRADE_RPC_MAX_RPS = 4                        # test: [2, 4, 8]   Drift (Solana) RPC politeness; reuses the wallet-flow limiter style
 
 # ══════════════════════════════════════════════════════════════════════════════
+# MEME-COIN CLUSTER-PATTERN RUG-RATE SCORER ($0 OBSERVER — follow/meme_scorer.py)
+# ══════════════════════════════════════════════════════════════════════════════
+# Capital-free OBSERVER under FollowAgent (sibling of the wallet watcher). Watches
+# new Solana launches (pump.fun), clusters early-buyer wallets by COMMON FUNDING
+# SOURCE (one hop, funder-only merge, terminal stop-list from labels.py), tracks
+# each funder's POINT-IN-TIME rug rate (computed as-of, NEVER stored static, via
+# the ONE shared meme_scorer.rug_rate_as_of), and emits AVOID when a launch
+# contains a funder-cluster with a strong, well-evidenced rug history. Otherwise
+# NO-SIGNAL — which means "no LAZY manipulation detected", NOT "safe". Decision
+# space is binary + abstention-heavy (AVOID | NO-SIGNAL). It never says BUY/SAFE,
+# never follows, has no submit/execute path.
+#
+# SCOPE (locked, deliberate misses, NOT gaps to fix): LOW-HANGING FRUIT ONLY —
+# single-hop "star" funding bundles. No bridge-tracing, no behavioural clustering,
+# no multi-hop graphs. v1 deliberately MISSES sophisticated operators. Solana only.
+#
+# LAUNCH VISIBILITY — Option 1 (SAMPLING) behind a LaunchSource seam: public RPC
+# cannot drink the pump.fun firehose, so v1 polls the launchpad on the existing
+# rate-limited client and ACCEPTS GAPS. KNOWN BIAS: sampling under-catches the
+# FASTEST rug-and-die launches (they live between polls), so live rug-rates run
+# LIGHT on fast rugs and the maturation window calibrates toward slower deaths —
+# documented in code + surfaced in the UI health layer (best-effort/gap flag).
+MEME_ENABLED = False
+MEME_LAUNCH_POLL_S = 30                  # test: [15, 30, 60]   sampling cadence
+MEME_EARLY_BUYER_WINDOW_S = 300          # how long after detect counts as "early"; test:[120,300,600]
+MEME_MATURATION_HORIZON_H = 24           # survival cutoff DEFAULT; calibration may override; test:[12,24,48]
+MEME_SLOWDEATH_WINDOW_H = 6              # sustained-floor window; test:[3,6,12]
+MEME_LIQ_FLOOR_USD = 1000                # test:[500,1000,2000]
+MEME_VOL_FLOOR_USD = 500                 # test:[250,500,1000]
+MEME_AVOID_MIN_RESOLVED = 5              # min resolved launches before a funder rate can flag; test:[3,5,8]
+MEME_AVOID_MIN_RUGRATE = 0.7             # test:[0.6,0.7,0.8]
+MEME_REPLAY_TEST_FRACTION = 0.3          # held-out fraction the threshold tuning never touches; test:[0.2,0.3,0.4]
+# reuses the wallet-flow RPC limiter/settings (WALLETFLOW_RPC_*) — no second limiter.
+
+# ══════════════════════════════════════════════════════════════════════════════
 # MOMENTUM SIGNAL (TRACK B)
 # ══════════════════════════════════════════════════════════════════════════════
 

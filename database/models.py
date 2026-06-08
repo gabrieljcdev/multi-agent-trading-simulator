@@ -1167,3 +1167,105 @@ class CopyTradeEvaluation(Base):
         Index("ix_copytrade_evaluations_actor", "actor_id", "evaluated_at"),
         Index("ix_copytrade_evaluations_decision", "decision"),
     )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# MEME-COIN CLUSTER-PATTERN RUG-RATE SCORER ($0 observer — follow/meme_scorer.py)
+# ──────────────────────────────────────────────────────────────────────────────
+# Sibling of the wallet-flow tables. Stores LAUNCHES + their early-buyer wallets +
+# the buyers' funding sources, so a funder's rug-rate can be computed POINT-IN-TIME
+# ON DEMAND — it is NEVER stored as a static number (storing it would leak the
+# future into the past). The two-clock discipline is the binary-correctness spine:
+# detected_at (launch became knowable) and resolved_at (outcome became FINAL, NULL
+# until resolved); a rate scored at T may use ONLY launches with resolved_at < T.
+# NOTHING here records "safe": a launch with no AVOID is "no lazy manipulation
+# detected", never a clean bill of health. Fresh init_db creates these tables;
+# existing databases run the project's migration convention (no Alembic).
+
+
+class MemeLaunch(Base):
+    """One observed Solana launch (sampled from the launchpad). The funder
+    rug-rate is COMPUTED from these rows as-of a timestamp — never stored.
+
+    Two clocks (load-bearing): detected_at is when the mint became knowable at
+    sample time; resolved_at is when the outcome became FINAL (rug confirmed OR
+    survived to the maturation horizon) and stays NULL until then. A launch that
+    is detected but not yet resolved is CENSORED — excluded from any denominator,
+    never counted as a non-rug. label_confidence distinguishes HARD (irreversible
+    on-chain event) from SOFT (sustained-floor slow-death) — floors are gameable,
+    so a soft label is never trusted alone.
+    """
+    __tablename__ = "meme_launches"
+
+    mint             = Column(String(60), primary_key=True)
+    detected_at      = Column(DateTime, nullable=False)     # launch became knowable
+    resolved_at      = Column(DateTime)                     # outcome FINAL (null until resolved)
+    outcome          = Column(String(10))                   # rug | survived (null until resolved)
+    label_confidence = Column(String(6))                    # hard | soft (null until resolved)
+    source           = Column(String(20), default="sampling")  # how it was observed (sampling)
+    meta             = Column(JSON)                          # creator, signature, sampling-gap notes
+    created_at       = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        Index("ix_meme_launches_detected", "detected_at"),
+        Index("ix_meme_launches_resolved", "resolved_at"),
+        Index("ix_meme_launches_outcome", "outcome"),
+    )
+
+
+class MemeLaunchBuyer(Base):
+    """One early-buyer wallet of a launch, with its derived first FUNDER (one hop,
+    post stop-list). The FUNDER is the persistent rug-rate-bearing identity (buyer
+    wallets are disposable); funder is NULL when unknown or when the trace reached
+    a terminal exchange/router/bridge (we stop there — "funded by Binance" is not a
+    bundle, so a terminal-funded wallet is NOT clustered).
+    """
+    __tablename__ = "meme_launch_buyers"
+
+    id          = Column(Integer, primary_key=True)
+    launch_mint = Column(String(60), ForeignKey("meme_launches.mint"), nullable=False)
+    wallet      = Column(String(60), nullable=False)
+    funder      = Column(String(60))                        # null = unknown / terminal (not clustered)
+    buy_at      = Column(DateTime)
+    meta        = Column(JSON)
+
+    __table_args__ = (
+        Index("ix_meme_buyers_launch", "launch_mint"),
+        Index("ix_meme_buyers_funder", "funder"),
+    )
+
+
+class MemeFunder(Base):
+    """A persistent funding-source identity seen across launches. The rug-rate is
+    COMPUTED point-in-time from the launches this funder appears in (via the ONE
+    shared meme_scorer.rug_rate_as_of) — it is deliberately NOT a column here.
+    """
+    __tablename__ = "meme_funders"
+
+    funder     = Column(String(60), primary_key=True)
+    first_seen = Column(DateTime, default=datetime.utcnow)  # IMMUTABLE after first insert
+
+
+class MemeDecision(Base):
+    """Immutable decision log — one row per launch scored. decision is AVOID or
+    NO_SIGNAL (NO_SIGNAL == "no lazy manipulation detected", NEVER "safe").
+    rate_as_of + resolved_sample + confidence are the evidence the decision was
+    made on (the rate the funder-cluster had at the launch's detected_at), kept so
+    the call is auditable and replayable through the SAME as-of function.
+    """
+    __tablename__ = "meme_decisions"
+
+    id              = Column(Integer, primary_key=True)
+    launch_mint     = Column(String(60), nullable=False)
+    decided_at      = Column(DateTime, default=datetime.utcnow)
+    decision        = Column(String(10), nullable=False)    # avoid | no_signal
+    funder          = Column(String(60))                    # the flagged funder (avoid only)
+    rate_as_of      = Column(Float)                         # point-in-time rug rate at decision
+    resolved_sample = Column(Integer)                       # resolved launches behind the rate
+    confidence      = Column(String(6))                     # hard | soft | mixed | none
+    reason          = Column(Text)
+
+    __table_args__ = (
+        Index("ix_meme_decisions_launch", "launch_mint", "decided_at"),
+        Index("ix_meme_decisions_decision", "decision"),
+    )

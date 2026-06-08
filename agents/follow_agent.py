@@ -226,6 +226,40 @@ class FollowAgent(BaseAgent):
             log.debug("[Follow] copytrade denominator: %s", e)
         return out
 
+    def get_meme_snapshot(self) -> dict:
+        """Live, low-volume block for the meme-coin rug-rate scorer panel. Every
+        key present even when a read raises (snapshot iron rule). Heavy/identifying
+        reads (per-launch cluster drill-in, the as-of inspector) are on-demand REST
+        under /api/meme/*, NOT here.
+
+        NO-SIGNAL is carried labelled "no lazy manipulation detected" — NEVER
+        "safe"; and the sampling best-effort/gap flag rides in the source stats."""
+        out = {
+            "enabled":   bool(getattr(settings, "MEME_ENABLED", False)),
+            "running":   bool(self._running),
+            "launches":  [],
+            "decisions": [],
+            "sources":   [],
+            "no_signal_label": "no lazy manipulation detected",
+            "scope_note": ("LOW-HANGING FRUIT only (single-hop funder bundles); "
+                           "sampling MISSES fast rugs; misses sophisticated "
+                           "operators by design. NO-SIGNAL != safe."),
+        }
+        src = self.get_source("meme_scorer")
+        try:
+            out["sources"] = [src.get_stats()] if src is not None else []
+        except Exception as e:
+            log.debug("[Follow] meme source stats: %s", e)
+        try:
+            out["launches"] = db_queries.get_active_meme_launches(limit=15)
+        except Exception as e:
+            log.debug("[Follow] meme launches: %s", e)
+        try:
+            out["decisions"] = db_queries.get_recent_meme_decisions(limit=15)
+        except Exception as e:
+            log.debug("[Follow] meme decisions: %s", e)
+        return out
+
     def get_corroboration_view(self, spot_assessments=None) -> dict:
         """Cross-surface corroboration view (the Tier-2 meeting point). Thin
         cross-reference only — it does NO detection; the perp source feeds its

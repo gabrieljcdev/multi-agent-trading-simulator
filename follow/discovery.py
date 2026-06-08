@@ -44,11 +44,12 @@ logger = logging.getLogger(__name__)
 
 
 def _meme_rug_rate(funder: Optional[str]) -> Optional[float]:
-    """Hook into the meme scorer's rug-rate for a funding source. The meme
-    source is not built yet, so this returns None (-> "unknown" warning). When
-    the meme source lands, wire it here — one place to change."""
+    """Hook into the meme scorer's POINT-IN-TIME rug-rate for a funding source —
+    the ONE place this is wired (follow.meme_scorer.funder_rug_rate). Returns None
+    on cold-start / insufficient resolved sample, which maps to the "unknown"
+    warning — a funder with no evidence is never assumed clean."""
     try:
-        from follow.meme_wallets import funder_rug_rate  # type: ignore
+        from follow.meme_scorer import funder_rug_rate
     except Exception:
         return None
     try:

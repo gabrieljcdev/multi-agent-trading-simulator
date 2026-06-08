@@ -23,6 +23,7 @@ from .models import (
     OpportunityLpDetail, OpportunityLaunchDetail,
     WalletFlowEvent, WalletWatchlist, DiscoveryCandidate, ExchangeLabel,
     CopyTradeEvent, CopyTradeActor, CopyTradeEvaluation,
+    MemeLaunch, MemeLaunchBuyer, MemeFunder, MemeDecision,
 )
 
 
@@ -3558,3 +3559,205 @@ def get_copytrade_denominator(limit: int = 500) -> dict:
         "rejection_reasons": reasons,
         "evaluations":      recent,
     }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MEME-COIN CLUSTER-PATTERN RUG-RATE SCORER ($0 observer — follow/meme_scorer.py)
+# ══════════════════════════════════════════════════════════════════════════════
+# Sibling of the wallet-flow query helpers. Stores LAUNCHES, their early-buyer
+# wallets + funders, and the immutable decision log. The funder rug-rate is
+# COMPUTED point-in-time by follow/meme_scorer.rug_rate_as_of — these helpers
+# NEVER store a rate and NEVER apply the as-of filter themselves: get_funder_launches
+# returns the RAW launch rows (resolved AND unresolved) so the ONE as-of function
+# can partition them (resolved-before-T vs censored). That mirrors how
+# get_wallet_resolved_actions feeds skill_scorer.resolved_actions_as_of.
+
+
+def _meme_launch_to_dict(r, *, raw_times: bool = False) -> dict:
+    def _t(v):
+        if v is None:
+            return None
+        return v if raw_times else v.isoformat()
+    return {
+        "mint":             r.mint,
+        "detected_at":      _t(r.detected_at),
+        "resolved_at":      _t(r.resolved_at),
+        "outcome":          r.outcome,
+        "label_confidence": r.label_confidence,
+        "source":           r.source,
+        "meta":             r.meta or {},
+    }
+
+
+def upsert_meme_launch(row: dict) -> None:
+    """Insert (or refresh an unresolved) launch. detected_at is set once on
+    insert; outcome/resolved_at/label_confidence are filled later by the
+    maturation pass via resolve_meme_launch. Never rewrites a resolved row's
+    detected_at."""
+    with get_session() as s:
+        r = s.query(MemeLaunch).filter_by(mint=row["mint"]).first()
+        if r is None:
+            s.add(MemeLaunch(
+                mint=row["mint"],
+                detected_at=row["detected_at"],
+                resolved_at=row.get("resolved_at"),
+                outcome=row.get("outcome"),
+                label_confidence=row.get("label_confidence"),
+                source=row.get("source", "sampling"),
+                meta=row.get("meta") or {},
+            ))
+
+
+def resolve_meme_launch(mint: str, resolved_at: datetime, outcome: str,
+                        label_confidence: str) -> None:
+    """Stamp a launch's OUTCOME clock (the second clock the as-of fn reads).
+    outcome is 'rug' | 'survived'; label_confidence is 'hard' | 'soft'."""
+    with get_session() as s:
+        r = s.query(MemeLaunch).filter_by(mint=mint).first()
+        if r is None:
+            return
+        r.resolved_at = resolved_at
+        r.outcome = outcome
+        r.label_confidence = label_confidence
+
+
+def get_meme_launch(mint: str) -> Optional[dict]:
+    with get_session() as s:
+        r = s.query(MemeLaunch).filter_by(mint=mint).first()
+        return _meme_launch_to_dict(r) if r is not None else None
+
+
+def get_active_meme_launches(limit: int = 50) -> list[dict]:
+    """Newest launches for the live panel (low-volume push)."""
+    with get_session() as s:
+        rows = (s.query(MemeLaunch)
+                .order_by(desc(MemeLaunch.detected_at))
+                .limit(limit).all())
+        return [_meme_launch_to_dict(r) for r in rows]
+
+
+def get_unresolved_meme_launches(limit: int = 500) -> list[dict]:
+    """Launches still pending an outcome — the maturation pass's work list.
+    Raw datetimes intact so the caller can compare against the horizon."""
+    with get_session() as s:
+        rows = (s.query(MemeLaunch)
+                .filter(MemeLaunch.resolved_at.is_(None))
+                .order_by(MemeLaunch.detected_at.asc())
+                .limit(limit).all())
+        return [_meme_launch_to_dict(r, raw_times=True) for r in rows]
+
+
+def insert_meme_launch_buyer(row: dict) -> int:
+    """Append one early-buyer wallet (+ derived funder) of a launch."""
+    with get_session() as s:
+        b = MemeLaunchBuyer(
+            launch_mint=row["launch_mint"],
+            wallet=row["wallet"],
+            funder=row.get("funder"),
+            buy_at=row.get("buy_at"),
+            meta=row.get("meta") or {},
+        )
+        s.add(b)
+        s.flush()
+        return int(b.id)
+
+
+def get_meme_launch_buyers(mint: str) -> list[dict]:
+    """Early-buyer wallets + funders for one launch (the cluster drill-in)."""
+    with get_session() as s:
+        rows = (s.query(MemeLaunchBuyer)
+                .filter(MemeLaunchBuyer.launch_mint == mint).all())
+        return [{
+            "wallet": r.wallet, "funder": r.funder,
+            "buy_at": r.buy_at.isoformat() if r.buy_at else None,
+            "meta": r.meta or {},
+        } for r in rows]
+
+
+def upsert_meme_funder(funder: str) -> None:
+    """Record a funder identity (first_seen IMMUTABLE after first insert). The
+    rug-rate is never stored — it is computed point-in-time on demand."""
+    if not funder:
+        return
+    with get_session() as s:
+        if s.query(MemeFunder).filter_by(funder=funder).first() is None:
+            s.add(MemeFunder(funder=funder))
+
+
+def get_funder_launches(funder: str) -> list[dict]:
+    """EVERY launch (resolved AND unresolved) whose cluster contains this funder,
+    raw datetimes intact. This is the RAW feed the ONE shared point-in-time
+    function (follow/meme_scorer.rug_rate_as_of) partitions as-of a timestamp — it
+    deliberately does NOT filter by time or resolution itself, so the single as-of
+    implementation lives in follow/meme_scorer.py and nowhere else (mirrors
+    get_wallet_resolved_actions feeding skill_scorer.resolved_actions_as_of)."""
+    with get_session() as s:
+        rows = (s.query(MemeLaunch)
+                .join(MemeLaunchBuyer,
+                      MemeLaunchBuyer.launch_mint == MemeLaunch.mint)
+                .filter(MemeLaunchBuyer.funder == funder)
+                .distinct()
+                .order_by(MemeLaunch.detected_at.asc())
+                .all())
+        return [_meme_launch_to_dict(r, raw_times=True) for r in rows]
+
+
+def get_resolved_meme_launches() -> list[dict]:
+    """All resolved launches, raw datetimes — the replay harness's universe and
+    the maturation-window calibration sample."""
+    with get_session() as s:
+        rows = (s.query(MemeLaunch)
+                .filter(MemeLaunch.resolved_at.isnot(None))
+                .order_by(MemeLaunch.resolved_at.asc())
+                .all())
+        return [_meme_launch_to_dict(r, raw_times=True) for r in rows]
+
+
+def insert_meme_decision(row: dict) -> int:
+    """Append one immutable decision-log row (avoid | no_signal)."""
+    with get_session() as s:
+        d = MemeDecision(
+            launch_mint=row["launch_mint"],
+            decided_at=row.get("decided_at") or datetime.utcnow(),
+            decision=row["decision"],
+            funder=row.get("funder"),
+            rate_as_of=row.get("rate_as_of"),
+            resolved_sample=row.get("resolved_sample"),
+            confidence=row.get("confidence"),
+            reason=row.get("reason"),
+        )
+        s.add(d)
+        s.flush()
+        return int(d.id)
+
+
+def get_recent_meme_decisions(limit: int = 50) -> list[dict]:
+    """Newest decisions for the live panel — AVOID and NO_SIGNAL alike."""
+    with get_session() as s:
+        rows = (s.query(MemeDecision)
+                .order_by(desc(MemeDecision.decided_at))
+                .limit(limit).all())
+        return [{
+            "id": r.id, "launch_mint": r.launch_mint,
+            "decided_at": r.decided_at.isoformat() if r.decided_at else None,
+            "decision": r.decision, "funder": r.funder,
+            "rate_as_of": r.rate_as_of, "resolved_sample": r.resolved_sample,
+            "confidence": r.confidence, "reason": r.reason,
+        } for r in rows]
+
+
+def get_meme_decision(mint: str) -> Optional[dict]:
+    """Most recent decision for one launch (the drill-in headline)."""
+    with get_session() as s:
+        r = (s.query(MemeDecision)
+             .filter(MemeDecision.launch_mint == mint)
+             .order_by(desc(MemeDecision.decided_at)).first())
+        if r is None:
+            return None
+        return {
+            "launch_mint": r.launch_mint,
+            "decided_at": r.decided_at.isoformat() if r.decided_at else None,
+            "decision": r.decision, "funder": r.funder,
+            "rate_as_of": r.rate_as_of, "resolved_sample": r.resolved_sample,
+            "confidence": r.confidence, "reason": r.reason,
+        }

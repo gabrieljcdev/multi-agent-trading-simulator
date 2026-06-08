@@ -275,8 +275,121 @@ def first_inbound_sol_sender(tx: dict, address: str) -> Optional[str]:
     return None
 
 
+# ── Launchpad + rug-event decoding (meme scorer; REUSES the helpers above) ───────
+# These ADD launch/rug decoding capability to the module that already owns Solana
+# decoding — they do NOT rewrite parse_transaction's watched-wallet ACTION_LAUNCH
+# flag (that stays as-is). They reuse the SAME launchpad program-id registry
+# (LAUNCHPAD_PROGRAM_IDS), instruction iteration, and SPL helpers, and stay PURE
+# (no network/DB/clock). The meme LaunchSource samples the launchpad and calls
+# these; the rug helpers feed the maturation/labelling layer.
+
+def _mint_initialized(tx: dict) -> Optional[str]:
+    """The mint of the first initializeMint(2) SPL instruction in the tx, if any.
+    A launchpad create mints a new token, so this is the most reliable mint id."""
+    for ix in _instructions(tx):
+        if ix.get("program") not in ("spl-token", "spl-token-2022"):
+            continue
+        parsed = ix.get("parsed") or {}
+        if parsed.get("type") in ("initializeMint", "initializeMint2"):
+            mint = (parsed.get("info") or {}).get("mint")
+            if mint:
+                return mint
+    return None
+
+
+def launch_events(tx: dict, *, launchpads: Optional[list[str]] = None) -> list[dict]:
+    """Decode a launchpad (pump.fun) create tx into new-launch records:
+    {mint, creator, launchpad, signature}. PURE + tolerant — a malformed or
+    non-launch tx yields [] (graceful degradation), so the sampling LaunchSource
+    can hand it raw RPC payloads. The mint is taken from the initializeMint
+    instruction when present, else the first account of the launchpad instruction
+    (best-effort without the launchpad IDL — documented). creator = fee payer."""
+    if not isinstance(tx, dict):
+        return []
+    out: list[dict] = []
+    try:
+        lp_ids = _active_program_ids("WALLETFLOW_PARSE_LAUNCHPADS",
+                                     LAUNCHPAD_PROGRAM_IDS, launchpads)
+        if not lp_ids:
+            return []
+        creator = _fee_payer(tx)
+        sig = _sig(tx)
+        init_mint = _mint_initialized(tx)
+        for ix in _instructions(tx):
+            pid = _ix_program_id(ix)
+            if pid not in lp_ids:
+                continue
+            accts = _ix_accounts(ix)
+            mint = init_mint or (accts[0] if accts else None)
+            if not mint:
+                continue
+            out.append({"mint": mint, "creator": creator,
+                        "launchpad": pid, "signature": sig})
+            break          # one launch per tx (a create mints one token)
+    except Exception as e:
+        logger.debug("launch_events parse failed: %s", e)
+        return []
+    return out
+
+
+# Irreversible rug-event types — these label a launch instantly + HARD (the
+# ground-truth set). They are detected from the SAME decode primitives, never
+# inferred from gameable floors.
+RUG_LP_REMOVE        = "lp_remove"        # liquidity pulled / yanked
+RUG_MINT_AUTH_ABUSE  = "mint_auth_abuse"  # post-launch mint-authority mint/assign
+RUG_DEV_DUMP         = "dev_dump"         # creator dumps full token allocation
+
+
+def rug_events(tx: dict, *, mint: Optional[str] = None,
+               creator: Optional[str] = None) -> list[dict]:
+    """Detect IRREVERSIBLE rug events in a tx for a given mint/creator. Returns a
+    list of {type, signature} for liquidity removal, mint-authority abuse, or a
+    full dev dump. PURE + tolerant (malformed tx -> []). These are the HARD
+    ground-truth labels; slow-death (soft) is handled separately by the
+    sustained-floor labeller, NOT here."""
+    if not isinstance(tx, dict):
+        return []
+    out: list[dict] = []
+    try:
+        sig = _sig(tx)
+        # Mint-authority abuse: a post-launch mintTo / setAuthority on the mint.
+        for ix in _instructions(tx):
+            if ix.get("program") not in ("spl-token", "spl-token-2022"):
+                continue
+            parsed = ix.get("parsed") or {}
+            ptype = parsed.get("type")
+            info = parsed.get("info") or {}
+            if mint is not None and info.get("mint") not in (mint, None):
+                continue
+            if ptype in ("mintTo", "mintToChecked"):
+                out.append({"type": RUG_MINT_AUTH_ABUSE, "signature": sig})
+            elif ptype == "setAuthority" and info.get("authorityType") == "mintTokens":
+                out.append({"type": RUG_MINT_AUTH_ABUSE, "signature": sig})
+        # Liquidity removal: an lp_remove on a known DEX (the launch's pool).
+        for ix in _instructions(tx):
+            pid = _ix_program_id(ix)
+            if pid in _active_program_ids("WALLETFLOW_PARSE_DEXES",
+                                          DEX_PROGRAM_IDS, None):
+                parsed = ix.get("parsed") or {}
+                if parsed.get("type") in ("withdraw", "removeLiquidity", "lp_remove"):
+                    out.append({"type": RUG_LP_REMOVE, "signature": sig})
+        # Dev dump: the creator is the SPL transfer authority sending the token out.
+        if creator is not None:
+            for t in _spl_transfers(tx):
+                if t.get("authority") == creator and \
+                        (mint is None or t.get("mint") == mint):
+                    out.append({"type": RUG_DEV_DUMP, "signature": sig})
+                    break
+    except Exception as e:
+        logger.debug("rug_events parse failed: %s", e)
+        return []
+    return out
+
+
 __all__ = [
     "parse_transaction", "sol_transfers", "first_inbound_sol_sender",
+    "launch_events", "rug_events",
+    "RUG_LP_REMOVE", "RUG_MINT_AUTH_ABUSE", "RUG_DEV_DUMP",
     "ACTION_LAUNCH", "ACTION_UNPARSED",
     "DEX_PROGRAM_IDS", "LAUNCHPAD_PROGRAM_IDS",
     "SYSTEM_PROGRAM_ID", "TOKEN_PROGRAM_ID",

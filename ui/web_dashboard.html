@@ -1701,9 +1701,84 @@ function copytradePanelHtml(c){
     denHtml;
 }
 
+/* ---------- meme-coin cluster rug-rate scorer panel ----------
+   Read-only $0 OBSERVER. Binary + abstention-heavy: AVOID | NO-SIGNAL, where
+   NO-SIGNAL is rendered "no lazy manipulation detected" — NEVER "safe". Layers,
+   ALL visible (hiding uncertainty is the failure mode): (1) recent decisions
+   with the funder-cluster rate + resolved sample + hard/soft confidence;
+   (2) live launches; (3) health — sampling best-effort/gap flag + the deliberate
+   scope (LOW-HANGING FRUIT; misses fast rugs + sophisticated operators by
+   design). Per-launch cluster drill-in + the as-of inspector are on-demand REST
+   (localhost-guarded), not in the snapshot. */
+function memePanelHtml(m){
+  m = m || {};
+  if(!m.enabled) return `<span class="muted">Meme rug-rate scorer disabled (MEME_ENABLED=False)</span>`;
+  const srcs = m.sources || [];
+  const gaps = srcs.reduce((n,s)=>n+(s.sampling_gaps||0),0);
+  const header =
+    `<div><b>MEME-COIN CLUSTER RUG-RATE SCORER</b> <span class="tag warn">OBSERVER · $0</span> · ` +
+    `<span class="dim">running</span> ${m.running?"yes":"no"}</div>`;
+  // Honest scope + NO-SIGNAL meaning — rendered, not buried.
+  const caveat = `<div class="muted" style="font-size:11px;margin:4px 0 6px">` +
+    `Binary: <b>AVOID</b> | <b>NO-SIGNAL</b>. NO-SIGNAL = "no lazy manipulation ` +
+    `detected", <b>NOT "safe"</b>. LOW-HANGING FRUIT only (single-hop funder ` +
+    `bundles); sampling MISSES the fastest rugs and v1 misses sophisticated ` +
+    `operators by design. Observes + logs — never trades, never says BUY.</div>`;
+  // Best-effort / sampling-gap banner — never imply completeness.
+  const gapHtml = srcs.some(s=>s.best_effort)
+    ? `<div class="tag warn" title="sampling under-catches fast rug-and-die launches">` +
+      `data: best-effort (sampling), ${gaps} sampling gap${gaps===1?"":"s"}</div>` : ``;
+
+  // Layer 1 — recent decisions (rate + resolved sample + confidence as prominent
+  // as the verdict).
+  const ds = m.decisions || [];
+  const dHtml = ds.length
+    ? `<table><thead><tr><th>decided</th><th>mint</th><th>decision</th>` +
+      `<th>funder</th><th>rate</th><th>resolved</th><th>conf</th></tr></thead><tbody>` +
+      ds.map(d => {
+        const avoid = d.decision === "avoid";
+        const tag = avoid
+          ? `<span class="tag loss">AVOID</span>`
+          : `<span class="tag warn" title="no lazy manipulation detected — NOT safe">NO-SIGNAL</span>`;
+        return `<tr><td class="dim">${esc((d.decided_at||"").slice(0,19))}</td>` +
+          `<td title="${esc(d.launch_mint)}">${esc((d.launch_mint||"").slice(0,8))}…</td>` +
+          `<td>${tag}</td>` +
+          `<td title="${esc(d.funder||"")}">${d.funder?esc(d.funder.slice(0,8))+"…":"—"}</td>` +
+          `<td><b>${d.rate_as_of==null?"—":d.rate_as_of}</b></td>` +
+          `<td>${d.resolved_sample||0}</td>` +
+          `<td>${esc(d.confidence||"none")}</td></tr>`;
+      }).join("") + `</tbody></table>`
+    : `<span class="muted">no decisions yet</span>`;
+
+  // Layer 2 — live launches.
+  const ls = m.launches || [];
+  const lHtml = ls.length
+    ? `<table><thead><tr><th>detected</th><th>mint</th><th>outcome</th>` +
+      `<th>conf</th></tr></thead><tbody>` +
+      ls.map(l => `<tr><td class="dim">${esc((l.detected_at||"").slice(0,19))}</td>` +
+        `<td title="${esc(l.mint)}">${esc((l.mint||"").slice(0,10))}…</td>` +
+        `<td>${esc(l.outcome||"pending")}</td>` +
+        `<td>${esc(l.label_confidence||"—")}</td></tr>`).join("") +
+      `</tbody></table>`
+    : `<span class="muted">no launches observed yet</span>`;
+
+  return header + caveat +
+    `<h2 class="dim" style="margin-top:8px">Decisions — AVOID | NO-SIGNAL (rate + sample + confidence)</h2>` +
+    `<div class="scroll" style="max-height:220px">${dHtml}</div>` +
+    `<h2 class="dim" style="margin-top:10px">Live launches (sampled)</h2>` +
+    `<div class="scroll" style="max-height:180px">${lHtml}</div>` +
+    `<h2 class="dim" style="margin-top:10px">System health</h2>` +
+    gapHtml +
+    `<div class="dim" style="font-size:11px;margin-top:4px">Per-launch cluster ` +
+    `+ the as-of inspector at <span class="dim">/api/meme/launch/&lt;mint&gt;</span> ` +
+    `and <span class="dim">/api/meme/asof/&lt;funder&gt;</span>; replay TP/FP/coverage ` +
+    `at <span class="dim">/api/meme/health</span>.</div>`;
+}
+
 function followDetailHtml(state){
   return `<div class="card">${walletflowPanelHtml(state.walletflow)}</div>` +
-    `<div class="card" style="margin-top:10px">${copytradePanelHtml(state.copytrade)}</div>`;
+    `<div class="card" style="margin-top:10px">${copytradePanelHtml(state.copytrade)}</div>` +
+    `<div class="card" style="margin-top:10px">${memePanelHtml(state.meme)}</div>`;
 }
 
 /* ---------- balance agent panel ---------- */

@@ -317,6 +317,11 @@ class WebServer:
             web.get("/api/copytrade/surfaced",         self.handle_copytrade_surfaced),
             web.get("/api/copytrade/denominator",      self.handle_copytrade_denominator),
             web.get("/api/copytrade/health",           self.handle_copytrade_health),
+            # Meme-coin rug-rate scorer — surfaces wallet/funder IDENTITIES, so
+            # localhost-guarded (403 otherwise), same privacy rule as walletflow.
+            web.get("/api/meme/launch/{mint}", self.handle_meme_launch),
+            web.get("/api/meme/asof/{funder}", self.handle_meme_asof),
+            web.get("/api/meme/health",        self.handle_meme_health),
             web.post("/action/approve",        self.handle_approve),
             web.post("/action/skip",           self.handle_skip),
             web.post("/action/kill",           self.handle_kill),
@@ -1206,6 +1211,113 @@ class WebServer:
             logger.debug("copytrade health failed: %s", e)
         return web.json_response(out)
 
+    # ── Meme-coin rug-rate scorer (/api/meme/*) ──────────────────────────
+    # PRIVACY HARD RULE: this panel serves wallet/funder identities. Every
+    # endpoint 403s unless the server binds to a loopback host — identical to
+    # the wallet-flow rule (identities must never leave the operator's machine).
+
+    def _meme_guard(self) -> Optional[web.Response]:
+        """Return a 403 response when WEB_UI_HOST is not loopback, else None."""
+        host = str(getattr(settings, "WEB_UI_HOST", "localhost") or "").lower()
+        if host not in _LOCAL_HOSTS:
+            return web.json_response(
+                {"ok": False, "error": "forbidden_non_local_host",
+                 "detail": "meme rug-rate data is localhost-only"}, status=403)
+        return None
+
+    async def handle_meme_launch(self, request) -> web.Response:
+        """GET /api/meme/launch/{mint} → per-launch drill-in: the decision, the
+        funder-cluster, and each present funder's rug-rate WITH resolved-vs-censored
+        counts and the hard/soft mix shown AS PROMINENTLY as the rate. Routes the
+        rate through the SAME shared meme_scorer.rug_rate_as_of as the scorer."""
+        guard = self._meme_guard()
+        if guard is not None:
+            return guard
+        from follow import meme_scorer
+        mint = request.match_info.get("mint", "")
+        try:
+            launch = db_queries.get_meme_launch(mint)
+            decision = db_queries.get_meme_decision(mint)
+            buyers = db_queries.get_meme_launch_buyers(mint)
+            as_of_dt = datetime.utcnow()
+            # Decision time is what the scorer used; show rates as-of THAT moment.
+            if decision and decision.get("decided_at"):
+                try:
+                    as_of_dt = datetime.fromisoformat(decision["decided_at"])
+                except (TypeError, ValueError):
+                    pass
+            funders = sorted({b["funder"] for b in buyers if b.get("funder")})
+            # SAME shared as-of fn the scorer + replay use — not a second copy.
+            cluster = [meme_scorer.rug_rate_as_of(f, as_of_dt) for f in funders]
+            return web.json_response(
+                {"ok": True, "launch": launch, "decision": decision,
+                 "buyers": buyers, "cluster": cluster,
+                 "no_signal_label": meme_scorer.NO_SIGNAL_LABEL},
+                dumps=lambda o: json.dumps(_jsonable(o), default=str,
+                                           allow_nan=False))
+        except Exception as e:
+            logger.debug("meme launch endpoint failed: %s", e)
+            return web.json_response({"ok": False, "error": str(e)})
+
+    async def handle_meme_asof(self, request) -> web.Response:
+        """GET /api/meme/asof/{funder}?as_of=ISO → THE AS-OF INSPECTOR. Reconstructs
+        a funder-cluster's rug-rate at any timestamp through the SAME shared
+        meme_scorer.rug_rate_as_of the live scorer and replay harness use (one code
+        path). Resolved-vs-censored counts + hard/soft mix are returned alongside
+        the rate — hiding uncertainty is the failure mode."""
+        guard = self._meme_guard()
+        if guard is not None:
+            return guard
+        from follow import meme_scorer
+        funder = request.match_info.get("funder", "")
+        as_of = None
+        raw = request.query.get("as_of")
+        if raw:
+            try:
+                as_of = datetime.fromisoformat(raw)
+            except (TypeError, ValueError):
+                as_of = None
+        try:
+            as_of_dt = as_of or datetime.utcnow()
+            rr = meme_scorer.rug_rate_as_of(funder, as_of_dt)
+            return web.json_response(
+                {"ok": True, "funder": funder, "as_of": as_of_dt.isoformat(),
+                 "rug_rate": rr},
+                dumps=lambda o: json.dumps(_jsonable(o), default=str,
+                                           allow_nan=False))
+        except Exception as e:
+            logger.debug("meme as-of endpoint failed: %s", e)
+            return web.json_response({"ok": False, "error": str(e)})
+
+    async def handle_meme_health(self, request) -> web.Response:
+        """GET /api/meme/health → the HEALTH LAYER: sampling best-effort/gap flag,
+        coverage, and the latest replay TP/FP/coverage. Surfaces the known bias
+        (sampling under-catches fast rugs; v1 misses sophisticated operators)
+        rather than implying completeness."""
+        guard = self._meme_guard()
+        if guard is not None:
+            return guard
+        from follow import meme_scorer
+        out = {"ok": True, "sources": [], "replay": {},
+               "no_signal_label": meme_scorer.NO_SIGNAL_LABEL,
+               "scope_note": ("LOW-HANGING FRUIT only; sampling MISSES fast rugs; "
+                              "misses sophisticated operators by design. "
+                              "NO-SIGNAL != safe.")}
+        try:
+            agent = self._get_agent("follow")
+            snap = (agent.get_meme_snapshot()
+                    if agent is not None and hasattr(agent, "get_meme_snapshot")
+                    else {})
+            out["sources"] = snap.get("sources", [])
+            out["running"] = snap.get("running", False)
+        except Exception as e:
+            logger.debug("meme health snapshot: %s", e)
+        try:
+            out["replay"] = meme_scorer.run_replay()
+        except Exception as e:
+            logger.debug("meme health replay: %s", e)
+        return web.json_response(out)
+
     # ── LED ticker (GET /api/ticker?exchange=<id>) ───────────────────────
 
     async def handle_ticker(self, request) -> web.Response:
@@ -1457,6 +1569,7 @@ class WebServer:
             # Copy-trade leaderboard observer (read-only; $0 OBSERVER). Live,
             # low-volume only — per-actor as-of + full denominator are REST.
             "copytrade":      self._snap_copytrade(),
+            "meme":           self._snap_meme(),
             # Web UI v2 fixes — capital deployment + movements visibility.
             "capital":        self._snap_capital(),
         }
@@ -1844,6 +1957,44 @@ class WebServer:
         except Exception as e:
             logger.debug("copytrade snapshot failed: %s", e)
             return self._copytrade_empty_block()
+
+    @staticmethod
+    def _meme_empty_block() -> dict:
+        """Complete safe-fallback shape — every sub-key present even when the
+        agent is None or a read raises (snapshot iron rule). NO-SIGNAL is carried
+        labelled, NEVER as 'safe'."""
+        return {
+            "enabled":         bool(getattr(settings, "MEME_ENABLED", False)),
+            "running":         False,
+            "launches":        [],
+            "decisions":       [],
+            "sources":         [],
+            "no_signal_label": "no lazy manipulation detected",
+            "scope_note":      ("LOW-HANGING FRUIT only (single-hop funder bundles); "
+                                "sampling MISSES fast rugs; misses sophisticated "
+                                "operators by design. NO-SIGNAL != safe."),
+        }
+
+    def _snap_meme(self) -> dict:
+        """Meme-coin rug-rate scorer panel block (READ-ONLY live view; the agent
+        is a $0 observer). Heavy/identifying reads (per-launch cluster drill-in,
+        the as-of inspector) are on-demand REST under /api/meme/* and are NOT
+        pushed here. Defensive: a None agent or any failing read falls back to the
+        complete empty block — the snapshot must never raise."""
+        agent = self._get_agent("follow")
+        if agent is None:
+            return self._meme_empty_block()
+        getter = getattr(agent, "get_meme_snapshot", None)
+        if not callable(getter):
+            return self._meme_empty_block()
+        try:
+            block = getter()
+            base = self._meme_empty_block()
+            base.update(block or {})
+            return base
+        except Exception as e:
+            logger.debug("meme snapshot failed: %s", e)
+            return self._meme_empty_block()
 
     def _snap_balance(self) -> dict:
         """Web UI v2 balance panel — wholesale replacement of the v1 shape.

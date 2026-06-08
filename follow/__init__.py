@@ -31,6 +31,7 @@ from __future__ import annotations
 from follow.base import ActorEvent, BaseStreamingDataSource
 from follow.wallet_flow import WalletFlowWatcher
 from follow.copytrade import CopyTradeObserver
+from follow.meme_scorer import MemeScorer
 
 
 REGISTERED_FOLLOW_SOURCES: list[BaseStreamingDataSource] = [
@@ -38,8 +39,11 @@ REGISTERED_FOLLOW_SOURCES: list[BaseStreamingDataSource] = [
     # On-chain perp leaderboard observer (Hyperliquid + Drift). Capital-free,
     # denominator-logged, corroboration-only — no execution path, no auto-follow.
     CopyTradeObserver(),
-    # Add new follow sources here (instances). e.g. the meme-wallet scorer,
-    # which will REUSE follow/sol_parse.py + follow/labels.py.
+    # Meme-coin cluster-pattern rug-rate scorer. Capital-free, point-in-time
+    # (one shared as-of rug-rate fn), sampling launch source, one-hop funder-only
+    # clustering. Emits AVOID | NO-SIGNAL only — no BUY/SAFE, no follow, no
+    # execution path. REUSES follow/sol_parse.py + follow/funding.py + labels.py.
+    MemeScorer(),
 ]
 
 __all__ = [
@@ -48,4 +52,5 @@ __all__ = [
     "ActorEvent",
     "WalletFlowWatcher",
     "CopyTradeObserver",
+    "MemeScorer",
 ]
