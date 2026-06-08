@@ -6,6 +6,16 @@ never SSL, never internet-exposed. Mirrors the terminal dashboard
 (`ui/dashboard.py`); the two render independently from the same data
 sources.
 
+The push snapshot is live state, not history; the one exception is the
+on-demand REST reads, which DO serve historical / as-of analysis on
+request rather than over the 2Hz push. The wallet-flow watcher
+(`/api/walletflow/*`) is the widest such surface — per-wallet skill
+scores, evidence, and a point-in-time as-of reconstruction. Because that
+data is wallet-IDENTIFYING, every `/api/walletflow/*` endpoint is bound
+to the privacy guard: it returns **403** unless `WEB_UI_HOST` is a
+loopback host (`localhost` / `127.0.0.1` / `::1`). LAN binds get no
+wallet data.
+
 The single HTML file `ui/web_dashboard.html` is served at `/` and
 opens a WebSocket to `/ws`. Snapshots arrive every
 `WEB_UI_PUSH_INTERVAL_S` (default 0.5s); the UI applies them via
@@ -53,6 +63,7 @@ Top-level keys, in order:
 | **`funding`** *(v2)* | dict | funding-rate panel — status, capital, venue, symbols, positions, today_summary |
 | **`balance`** *(v2)* | dict | balance-agent panel — status, pool, funds, nodes, in_transit, halted_pairs, today, pending_plan |
 | **`opportunities`** | dict | Opportunity Scanner panel (read-only; $0 observation) — enabled, observation_count, detection_latency_ms_p50, standard, exploratory, notes |
+| **`walletflow`** | dict | Wallet + exchange-flow watcher (read-only; $0 OBSERVER) — enabled, running, flow_events, netflow_spikes, pending_candidates, label_staleness, sources. Live/low-volume only; wallet-identifying + historical reads are on-demand REST under `/api/walletflow/*` |
 | **`capital`** *(v2 fixes)* | dict | capital deployment + movements — totals, per-agent live allocation/deployed/idle + return-on-deployed%, in-transit moves, recent capital_movements rows |
 
 ### `arb` (v2)
@@ -291,6 +302,7 @@ UI. The render function dispatched per agent_id:
 | `funding_arb` | full `fundingPanelHtml(funding)` |
 | `balance`     | full `balancePanelHtml(balance)` — includes the arm/confirm/cancel control block, which now lives on this detail page rather than on the dashboard |
 | `opportunity_scanner` | full `opportunityPanelHtml(opportunities)` — the read-only panel (standard + exploratory views, reasoning feed); this detail page is now its ONLY surface — the duplicate dashboard card was removed |
+| `follow` | full `walletflowPanelHtml(walletflow)` — the read-only $0 OBSERVER panel: live flow signals (labelled suggestive-not-confirmed), net-flow spikes, system health, and the candidate-review queue (warnings + Confirm/Reject, wired via `bindWalletflowReview()` to the localhost-guarded `/api/walletflow/*` endpoints). Per-wallet skill + as-of reconstruction are on-demand REST, not pushed |
 
 The four `*PanelHtml` functions (`arbFundPanelHtml`, `xchainPanelHtml`,
 `fundingPanelHtml`, `balancePanelHtml`) are unchanged from v2 — they
@@ -422,6 +434,16 @@ the error string. Never raises to the aiohttp layer.
 | `/api/ticker?exchange=<id>` | LED-ticker prices, proxied through the bot's ccxt layer (see below) |
 | `/api/coinlogo/{coin}` | coin-logo proxy (cryptocurrency-icons SVG, server-cached; 404 → grid letter-avatar fallback) |
 | `/api/opportunity_notes?noteworthy={true\|false}&limit={int}` | `{"ok": true, "notes": [...]}` — the reasoning feed's full-history pull (`noteworthy=true` default; `false` includes routine posts). Read-only; errors return `{"ok": false, "error": ...}`. The kill switch remains the only DB-writing endpoint. |
+| `GET /api/walletflow/wallet/{address}?as_of={iso}` | `{"ok": true, "wallet", "score", "evidence", "as_of"}` — point-in-time skill score + evidence + as-of reconstruction. The as-of view calls the SAME shared point-in-time function as the scorer (`follow.skill_scorer.resolved_actions_as_of`) — one code path. **403** off-loopback (privacy guard). |
+| `GET /api/walletflow/candidates` | `{"ok": true, "candidates": [...]}` — pending auto-discovery candidates WITH bait-resistance warnings (informational, never auto-applied). **403** off-loopback. |
+| `POST /api/walletflow/candidate/confirm` `{address}` | candidate → confirmed (operator action — the ONLY path to confirmed). `{"ok": bool, ...}`. **403** off-loopback. |
+| `POST /api/walletflow/candidate/reject` `{address}` | candidate → rejected (permanent; never re-proposed). `{"ok": bool, ...}`. **403** off-loopback. |
+| `GET /api/walletflow/health` | `{"ok": true, "label_staleness", "coverage", "latency_delta_s"}` — label-set staleness, source coverage, latency-δ p50/p90. **403** off-loopback. |
+
+The wallet-flow confirm/reject endpoints are operator WRITES — distinct from
+the opportunity panel's read-only feed. They mutate watchlist provenance only
+(never capital), are localhost-guarded, and are the operator's two paths off
+the "candidate" state; discovery itself can never confirm.
 
 ### `GET /api/ticker`
 
@@ -691,6 +713,10 @@ FUNDING_DELTA_TOLERANCE_USD       5.0                   funding position delta c
 OPPORTUNITY_PANEL_MAX_ROWS        12                    max rows per view in the Opportunity Scanner panel
   (panel also reads OPPORTUNITY_SCANNER_ENABLED, OPPORTUNITY_SHOW_DISQUALIFIED,
    OPPORTUNITY_UNCONVENTIONAL_MIN_SCORE from the agent build)
+
+WALLETFLOW_ENABLED                False                 master enable for the wallet-flow OBSERVER panel
+  (the /api/walletflow/* endpoints are localhost-guarded by WEB_UI_HOST; the
+   panel also surfaces WALLETFLOW_LABEL_STALENESS_WARN_DAYS-driven staleness)
 
 TICKER_EXCHANGES                  [kraken,…,hyperliquid] venues in the ticker dropdown
 TICKER_DEFAULT_EXCHANGE           "kraken"              fresh selection each page load

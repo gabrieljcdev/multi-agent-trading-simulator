@@ -954,3 +954,118 @@ class OpportunityObservation(Base):
         Index("ix_opportunity_obs_detector", "detector_id", "opp_type"),
         Index("ix_opportunity_obs_first_seen", "first_seen"),
     )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# WALLET + EXCHANGE-FLOW WATCHER ($0 observer — follow/)
+# ──────────────────────────────────────────────────────────────────────────────
+# OBSERVER tables: a wallet-action / exchange-flow event log, the watchlist
+# provenance store, the auto-discovery candidate queue, and the SHARED
+# exchange-address label set (one source of truth for "is this a terminal
+# exchange/router/bridge"). NOTHING here records trading intent: flow is stored
+# as SUGGESTIVE evidence, never as a confirmed sell/buy. Fresh init_db creates
+# them; existing databases run the project's migration convention (no Alembic).
+
+
+class WalletFlowEvent(Base):
+    """One observed on-chain action by a tracked wallet (or a transfer to/from
+    a labelled exchange address). Stored as SUGGESTIVE evidence only — `action`
+    is the observed event class, never an inferred intent.
+
+    Two-clock discipline (load-bearing for the point-in-time scorer): occurred_at
+    is on-chain block time, detected_at is when WE observed it (T + delta), and
+    resolved_at is when the action's outcome became known. A score at time T may
+    only use rows with resolved_at strictly < T — no look-ahead, ever.
+    """
+    __tablename__ = "wallet_flow_events"
+
+    id          = Column(Integer, primary_key=True)
+    source_id   = Column(String(30), nullable=False)   # "wallet_flow"
+    actor_id    = Column(String(60), nullable=False)   # wallet address
+    action      = Column(String(20), nullable=False)   # swap | transfer_in | transfer_out | lp_add | ...
+    asset       = Column(String(40))
+    venue       = Column(String(40))                   # exchange/label name when known
+    size_usd    = Column(Float)
+    occurred_at = Column(DateTime, nullable=False)     # on-chain block time
+    detected_at = Column(DateTime, nullable=False)     # when WE observed it (T + delta)
+    resolved_at = Column(DateTime)                     # outcome known (null until resolved)
+    outcome     = Column(String(10))                   # win | loss | flat (null until resolved)
+    meta        = Column(JSON)                          # event-type extras (exchange label, counterparty, token mint)
+    created_at  = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        Index("ix_wallet_flow_actor", "actor_id", "occurred_at"),
+        Index("ix_wallet_flow_resolved", "actor_id", "resolved_at"),
+        Index("ix_wallet_flow_asset_venue", "asset", "venue", "occurred_at"),
+        Index("ix_wallet_flow_action", "action"),
+    )
+
+
+class WalletWatchlist(Base):
+    """The watchlist provenance store. provenance is the state-machine state
+    (follow/provenance.py): candidate | confirmed | manual | rejected.
+
+    HARD INVARIANT (also enforced in queries.transition_provenance): discovery
+    may only create rows in "candidate"; only an operator action confirms or
+    rejects; rejected is permanent (never re-proposed); the watcher emits
+    signals ONLY from "manual" and "confirmed" wallets.
+    """
+    __tablename__ = "wallet_watchlist"
+
+    address              = Column(String(60), primary_key=True)
+    provenance           = Column(String(12), nullable=False)   # candidate|confirmed|manual|rejected
+    added_at             = Column(DateTime, default=datetime.utcnow)
+    added_by             = Column(String(12))                   # discovery | operator
+    confirmed_at         = Column(DateTime)                     # set on -> confirmed
+    expires_at           = Column(DateTime)                     # trust-expiry horizon (confirmed only)
+    actions_since_confirm = Column(Integer, default=0)
+    last_demote_reason   = Column(String(40))
+
+    __table_args__ = (
+        Index("ix_wallet_watchlist_provenance", "provenance"),
+    )
+
+
+class DiscoveryCandidate(Base):
+    """Auto-discovery's PROPOSAL record — one row per wallet discovery mined
+    from the watcher's own event stream. Discovery writes ONLY these; it never
+    confirms. gate_passed records whether the promotion gate (ALL of sample /
+    score / first-mover / latency-δ) cleared; warnings carry BAIT-RESISTANCE
+    flags that inform operator review but NEVER auto-reject.
+    """
+    __tablename__ = "discovery_candidates"
+
+    id                = Column(Integer, primary_key=True)
+    address           = Column(String(60), nullable=False)
+    discovered_at     = Column(DateTime, default=datetime.utcnow)
+    skill_score       = Column(Float)
+    resolved_sample   = Column(Integer)
+    first_mover_ratio = Column(Float)
+    latency_delta_s   = Column(Float)
+    warnings          = Column(JSON)                            # [{flag, severity, detail}] — informational only
+    gate_passed       = Column(Boolean, default=False)
+    review_state      = Column(String(10), default="pending")   # pending | approved | rejected
+
+    __table_args__ = (
+        Index("ix_discovery_candidates_address", "address"),
+        Index("ix_discovery_candidates_review", "review_state"),
+    )
+
+
+class ExchangeLabel(Base):
+    """SHARED exchange-address label set — the one source of truth for
+    "is this address an exchange/router/bridge" (also the meme scorer's terminal
+    stop-list). label is the address class; last_verified_at drives staleness.
+    """
+    __tablename__ = "exchange_labels"
+
+    address          = Column(String(60), primary_key=True)
+    label            = Column(String(20), nullable=False)   # exchange | router | bridge | multisig
+    exchange_name    = Column(String(40))
+    source           = Column(String(40))                   # where the label came from (seed | operator | feed)
+    added_at         = Column(DateTime, default=datetime.utcnow)
+    last_verified_at = Column(DateTime)
+
+    __table_args__ = (
+        Index("ix_exchange_labels_label", "label"),
+    )

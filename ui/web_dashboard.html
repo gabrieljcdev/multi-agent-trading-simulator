@@ -1322,6 +1322,7 @@ function fundingPanelHtml(f){
    interactive control and fires a GET read — no buttons, no actions. */
 let oppNotesMode = "noteworthy";   // feed filter state; survives re-renders
 let oppNotesAllCache = null;       // GET /api/opportunity_notes payload for "All posts"
+let walletflowCandidates = null;   // GET /api/walletflow/candidates payload (on-demand pull)
 
 const OPP_TREND_CHIP  = {zero:"opp-zero", rising_slow:"opp-slow",
                          rising_fast:"opp-fast", saturated:"opp-sat"};
@@ -1479,6 +1480,137 @@ function bindOppNotesFilters(){
       if(STATE && STATE.ts) updateUI(STATE);
     };
   });
+}
+
+/* ---------- wallet + exchange-flow watcher panel ----------
+   Read-only $0 OBSERVER. Three layers, ALL visible (hiding uncertainty is the
+   failure mode): (1) live flow signals labelled SUGGESTIVE-not-confirmed;
+   (2) net-flow spikes + latency-δ shown as prominently as anything else;
+   (3) system health. Plus the candidate-review queue with warnings + approve/
+   reject. The wallet-identity + as-of reconstruction reads are on-demand REST
+   (localhost-guarded), not in the 2Hz snapshot. */
+function walletflowPanelHtml(w){
+  w = w || {};
+  if(!w.enabled) return `<span class="muted">Wallet-flow watcher disabled (WALLETFLOW_ENABLED=False)</span>`;
+  const stale = w.label_staleness || {};
+  const staleTag = stale.is_stale
+    ? ` <span class="tag loss">LABELS STALE</span>` : ` <span class="tag ok">labels ok</span>`;
+  const header =
+    `<div><b>WALLET + EXCHANGE-FLOW WATCHER</b> <span class="tag warn">OBSERVER · $0</span> · ` +
+    `<span class="dim">running</span> ${w.running?"yes":"no"} · ` +
+    `<span class="dim">pending review</span> ${w.pending_candidates||0}${staleTag}</div>`;
+
+  // Layer 1 — live flow signals (SUGGESTIVE, never confirmed intent).
+  const evs = w.flow_events || [];
+  const evHtml = evs.length
+    ? `<table><thead><tr><th>detected</th><th>wallet</th><th>action</th><th>asset</th>` +
+      `<th>venue</th><th>size</th></tr></thead><tbody>` +
+      evs.map(e => `<tr><td class="dim">${esc((e.detected_at||"").slice(0,19))}</td>` +
+        `<td title="${esc(e.actor_id)}">${esc((e.actor_id||"").slice(0,8))}…</td>` +
+        `<td>${esc(e.action)}</td><td>${esc((e.asset||"—")).slice(0,10)}</td>` +
+        `<td>${esc(e.venue||"—")}</td><td>${fmtUsd(e.size_usd)}</td></tr>`).join("") +
+      `</tbody></table>`
+    : `<span class="muted">no flow events yet</span>`;
+
+  // Layer 2 — net-flow spikes (inflow=pre-sell tell, outflow=accumulation tell).
+  const sp = w.netflow_spikes || [];
+  const spHtml = sp.length
+    ? `<table><thead><tr><th>asset</th><th>venue</th><th>window</th>` +
+      `<th>net</th><th>in</th><th>out</th></tr></thead><tbody>` +
+      sp.map(s => {
+        const net = s.net_usd||0;
+        const style = net>0 ? ' style="color:var(--neg)"' : (net<0 ? ' style="color:var(--pos)"' : '');
+        return `<tr><td>${esc((s.asset||"?").slice(0,10))}</td><td>${esc(s.venue)}</td>` +
+          `<td class="dim">${s.window_h}h</td><td${style}>${fmtUsd(net)}</td>` +
+          `<td>${fmtUsd(s.inflow_usd)}</td><td>${fmtUsd(s.outflow_usd)}</td></tr>`;
+      }).join("") + `</tbody></table>`
+    : `<span class="muted">no net-flow spikes</span>`;
+
+  // Layer 3 — system health (sources + latency-δ shown prominently).
+  const srcs = w.sources || [];
+  const srcHtml = srcs.length
+    ? srcs.map(s => `<div class="dim">${esc(s.source_id)} · ` +
+        `watched ${s.watched||0} · events ${s.events_seen||0} · ` +
+        `signals ${s.signals_emitted||0} · available ${s.available?"yes":"no"}</div>`).join("")
+    : `<span class="muted">no sources</span>`;
+
+  return header +
+    `<div class="muted" style="font-size:11px;margin:4px 0 6px">` +
+      `Flow is SUGGESTIVE evidence, never a confirmed sell/buy. This watcher ` +
+      `observes and logs — it never trades.</div>` +
+    `<h2 class="dim" style="margin-top:8px">Live flow — suggestive, not confirmed</h2>` +
+    `<div class="scroll" style="max-height:220px">${evHtml}</div>` +
+    `<h2 class="dim" style="margin-top:10px">Net-flow spikes (per token / exchange)</h2>` +
+    `<div class="scroll" style="max-height:200px">${spHtml}</div>` +
+    `<h2 class="dim" style="margin-top:10px">System health</h2>` +
+    `<div>${srcHtml}</div>` +
+    `<div class="dim" style="font-size:11px;margin-top:4px">label set: ` +
+      `${stale.count||0} addrs · last verified ${esc(stale.last_verified_at||"never")} · ` +
+      `${stale.is_stale?"STALE — verify before trusting":"fresh"}</div>` +
+    walletflowCandidateReviewHtml();
+}
+
+function walletflowCandidateReviewHtml(){
+  const cands = walletflowCandidates;
+  let body;
+  if(cands == null){
+    body = `<span class="muted">loading candidates…</span>`;
+  }else if(!cands.length){
+    body = `<span class="muted">no candidates pending review</span>`;
+  }else{
+    body = cands.map(c => {
+      const warns = (c.warnings||[]).map(wn =>
+        `<span class="tag ${wn.severity==='unknown'?'warn':'loss'}" title="${esc(wn.detail)}">${esc(wn.flag)}</span>`
+      ).join(" ");
+      return `<div class="card" style="margin:6px 0;padding:8px">` +
+        `<div><b title="${esc(c.address)}">${esc((c.address||"").slice(0,16))}…</b> ` +
+        `<span class="dim">skill</span> ${c.skill_score==null?"—":c.skill_score} · ` +
+        `<span class="dim">sample</span> ${c.resolved_sample||0} · ` +
+        `<span class="dim">first-mover</span> ${c.first_mover_ratio==null?"—":c.first_mover_ratio} · ` +
+        `<span class="dim">δ</span> ${c.latency_delta_s==null?"—":c.latency_delta_s}s</div>` +
+        `<div style="margin:4px 0">${warns || '<span class="dim">no warnings</span>'}</div>` +
+        `<button class="wfConfirm" data-addr="${esc(c.address)}">Confirm</button> ` +
+        `<button class="wfReject" data-addr="${esc(c.address)}">Reject</button></div>`;
+    }).join("");
+  }
+  return `<h2 class="dim" style="margin-top:12px">Candidate review — auto-discovered, NEVER auto-trusted</h2>` +
+    `<div class="muted" style="font-size:11px;margin-bottom:4px">` +
+      `Warnings inform review; they never auto-reject. Confirm/Reject are the ` +
+      `only paths off "candidate"; rejected is permanent.</div>` +
+    `<div class="scroll" style="max-height:320px">${body}</div>`;
+}
+
+async function bindWalletflowReview(){
+  // Pull the candidate queue once per detail render (on-demand REST, not the
+  // snapshot), then wire the approve/reject buttons. Mirrors bindOppNotesFilters.
+  document.querySelectorAll(".wfConfirm").forEach(b =>
+    b.onclick = async () => {
+      b.disabled = true;
+      await postAction("/api/walletflow/candidate/confirm", {address:b.dataset.addr});
+      walletflowCandidates = null;
+      await refreshWalletflowCandidates();
+    });
+  document.querySelectorAll(".wfReject").forEach(b =>
+    b.onclick = async () => {
+      b.disabled = true;
+      await postAction("/api/walletflow/candidate/reject", {address:b.dataset.addr});
+      walletflowCandidates = null;
+      await refreshWalletflowCandidates();
+    });
+  if(walletflowCandidates == null) await refreshWalletflowCandidates();
+}
+
+async function refreshWalletflowCandidates(){
+  try{
+    const r = await fetch("/api/walletflow/candidates");
+    const d = await r.json();
+    walletflowCandidates = (d && d.ok) ? (d.candidates||[]) : [];
+  }catch(e){ walletflowCandidates = []; }
+  if(STATE && STATE.ts && activeAgentId === "follow") updateUI(STATE);
+}
+
+function followDetailHtml(state){
+  return `<div class="card">${walletflowPanelHtml(state.walletflow)}</div>`;
 }
 
 /* ---------- balance agent panel ---------- */
@@ -1834,6 +1966,7 @@ function agentOverviewHtml(state, id){
     case "funding_arb": return fundingDetailHtml(state);
     case "balance":     return balanceDetailHtml(state);
     case "opportunity_scanner": return opportunityDetailHtml(state);
+    case "follow":      return followDetailHtml(state);
     default:            return `<span class="muted">unknown agent: ${esc(id)}</span>`;
   }
 }
@@ -1850,6 +1983,9 @@ function renderAgentDetail(state, id){
   // The opportunity panel renders only here now (it left the dashboard),
   // so its notes-feed dropdown is (re)bound right after this render.
   if(id === "opportunity_scanner") bindOppNotesFilters();
+  // Wallet-flow candidate-review queue is an on-demand pull + button wireup,
+  // (re)bound right after this render (same convention as the opp notes feed).
+  if(id === "follow") bindWalletflowReview();
 }
 
 function signalDetailHtml(state){

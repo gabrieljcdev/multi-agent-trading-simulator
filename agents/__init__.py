@@ -494,6 +494,7 @@ from agents.crosschain_agent import CrossChainArbAgent
 from agents.balance_agent import BalanceAgent
 from agents.funding_arb_agent import FundingArbAgent
 from agents.opportunity_scanner_agent import OpportunityScannerAgent
+from agents.follow_agent import FollowAgent
 
 
 REGISTERED_AGENTS: list[BaseAgent] = [
@@ -506,6 +507,10 @@ REGISTERED_AGENTS: list[BaseAgent] = [
     # $0 observation-mode edge watcher — capital_allocation = 0.0, so the
     # _check_capital_sum() invariant is untouched.
     OpportunityScannerAgent(),
+    # $0 capital-free OBSERVER host for the follow/ wallet + exchange-flow
+    # watcher — capital_allocation = 0.0, no execution path. Registered as an
+    # observer only.
+    FollowAgent(),
     # Add new agents here (instances).
 ]
 
@@ -521,4 +526,5 @@ __all__ = [
     "FundingArbAgent",
     "BalanceAgent",
     "OpportunityScannerAgent",
+    "FollowAgent",
 ]

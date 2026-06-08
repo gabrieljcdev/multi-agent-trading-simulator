@@ -419,6 +419,47 @@ OPPORTUNITY_GATE_SELF_AUDIT_ENABLED = True    # log counterfactual outcomes on d
 OPPORTUNITY_PANEL_MAX_ROWS = 12               # test: 5-30   max rows per view in the dashboard panel
 
 # ══════════════════════════════════════════════════════════════════════════════
+# WALLET + EXCHANGE-FLOW WATCHER ($0 OBSERVER — follow/, DESIGN_wallet_exchange_flow_watcher)
+# ══════════════════════════════════════════════════════════════════════════════
+# Raw-Helius streaming OBSERVER under FollowAgent: tracks a watchlist of Solana
+# wallets + their transfers TO/FROM labelled exchange addresses, scores wallet
+# skill point-in-time, and runs a REVIEWED auto-discovery pipeline that only
+# ever PROPOSES candidates (never auto-trusts). Places NO capital, opens NO
+# positions, has no submit/execute path — it logs flow as SUGGESTIVE evidence
+# and surfaces it for the operator. All thresholds live here; no magic numbers
+# in the follow/ modules.
+
+WALLETFLOW_ENABLED = False                  # default off — master enable for the observer
+WALLETFLOW_HELIUS_KEY_ENV = "HELIUS_API_KEY"   # env var the Helius stream key is read from
+
+# Net-flow aggregation windows (hours) — rolling per-token, per-exchange inflow-outflow
+WALLETFLOW_NETFLOW_WINDOWS_H = [1, 24]      # test: [[1,24],[1,4,24]]
+
+# Manual (operator) skill-scorer gates
+WALLETFLOW_MIN_RESOLVED_SAMPLE = 30         # test: [20, 30, 50]   resolved actions below this -> NO-SIGNAL (fatal gate)
+WALLETFLOW_MAX_FOLLOWABLE_DELTA_S = 30      # test: [10, 30, 60]   latency-δ past which a wallet is "real but unfollowable"
+
+# Auto-discovery PROMOTION gate — STRICTER than the manual scorer (auto-discovery
+# inflates multiple comparisons, so demand more evidence). ALL must pass.
+WALLETFLOW_DISCOVERY_MIN_SAMPLE = 50        # test: [40, 50, 75]   (stricter than manual)
+WALLETFLOW_DISCOVERY_MIN_SCORE = 0.6        # test: [0.5, 0.6, 0.7]
+WALLETFLOW_DISCOVERY_MIN_FIRSTMOVER = 0.6   # test: [0.5, 0.6, 0.7]
+WALLETFLOW_DISCOVERY_MAX_DELTA_S = 30       # test: [10, 30, 60]
+
+# Bait-resistance warnings (INFORMATIONAL — inform operator review, NEVER auto-reject)
+WALLETFLOW_TOO_CLEAN_WINRATE = 0.98         # test: [0.95, 0.98, 1.0]  win-rate over a large sample this high is a red flag, not green
+WALLETFLOW_COORD_CLUSTER_MIN = 3            # test: [2, 3, 5]   "independent" candidates sharing one funder before the coordinated-cluster warning fires
+
+# Provenance trust lifecycle — confirmed wallets expire for re-review
+WALLETFLOW_TRUST_EXPIRY_DAYS = 30           # test: [14, 30, 60]   confirmed -> candidate after this many days
+WALLETFLOW_TRUST_EXPIRY_ACTIONS = 50        # test: [25, 50, 100]  ...or this many actions, whichever first
+WALLETFLOW_DEMOTE_BAD_STREAK = 5            # test: [3, 5, 8]      confirmed wallet's bad-resolving streak -> auto-demote
+WALLETFLOW_LABEL_STALENESS_WARN_DAYS = 7    # test: [3, 7, 14]     exchange-label set older than this flags stale
+
+# FollowAgent maintenance pass — runs discovery + trust-lifecycle enforcement
+WALLETFLOW_MAINTENANCE_INTERVAL_S = 3600    # test: [900, 3600, 21600]  cadence of the discovery + trust-expiry maintenance pass
+
+# ══════════════════════════════════════════════════════════════════════════════
 # MOMENTUM SIGNAL (TRACK B)
 # ══════════════════════════════════════════════════════════════════════════════
 

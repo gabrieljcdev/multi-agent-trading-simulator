@@ -49,7 +49,10 @@ _VALID_MODES = ("per_trade", "window", "autonomous")
 # Web UI v2 dropped the macro / sentiment_agent / onchain placeholders;
 # added xchain / funding_arb / balance now that those agents are real.
 _VALID_AGENTS = ("signal", "arb", "scalp", "xchain", "funding_arb", "balance",
-                 "opportunity_scanner")
+                 "opportunity_scanner", "follow")
+# Hosts treated as local for the wallet-flow privacy guard (the panel surfaces
+# wallet addresses, so it 403s unless the server binds to a loopback host).
+_LOCAL_HOSTS = ("localhost", "127.0.0.1", "::1")
 _SESSIONS = ("LONDON", "NEW_YORK", "ASIA", "OFF_HOURS")
 # Anchor city per session for the local clock + session-page header.
 _SESSION_TZ = {
@@ -301,6 +304,13 @@ class WebServer:
             web.get("/api/ticker",                 self.handle_ticker),
             web.get("/api/coinlogo/{coin}",        self.handle_coinlogo),
             web.get("/api/opportunity_notes",      self.handle_opportunity_notes),
+            # Wallet-flow watcher — wallet-identifying, so localhost-guarded (403
+            # otherwise). On-demand historical/heavy reads, NOT in the snapshot.
+            web.get("/api/walletflow/wallet/{address}", self.handle_walletflow_wallet),
+            web.get("/api/walletflow/candidates",       self.handle_walletflow_candidates),
+            web.post("/api/walletflow/candidate/confirm", self.handle_walletflow_confirm),
+            web.post("/api/walletflow/candidate/reject",  self.handle_walletflow_reject),
+            web.get("/api/walletflow/health",           self.handle_walletflow_health),
             web.post("/action/approve",        self.handle_approve),
             web.post("/action/skip",           self.handle_skip),
             web.post("/action/kill",           self.handle_kill),
@@ -928,6 +938,163 @@ class WebServer:
             logger.debug("opportunity_notes endpoint failed: %s", e)
             return web.json_response({"ok": False, "error": str(e)})
 
+    # ── Wallet-flow watcher (/api/walletflow/*) ──────────────────────────
+    # PRIVACY HARD RULE: this panel serves wallet addresses/identities. Every
+    # endpoint 403s unless the server binds to a loopback host — wallet
+    # identities must never leave the operator's machine over a LAN bind.
+
+    def _walletflow_guard(self) -> Optional[web.Response]:
+        """Return a 403 response when WEB_UI_HOST is not loopback, else None.
+        Keys off the configured bind host per the privacy rule."""
+        host = str(getattr(settings, "WEB_UI_HOST", "localhost") or "").lower()
+        if host not in _LOCAL_HOSTS:
+            return web.json_response(
+                {"ok": False, "error": "forbidden_non_local_host",
+                 "detail": "wallet-flow data is localhost-only"}, status=403)
+        return None
+
+    async def handle_walletflow_wallet(self, request) -> web.Response:
+        """GET /api/walletflow/wallet/{address} → point-in-time skill score +
+        evidence + as-of reconstruction. The as-of reconstruction calls the
+        SAME shared point-in-time function as the scorer (one code path)."""
+        guard = self._walletflow_guard()
+        if guard is not None:
+            return guard
+        from follow import skill_scorer
+        address = request.match_info.get("address", "")
+        as_of = None
+        raw = request.query.get("as_of")
+        if raw:
+            try:
+                as_of = datetime.fromisoformat(raw)
+            except (TypeError, ValueError):
+                as_of = None
+        try:
+            score = skill_scorer.score_wallet(address, as_of)
+            as_of_dt = as_of or datetime.utcnow()
+            # SAME shared as-of query the scorer uses — not a second copy.
+            evidence = skill_scorer.resolved_actions_as_of(address, as_of_dt)
+            return web.json_response(
+                {"ok": True, "wallet": address, "score": score,
+                 "evidence": evidence[-50:], "as_of": as_of_dt.isoformat()},
+                dumps=lambda o: json.dumps(_jsonable(o), default=str,
+                                           allow_nan=False))
+        except Exception as e:
+            logger.debug("walletflow wallet endpoint failed: %s", e)
+            return web.json_response({"ok": False, "error": str(e)})
+
+    async def handle_walletflow_candidates(self, request) -> web.Response:
+        """GET /api/walletflow/candidates → pending candidates WITH warnings
+        (bait-resistance flags surfaced, never auto-applied)."""
+        guard = self._walletflow_guard()
+        if guard is not None:
+            return guard
+        try:
+            cands = db_queries.get_pending_candidates(limit=200)
+            return web.json_response(
+                {"ok": True, "candidates": cands},
+                dumps=lambda o: json.dumps(_jsonable(o), default=str,
+                                           allow_nan=False))
+        except Exception as e:
+            logger.debug("walletflow candidates endpoint failed: %s", e)
+            return web.json_response({"ok": False, "error": str(e)})
+
+    async def handle_walletflow_confirm(self, request) -> web.Response:
+        """POST /api/walletflow/candidate/confirm {address} → candidate ->
+        confirmed (operator action — the ONLY path to confirmed)."""
+        guard = self._walletflow_guard()
+        if guard is not None:
+            return guard
+        from follow import provenance as fp
+        body = await self._body(request)
+        address = str(body.get("address", "") or "")
+        if not address:
+            return web.json_response({"ok": False, "error": "missing_address"})
+        try:
+            res = fp.confirm(address)
+            if res.get("ok"):
+                db_queries.set_candidate_review_state(address, "approved")
+                db_queries.log_agent_event("follow", "WALLET_CONFIRM",
+                                           f"source=web_ui address={address}")
+            return web.json_response(res)
+        except Exception as e:
+            logger.error("walletflow confirm(%s) failed: %s", address, e)
+            return web.json_response({"ok": False, "error": str(e)})
+
+    async def handle_walletflow_reject(self, request) -> web.Response:
+        """POST /api/walletflow/candidate/reject {address} → candidate ->
+        rejected (operator action; permanent, never re-proposed)."""
+        guard = self._walletflow_guard()
+        if guard is not None:
+            return guard
+        from follow import provenance as fp
+        body = await self._body(request)
+        address = str(body.get("address", "") or "")
+        if not address:
+            return web.json_response({"ok": False, "error": "missing_address"})
+        try:
+            res = fp.reject(address)
+            if res.get("ok"):
+                db_queries.log_agent_event("follow", "WALLET_REJECT",
+                                           f"source=web_ui address={address}")
+            return web.json_response(res)
+        except Exception as e:
+            logger.error("walletflow reject(%s) failed: %s", address, e)
+            return web.json_response({"ok": False, "error": str(e)})
+
+    async def handle_walletflow_health(self, request) -> web.Response:
+        """GET /api/walletflow/health → label-set staleness, coverage, and the
+        latency-δ distribution over recent flow events."""
+        guard = self._walletflow_guard()
+        if guard is not None:
+            return guard
+        out = {"ok": True, "label_staleness": {}, "coverage": {},
+               "latency_delta_s": {"p50": None, "p90": None, "n": 0}}
+        try:
+            out["label_staleness"] = db_queries.label_set_staleness()
+        except Exception as e:
+            logger.debug("walletflow health staleness: %s", e)
+        try:
+            agent = self._get_agent("follow")
+            snap = (agent.get_walletflow_snapshot()
+                    if agent is not None and hasattr(agent, "get_walletflow_snapshot")
+                    else {})
+            out["coverage"] = {
+                "sources": snap.get("sources", []),
+                "pending_candidates": snap.get("pending_candidates", 0),
+                "running": snap.get("running", False),
+            }
+        except Exception as e:
+            logger.debug("walletflow health coverage: %s", e)
+        try:
+            out["latency_delta_s"] = self._walletflow_delta_distribution()
+        except Exception as e:
+            logger.debug("walletflow health delta: %s", e)
+        return web.json_response(out)
+
+    @staticmethod
+    def _walletflow_delta_distribution() -> dict:
+        """p50/p90 of (detected_at - occurred_at) over recent flow events —
+        the followability grade. Empty-safe."""
+        rows = db_queries.get_recent_wallet_flow_events(limit=200)
+        deltas = []
+        for r in rows:
+            occ, det = r.get("occurred_at"), r.get("detected_at")
+            if not occ or not det:
+                continue
+            try:
+                d = (datetime.fromisoformat(det) - datetime.fromisoformat(occ)).total_seconds()
+                deltas.append(d)
+            except (TypeError, ValueError):
+                continue
+        if not deltas:
+            return {"p50": None, "p90": None, "n": 0}
+        deltas.sort()
+        def _pct(p):
+            idx = min(len(deltas) - 1, int(p * len(deltas)))
+            return round(deltas[idx], 2)
+        return {"p50": _pct(0.5), "p90": _pct(0.9), "n": len(deltas)}
+
     # ── LED ticker (GET /api/ticker?exchange=<id>) ───────────────────────
 
     async def handle_ticker(self, request) -> web.Response:
@@ -1173,6 +1340,9 @@ class WebServer:
             "funding":        self._snap_funding(),
             "balance":        self._snap_balance(),
             "opportunities":  self._snap_opportunities(),
+            # Wallet + exchange-flow watcher (read-only; $0 observer). Live,
+            # low-volume only — heavy/historical reads are on-demand REST.
+            "walletflow":     self._snap_walletflow(),
             # Web UI v2 fixes — capital deployment + movements visibility.
             "capital":        self._snap_capital(),
         }
@@ -1485,6 +1655,44 @@ class WebServer:
         except Exception as e:
             logger.debug("opportunities notes failed: %s", e)
         return out
+
+    @staticmethod
+    def _walletflow_empty_block() -> dict:
+        """Complete safe-fallback shape — every sub-key present even when the
+        agent is None or a read raises (snapshot iron rule)."""
+        return {
+            "enabled":            bool(getattr(settings, "WALLETFLOW_ENABLED", False)),
+            "running":            False,
+            "flow_events":        [],
+            "netflow_spikes":     [],
+            "pending_candidates": 0,
+            "label_staleness":    {"is_stale": True, "count": 0},
+            "sources":            [],
+        }
+
+    def _snap_walletflow(self) -> dict:
+        """Wallet + exchange-flow watcher panel block (READ-ONLY live view; the
+        agent is a $0 observer and so is its push surface). Heavy/wallet-
+        identifying reads (skill score, candidate detail, as-of reconstruction)
+        are on-demand REST under /api/walletflow/* and are NOT pushed here.
+
+        Defensive: a None agent or any failing read falls back to the complete
+        empty block — the snapshot must never raise."""
+        agent = self._get_agent("follow")
+        if agent is None:
+            return self._walletflow_empty_block()
+        getter = getattr(agent, "get_walletflow_snapshot", None)
+        if not callable(getter):
+            return self._walletflow_empty_block()
+        try:
+            block = getter()
+            # Belt-and-braces: guarantee every key the frontend reads exists.
+            base = self._walletflow_empty_block()
+            base.update(block or {})
+            return base
+        except Exception as e:
+            logger.debug("walletflow snapshot failed: %s", e)
+            return self._walletflow_empty_block()
 
     def _snap_balance(self) -> dict:
         """Web UI v2 balance panel — wholesale replacement of the v1 shape.

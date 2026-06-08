@@ -21,6 +21,7 @@ from .models import (
     OpportunityCore, OpportunityObservation,
     OpportunityLiquidationDetail, OpportunityFundingDetail,
     OpportunityLpDetail, OpportunityLaunchDetail,
+    WalletFlowEvent, WalletWatchlist, DiscoveryCandidate, ExchangeLabel,
 )
 
 
@@ -3010,3 +3011,369 @@ def get_opportunity_detail(opp_type: str, core_id: int) -> dict:
                     if c.name not in ("id", "core_id")}
     except Exception:
         return {}
+
+
+# ── Wallet + exchange-flow watcher (follow/) ─────────────────────────────────
+#
+# OBSERVER reads/writes. Flow events are SUGGESTIVE evidence (never confirmed
+# intent). transition_provenance is the DB-layer enforcement of the HARD
+# INVARIANT — it duplicates follow/provenance.py's rules on purpose (defence in
+# depth) and is kept local rather than importing follow/ (which imports this
+# module — the same circular-import avoidance the opportunity ranker uses).
+
+# Provenance state machine — the single allowed-transition table. `by` is the
+# actor class. The load-bearing rule: a "discovery" actor may ONLY ever produce
+# "candidate"; there is no discovery->confirmed edge anywhere.
+WALLET_PROVENANCE_STATES = ("candidate", "confirmed", "manual", "rejected")
+# (from_state, to_state) -> set of actor classes permitted to make the move.
+# from_state None == the address is not yet on the watchlist.
+_WALLET_PROVENANCE_TRANSITIONS = {
+    (None,        "candidate"): {"discovery", "operator"},
+    (None,        "manual"):    {"operator"},
+    ("candidate", "confirmed"): {"operator"},            # operator-only confirm
+    ("candidate", "rejected"):  {"operator"},            # operator-only reject (permanent)
+    ("candidate", "manual"):    {"operator"},
+    ("confirmed", "candidate"): {"auto", "operator"},    # trust expiry / demote breaker
+    ("manual",    "candidate"): {"auto", "operator"},
+    ("manual",    "rejected"):  {"operator"},
+    # NOTE: no (*, ...) edge OUT OF "rejected" exists — rejected is permanent,
+    # so a rejected wallet is never re-proposed. And no (_, "confirmed") edge
+    # admits "discovery": discovery can never confirm.
+}
+
+
+def _wallet_watchlist_to_dict(r) -> dict:
+    return {
+        "address":               r.address,
+        "provenance":            r.provenance,
+        "added_at":              r.added_at.isoformat() if r.added_at else None,
+        "added_by":              r.added_by,
+        "confirmed_at":          r.confirmed_at.isoformat() if r.confirmed_at else None,
+        "expires_at":            r.expires_at.isoformat() if r.expires_at else None,
+        "actions_since_confirm": int(r.actions_since_confirm or 0),
+        "last_demote_reason":    r.last_demote_reason,
+    }
+
+
+def get_watchlist_entry(address: str) -> Optional[dict]:
+    """One watchlist row as a dict (None if the address is unknown)."""
+    with get_session() as s:
+        r = s.query(WalletWatchlist).filter_by(address=address).first()
+        return _wallet_watchlist_to_dict(r) if r is not None else None
+
+
+def get_watchlist_by_provenance(provenance: str) -> list[dict]:
+    """Every watchlist address in the given provenance state."""
+    with get_session() as s:
+        rows = (s.query(WalletWatchlist)
+                .filter(WalletWatchlist.provenance == provenance)
+                .order_by(WalletWatchlist.added_at.asc())
+                .all())
+        return [_wallet_watchlist_to_dict(r) for r in rows]
+
+
+def get_signal_eligible_wallets() -> set[str]:
+    """Addresses the watcher may emit/act on — ONLY manual + confirmed.
+    Candidate and rejected wallets are excluded (the HARD INVARIANT)."""
+    with get_session() as s:
+        rows = (s.query(WalletWatchlist.address)
+                .filter(WalletWatchlist.provenance.in_(("manual", "confirmed")))
+                .all())
+        return {r[0] for r in rows}
+
+
+def transition_provenance(address: str, to_state: str, by: str,
+                          reason: Optional[str] = None,
+                          expires_at: Optional[datetime] = None) -> dict:
+    """The ONE provenance write — enforces the HARD INVARIANT at the DB layer.
+
+    Returns an envelope {"ok": bool, ...}; never raises to feature code. `by`
+    is the actor class: "discovery" | "operator" | "auto". Refuses any move not
+    in _WALLET_PROVENANCE_TRANSITIONS for that actor — in particular it can
+    never take a discovery output to "confirmed", and never moves anything out
+    of "rejected" (permanent)."""
+    if to_state not in WALLET_PROVENANCE_STATES:
+        return {"ok": False, "error": f"bad_state:{to_state}"}
+    with get_session() as s:
+        existing = s.query(WalletWatchlist).filter_by(address=address).first()
+        frm = existing.provenance if existing is not None else None
+        allowed = _WALLET_PROVENANCE_TRANSITIONS.get((frm, to_state), set())
+        if by not in allowed:
+            return {"ok": False, "error": "transition_forbidden",
+                    "from": frm, "to": to_state, "by": by}
+        if existing is None:
+            existing = WalletWatchlist(address=address, provenance=to_state,
+                                       added_by=by, actions_since_confirm=0)
+            s.add(existing)
+        else:
+            existing.provenance = to_state
+        if to_state == "confirmed":
+            existing.confirmed_at = datetime.utcnow()
+            existing.actions_since_confirm = 0
+            existing.expires_at = expires_at
+            existing.last_demote_reason = None
+        elif to_state == "candidate" and frm in ("confirmed", "manual"):
+            existing.last_demote_reason = reason
+        return {"ok": True, "address": address, "from": frm, "to": to_state,
+                "by": by}
+
+
+def bump_wallet_actions(address: str, n: int = 1) -> None:
+    """Increment a confirmed/manual wallet's actions_since_confirm counter
+    (drives the action-count arm of trust expiry). No-op if unknown."""
+    with get_session() as s:
+        r = s.query(WalletWatchlist).filter_by(address=address).first()
+        if r is None:
+            return
+        r.actions_since_confirm = int(r.actions_since_confirm or 0) + int(n)
+
+
+# ── Flow events ──────────────────────────────────────────────────────────────
+
+def insert_wallet_flow_event(row: dict) -> int:
+    """Append one observed flow/action event. Returns the row id. Stored as
+    suggestive evidence — `action` is the observed class, not an intent."""
+    with get_session() as s:
+        ev = WalletFlowEvent(
+            source_id=row["source_id"],
+            actor_id=row["actor_id"],
+            action=row["action"],
+            asset=row.get("asset"),
+            venue=row.get("venue"),
+            size_usd=row.get("size_usd"),
+            occurred_at=row["occurred_at"],
+            detected_at=row["detected_at"],
+            resolved_at=row.get("resolved_at"),
+            outcome=row.get("outcome"),
+            meta=row.get("meta"),
+        )
+        s.add(ev)
+        s.flush()
+        return int(ev.id)
+
+
+def resolve_wallet_flow_event(event_id: int, resolved_at: datetime,
+                              outcome: str) -> None:
+    """Stamp an event's outcome clock (the second clock the scorer reads)."""
+    with get_session() as s:
+        ev = s.query(WalletFlowEvent).filter_by(id=event_id).first()
+        if ev is None:
+            return
+        ev.resolved_at = resolved_at
+        ev.outcome = outcome
+
+
+def _wallet_flow_event_to_dict(r, *, raw_times: bool = False) -> dict:
+    def _t(v):
+        if v is None:
+            return None
+        return v if raw_times else v.isoformat()
+    return {
+        "id":          r.id,
+        "source_id":   r.source_id,
+        "actor_id":    r.actor_id,
+        "action":      r.action,
+        "asset":       r.asset,
+        "venue":       r.venue,
+        "size_usd":    r.size_usd,
+        "occurred_at": _t(r.occurred_at),
+        "detected_at": _t(r.detected_at),
+        "resolved_at": _t(r.resolved_at),
+        "outcome":     r.outcome,
+        "meta":        r.meta or {},
+    }
+
+
+def get_recent_wallet_flow_events(limit: int = 20) -> list[dict]:
+    """Newest flow events for the live panel (low-volume push)."""
+    with get_session() as s:
+        rows = (s.query(WalletFlowEvent)
+                .order_by(desc(WalletFlowEvent.detected_at))
+                .limit(limit).all())
+        return [_wallet_flow_event_to_dict(r) for r in rows]
+
+
+def get_wallet_resolved_actions(address: str) -> list[dict]:
+    """EVERY resolved action for one wallet, raw datetimes intact. This is the
+    raw feed the SINGLE shared point-in-time function filters as-of a timestamp
+    — it deliberately does NOT filter by time itself, so the one as-of
+    implementation lives in follow/skill_scorer.py and nowhere else."""
+    with get_session() as s:
+        rows = (s.query(WalletFlowEvent)
+                .filter(WalletFlowEvent.actor_id == address)
+                .filter(WalletFlowEvent.resolved_at.isnot(None))
+                .order_by(WalletFlowEvent.occurred_at.asc())
+                .all())
+        return [_wallet_flow_event_to_dict(r, raw_times=True) for r in rows]
+
+
+def get_distinct_flow_actors() -> list[str]:
+    """Distinct wallet addresses seen in the event log — discovery's candidate
+    universe (it mines the watcher's OWN stream)."""
+    with get_session() as s:
+        rows = s.query(WalletFlowEvent.actor_id).distinct().all()
+        return [r[0] for r in rows]
+
+
+def get_wallet_net_flows(windows_h: list[int]) -> list[dict]:
+    """Rolling per-token, per-exchange (inflow - outflow) over each window.
+    transfer_in = flow TO a labelled exchange (pre-sell tell); transfer_out =
+    withdrawal from one (accumulation tell). Suggestive, never a confirmed
+    sell."""
+    out: list[dict] = []
+    now = datetime.utcnow()
+    with get_session() as s:
+        for window_h in windows_h:
+            cutoff = now - timedelta(hours=int(window_h))
+            rows = (s.query(WalletFlowEvent)
+                    .filter(WalletFlowEvent.occurred_at >= cutoff)
+                    .filter(WalletFlowEvent.action.in_(("transfer_in", "transfer_out")))
+                    .filter(WalletFlowEvent.venue.isnot(None))
+                    .all())
+            agg: dict[tuple, dict] = {}
+            for r in rows:
+                key = (r.asset or "?", r.venue or "?")
+                a = agg.setdefault(key, {"inflow_usd": 0.0, "outflow_usd": 0.0,
+                                         "events": 0})
+                if r.action == "transfer_in":
+                    a["inflow_usd"] += float(r.size_usd or 0.0)
+                else:
+                    a["outflow_usd"] += float(r.size_usd or 0.0)
+                a["events"] += 1
+            for (asset, venue), a in agg.items():
+                out.append({
+                    "asset":       asset,
+                    "venue":       venue,
+                    "window_h":    int(window_h),
+                    "inflow_usd":  round(a["inflow_usd"], 2),
+                    "outflow_usd": round(a["outflow_usd"], 2),
+                    "net_usd":     round(a["inflow_usd"] - a["outflow_usd"], 2),
+                    "events":      a["events"],
+                })
+    return out
+
+
+# ── Discovery candidates ─────────────────────────────────────────────────────
+
+def _discovery_candidate_to_dict(r) -> dict:
+    return {
+        "id":                r.id,
+        "address":           r.address,
+        "discovered_at":     r.discovered_at.isoformat() if r.discovered_at else None,
+        "skill_score":       r.skill_score,
+        "resolved_sample":   r.resolved_sample,
+        "first_mover_ratio": r.first_mover_ratio,
+        "latency_delta_s":   r.latency_delta_s,
+        "warnings":          r.warnings or [],
+        "gate_passed":       bool(r.gate_passed),
+        "review_state":      r.review_state,
+    }
+
+
+def insert_discovery_candidate(row: dict) -> int:
+    """Write one auto-discovery PROPOSAL row. Discovery writes ONLY these; this
+    function never touches the watchlist's confirmed set."""
+    with get_session() as s:
+        c = DiscoveryCandidate(
+            address=row["address"],
+            skill_score=row.get("skill_score"),
+            resolved_sample=row.get("resolved_sample"),
+            first_mover_ratio=row.get("first_mover_ratio"),
+            latency_delta_s=row.get("latency_delta_s"),
+            warnings=row.get("warnings") or [],
+            gate_passed=bool(row.get("gate_passed", False)),
+            review_state=row.get("review_state", "pending"),
+        )
+        s.add(c)
+        s.flush()
+        return int(c.id)
+
+
+def get_pending_candidates(limit: int = 100) -> list[dict]:
+    """Pending discovery candidates for the operator review queue."""
+    with get_session() as s:
+        rows = (s.query(DiscoveryCandidate)
+                .filter(DiscoveryCandidate.review_state == "pending")
+                .order_by(desc(DiscoveryCandidate.discovered_at))
+                .limit(limit).all())
+        return [_discovery_candidate_to_dict(r) for r in rows]
+
+
+def set_candidate_review_state(address: str, state: str) -> None:
+    """Mark every pending proposal for an address as approved/rejected once the
+    operator acts on it (keeps the review queue from re-showing it)."""
+    with get_session() as s:
+        rows = (s.query(DiscoveryCandidate)
+                .filter(DiscoveryCandidate.address == address)
+                .filter(DiscoveryCandidate.review_state == "pending")
+                .all())
+        for r in rows:
+            r.review_state = state
+
+
+# ── Exchange-address label set (SHARED terminal stop-list) ───────────────────
+
+def upsert_exchange_label(address: str, label: str,
+                          exchange_name: Optional[str] = None,
+                          source: str = "seed",
+                          last_verified_at: Optional[datetime] = None) -> None:
+    """Insert or refresh one exchange-address label."""
+    with get_session() as s:
+        r = s.query(ExchangeLabel).filter_by(address=address).first()
+        if r is None:
+            s.add(ExchangeLabel(
+                address=address, label=label, exchange_name=exchange_name,
+                source=source,
+                last_verified_at=last_verified_at or datetime.utcnow()))
+        else:
+            r.label = label
+            r.exchange_name = exchange_name
+            r.source = source
+            r.last_verified_at = last_verified_at or datetime.utcnow()
+
+
+def get_exchange_label(address: str) -> Optional[dict]:
+    """Label metadata for one address (None if not a labelled address)."""
+    with get_session() as s:
+        r = s.query(ExchangeLabel).filter_by(address=address).first()
+        if r is None:
+            return None
+        return {
+            "address":          r.address,
+            "label":            r.label,
+            "exchange_name":    r.exchange_name,
+            "source":           r.source,
+            "last_verified_at": r.last_verified_at.isoformat() if r.last_verified_at else None,
+        }
+
+
+def is_terminal_address(address: str) -> bool:
+    """True if the address is a labelled exchange/router/bridge/multisig — the
+    SHARED 'is this a terminal address' check (also the meme stop-list)."""
+    with get_session() as s:
+        return s.query(ExchangeLabel).filter_by(address=address).first() is not None
+
+
+def label_set_staleness() -> dict:
+    """Coverage + staleness metadata for the label set. is_stale is True when
+    the most-recently-verified label is older than
+    WALLETFLOW_LABEL_STALENESS_WARN_DAYS (the set drifts as exchanges rotate
+    addresses, so a stale set silently misses flow)."""
+    from config import settings
+    warn_days = int(getattr(settings, "WALLETFLOW_LABEL_STALENESS_WARN_DAYS", 7))
+    with get_session() as s:
+        count = s.query(ExchangeLabel).count()
+        newest = (s.query(ExchangeLabel)
+                  .order_by(desc(ExchangeLabel.last_verified_at)).first())
+    last_verified = (newest.last_verified_at if newest is not None else None)
+    age_days = None
+    if last_verified is not None:
+        age_days = (datetime.utcnow() - last_verified).total_seconds() / 86400.0
+    is_stale = (count == 0) or (age_days is not None and age_days > warn_days)
+    return {
+        "count":            count,
+        "last_verified_at": last_verified.isoformat() if last_verified else None,
+        "age_days":         (round(age_days, 2) if age_days is not None else None),
+        "warn_days":        warn_days,
+        "is_stale":         bool(is_stale),
+    }
