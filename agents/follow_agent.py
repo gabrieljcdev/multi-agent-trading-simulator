@@ -54,7 +54,17 @@ class FollowAgent(BaseAgent):
     # ── BaseAgent contract ──────────────────────────────────────────────────
 
     def is_available(self) -> bool:
-        return bool(getattr(settings, "WALLETFLOW_ENABLED", False))
+        # The host runs when ANY follow source is enabled. Each source is gated
+        # individually inside start(), so a disabled sibling never starts; this
+        # just keeps the host alive when at least one observer wants to run.
+        if bool(getattr(settings, "WALLETFLOW_ENABLED", False)):
+            return True
+        if bool(getattr(settings, "COPYTRADE_ENABLED", False)):
+            return True
+        try:
+            return any(s.is_available() for s in self._sources)
+        except Exception:
+            return False
 
     @property
     def observation_mode(self) -> bool:
@@ -172,6 +182,62 @@ class FollowAgent(BaseAgent):
         except Exception as e:
             log.debug("[Follow] label staleness: %s", e)
         return out
+
+    def get_copytrade_snapshot(self) -> dict:
+        """Live, low-volume block for the copy-trade observer panel. Every key
+        present even when a read raises (snapshot iron rule). Heavy/identifying
+        reads (per-actor as-of reconstruction, the full denominator) are
+        on-demand REST under /api/copytrade/*, NOT here.
+
+        Honest-scope caveat is carried in the block: this observer surfaces SKILL
+        (corroboration), not followable entries — latency usually eats the edge."""
+        out = {
+            "enabled":      bool(getattr(settings, "COPYTRADE_ENABLED", False)),
+            "running":      bool(self._running),
+            "events":       [],
+            "surfaced_actors": [],
+            "denominator":  {"evaluated": 0, "surfaced": 0, "rejected": 0,
+                             "rejection_reasons": {}},
+            "sources":      [],
+            "scope_note":   ("latency-limited: surfaces genuine SKILL "
+                             "(corroboration), rarely followable entries"),
+        }
+        src = self.get_source("copytrade")
+        try:
+            out["sources"] = [src.get_stats()] if src is not None else []
+        except Exception as e:
+            log.debug("[Follow] copytrade source stats: %s", e)
+        try:
+            out["events"] = db_queries.get_recent_copytrade_events(limit=15)
+        except Exception as e:
+            log.debug("[Follow] recent copytrade events: %s", e)
+        try:
+            out["surfaced_actors"] = db_queries.get_skilled_copytrade_actors()[:10]
+        except Exception as e:
+            log.debug("[Follow] surfaced copytrade actors: %s", e)
+        try:
+            den = db_queries.get_copytrade_denominator(limit=500)
+            # Drop the heavy per-row list from the push surface (it's the REST
+            # denominator view's job); keep the headline counts.
+            out["denominator"] = {k: den[k] for k in
+                                  ("evaluated", "surfaced", "rejected",
+                                   "rejection_reasons") if k in den}
+        except Exception as e:
+            log.debug("[Follow] copytrade denominator: %s", e)
+        return out
+
+    def get_corroboration_view(self, spot_assessments=None) -> dict:
+        """Cross-surface corroboration view (the Tier-2 meeting point). Thin
+        cross-reference only — it does NO detection; the perp source feeds its
+        skilled-actor assessments and the spot side is passed in. Never raises."""
+        from follow import corroboration
+        try:
+            src = self.get_source("copytrade")
+            return corroboration.build_view(perp_source=src,
+                                            spot_assessments=spot_assessments)
+        except Exception as e:
+            log.debug("[Follow] corroboration view: %s", e)
+            return {"rows": [], "n_perp": 0, "n_spot": 0, "n_cross": 0}
 
     # ── Internal loops ──────────────────────────────────────────────────────
 

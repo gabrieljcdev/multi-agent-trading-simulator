@@ -30,12 +30,16 @@ from __future__ import annotations
 
 from follow.base import ActorEvent, BaseStreamingDataSource
 from follow.wallet_flow import WalletFlowWatcher
+from follow.copytrade import CopyTradeObserver
 
 
 REGISTERED_FOLLOW_SOURCES: list[BaseStreamingDataSource] = [
     WalletFlowWatcher(),
+    # On-chain perp leaderboard observer (Hyperliquid + Drift). Capital-free,
+    # denominator-logged, corroboration-only — no execution path, no auto-follow.
+    CopyTradeObserver(),
     # Add new follow sources here (instances). e.g. the meme-wallet scorer,
-    # which will REUSE follow/helius_parse.py + follow/labels.py.
+    # which will REUSE follow/sol_parse.py + follow/labels.py.
 ]
 
 __all__ = [
@@ -43,4 +47,5 @@ __all__ = [
     "BaseStreamingDataSource",
     "ActorEvent",
     "WalletFlowWatcher",
+    "CopyTradeObserver",
 ]

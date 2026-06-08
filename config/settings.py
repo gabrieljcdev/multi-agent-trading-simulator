@@ -475,6 +475,28 @@ WALLETFLOW_PARSE_DEXES = ["raydium", "orca"]   # the 1-2 DEXs parsed; everything
 WALLETFLOW_PARSE_LAUNCHPADS = ["pumpfun"]      # launchpad instruction formats parsed (capability; subscription stays narrow)
 
 # ══════════════════════════════════════════════════════════════════════════════
+# COPY-TRADE LEADERBOARD OBSERVER ($0 OBSERVER — follow/, sibling of the wallet watcher)
+# ══════════════════════════════════════════════════════════════════════════════
+# Capital-free OBSERVER under FollowAgent that reads ON-CHAIN PERP venues
+# (Hyperliquid + Drift), scores ranked traders for SURVIVAL-AWARE + LATENCY-AWARE
+# skill point-in-time (reusing skill_scorer.resolved_actions_as_of — the ONE
+# no-leak filter, never forked), and LOGS THE DENOMINATOR: every actor evaluated
+# AND rejected, with a reason, so skill estimates are never computed from a
+# survivor-only pool. It emits skill assessments as CORROBORATION — it does NOT
+# auto-follow, trade, or expose any submit/execute path. On-chain only: CEX
+# leaderboards (ROI% with hidden sizing) are explicitly OUT of v1. Honest scope:
+# latency usually eats leaderboard edges, so the realistic output is "this actor
+# is genuinely skilled" (corroboration), rarely "follow this trade now".
+
+COPYTRADE_ENABLED = False                        # default off — master enable for the observer
+COPYTRADE_VENUES = ["hyperliquid", "drift"]      # gmx/dydx stubbed behind the same seam, NOT active
+COPYTRADE_MIN_CLOSED_TRADES = 50                 # test: [30, 50, 75]   resolved closed trades below this -> NO-SIGNAL (fatal survival gate)
+COPYTRADE_MAX_FOLLOWABLE_DELTA_S = 60            # test: [30, 60, 120]  latency-δ past which an actor is "real but unfollowable"
+COPYTRADE_MAX_DRAWDOWN = 0.5                     # test: [0.3, 0.5, 0.7]  point-in-time drawdown past which the actor is rejected (sizing/risk too hot)
+COPYTRADE_LEADERBOARD_REFRESH_S = 300            # test: [120, 300, 600]  leaderboard poll cadence
+COPYTRADE_RPC_MAX_RPS = 4                        # test: [2, 4, 8]   Drift (Solana) RPC politeness; reuses the wallet-flow limiter style
+
+# ══════════════════════════════════════════════════════════════════════════════
 # MOMENTUM SIGNAL (TRACK B)
 # ══════════════════════════════════════════════════════════════════════════════
 

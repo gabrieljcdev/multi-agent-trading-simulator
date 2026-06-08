@@ -311,6 +311,12 @@ class WebServer:
             web.post("/api/walletflow/candidate/confirm", self.handle_walletflow_confirm),
             web.post("/api/walletflow/candidate/reject",  self.handle_walletflow_reject),
             web.get("/api/walletflow/health",           self.handle_walletflow_health),
+            # Copy-trade leaderboard observer — surfaces TRADER IDENTITIES, so
+            # localhost-guarded (403 otherwise), same privacy rule as walletflow.
+            web.get("/api/copytrade/actor/{actor_id}", self.handle_copytrade_actor),
+            web.get("/api/copytrade/surfaced",         self.handle_copytrade_surfaced),
+            web.get("/api/copytrade/denominator",      self.handle_copytrade_denominator),
+            web.get("/api/copytrade/health",           self.handle_copytrade_health),
             web.post("/action/approve",        self.handle_approve),
             web.post("/action/skip",           self.handle_skip),
             web.post("/action/kill",           self.handle_kill),
@@ -1095,6 +1101,111 @@ class WebServer:
             return round(deltas[idx], 2)
         return {"p50": _pct(0.5), "p90": _pct(0.9), "n": len(deltas)}
 
+    # ── Copy-trade leaderboard observer (/api/copytrade/*) ───────────────
+    # PRIVACY HARD RULE: this panel serves trader identities. Every endpoint
+    # 403s unless the server binds to a loopback host — identical to the
+    # wallet-flow rule (identities must never leave the operator's machine).
+
+    def _copytrade_guard(self) -> Optional[web.Response]:
+        """Return a 403 response when WEB_UI_HOST is not loopback, else None."""
+        host = str(getattr(settings, "WEB_UI_HOST", "localhost") or "").lower()
+        if host not in _LOCAL_HOSTS:
+            return web.json_response(
+                {"ok": False, "error": "forbidden_non_local_host",
+                 "detail": "copy-trade data is localhost-only"}, status=403)
+        return None
+
+    async def handle_copytrade_actor(self, request) -> web.Response:
+        """GET /api/copytrade/actor/{actor_id} → point-in-time survival/latency
+        skill + evidence + as-of reconstruction. The as-of reconstruction calls
+        the SAME shared point-in-time function as the scorer (one code path) —
+        sample size + δ shown as prominently as the score."""
+        guard = self._copytrade_guard()
+        if guard is not None:
+            return guard
+        from follow import copytrade_scorer, skill_scorer
+        actor_id = request.match_info.get("actor_id", "")
+        as_of = None
+        raw = request.query.get("as_of")
+        if raw:
+            try:
+                as_of = datetime.fromisoformat(raw)
+            except (TypeError, ValueError):
+                as_of = None
+        try:
+            score = copytrade_scorer.score_actor(actor_id, as_of)
+            as_of_dt = as_of or datetime.utcnow()
+            # SAME shared as-of query the scorer uses — not a second copy.
+            evidence = skill_scorer.resolved_actions_as_of(actor_id, as_of_dt)
+            return web.json_response(
+                {"ok": True, "actor": actor_id, "score": score,
+                 "evidence": evidence[-50:], "as_of": as_of_dt.isoformat()},
+                dumps=lambda o: json.dumps(_jsonable(o), default=str,
+                                           allow_nan=False))
+        except Exception as e:
+            logger.debug("copytrade actor endpoint failed: %s", e)
+            return web.json_response({"ok": False, "error": str(e)})
+
+    async def handle_copytrade_surfaced(self, request) -> web.Response:
+        """GET /api/copytrade/surfaced → currently surfaced (skilled) actors +
+        latest position changes. "Skilled but unfollowable" actors are present,
+        flagged as such (followable=False) — surfacing them honestly is the
+        point, not hiding them."""
+        guard = self._copytrade_guard()
+        if guard is not None:
+            return guard
+        try:
+            actors = db_queries.get_skilled_copytrade_actors()
+            events = db_queries.get_recent_copytrade_events(limit=25)
+            return web.json_response(
+                {"ok": True, "actors": actors, "events": events},
+                dumps=lambda o: json.dumps(_jsonable(o), default=str,
+                                           allow_nan=False))
+        except Exception as e:
+            logger.debug("copytrade surfaced endpoint failed: %s", e)
+            return web.json_response({"ok": False, "error": str(e)})
+
+    async def handle_copytrade_denominator(self, request) -> web.Response:
+        """GET /api/copytrade/denominator → THE DENOMINATOR VIEW: evaluated N,
+        surfaced M, and WHY the N−M were rejected. A population view, not a
+        highlight reel — so skill is never read off a survivor-only pool."""
+        guard = self._copytrade_guard()
+        if guard is not None:
+            return guard
+        try:
+            den = db_queries.get_copytrade_denominator(limit=500)
+            return web.json_response(
+                {"ok": True, "denominator": den},
+                dumps=lambda o: json.dumps(_jsonable(o), default=str,
+                                           allow_nan=False))
+        except Exception as e:
+            logger.debug("copytrade denominator endpoint failed: %s", e)
+            return web.json_response({"ok": False, "error": str(e)})
+
+    async def handle_copytrade_health(self, request) -> web.Response:
+        """GET /api/copytrade/health → venue coverage (implemented vs stubbed),
+        the denominator headline, and the honest-scope caveat."""
+        guard = self._copytrade_guard()
+        if guard is not None:
+            return guard
+        out = {"ok": True, "venues": [], "venues_stubbed": [], "denominator": {},
+               "scope_note": ("latency-limited: surfaces SKILL (corroboration), "
+                              "rarely followable entries")}
+        try:
+            agent = self._get_agent("follow")
+            snap = (agent.get_copytrade_snapshot()
+                    if agent is not None and hasattr(agent, "get_copytrade_snapshot")
+                    else {})
+            srcs = snap.get("sources", []) or []
+            if srcs:
+                out["venues"] = srcs[0].get("venues", [])
+                out["venues_stubbed"] = srcs[0].get("venues_stubbed", [])
+            out["denominator"] = snap.get("denominator", {})
+            out["running"] = snap.get("running", False)
+        except Exception as e:
+            logger.debug("copytrade health failed: %s", e)
+        return web.json_response(out)
+
     # ── LED ticker (GET /api/ticker?exchange=<id>) ───────────────────────
 
     async def handle_ticker(self, request) -> web.Response:
@@ -1343,6 +1454,9 @@ class WebServer:
             # Wallet + exchange-flow watcher (read-only; $0 observer). Live,
             # low-volume only — heavy/historical reads are on-demand REST.
             "walletflow":     self._snap_walletflow(),
+            # Copy-trade leaderboard observer (read-only; $0 OBSERVER). Live,
+            # low-volume only — per-actor as-of + full denominator are REST.
+            "copytrade":      self._snap_copytrade(),
             # Web UI v2 fixes — capital deployment + movements visibility.
             "capital":        self._snap_capital(),
         }
@@ -1693,6 +1807,43 @@ class WebServer:
         except Exception as e:
             logger.debug("walletflow snapshot failed: %s", e)
             return self._walletflow_empty_block()
+
+    @staticmethod
+    def _copytrade_empty_block() -> dict:
+        """Complete safe-fallback shape — every sub-key present even when the
+        agent is None or a read raises (snapshot iron rule)."""
+        return {
+            "enabled":         bool(getattr(settings, "COPYTRADE_ENABLED", False)),
+            "running":         False,
+            "events":          [],
+            "surfaced_actors": [],
+            "denominator":     {"evaluated": 0, "surfaced": 0, "rejected": 0,
+                                "rejection_reasons": {}},
+            "sources":         [],
+            "scope_note":      ("latency-limited: surfaces SKILL (corroboration), "
+                                "rarely followable entries"),
+        }
+
+    def _snap_copytrade(self) -> dict:
+        """Copy-trade leaderboard observer panel block (READ-ONLY live view; the
+        agent is a $0 observer). Heavy/identifying reads (per-actor as-of, the
+        full denominator) are on-demand REST under /api/copytrade/* and are NOT
+        pushed here. Defensive: a None agent or any failing read falls back to the
+        complete empty block — the snapshot must never raise."""
+        agent = self._get_agent("follow")
+        if agent is None:
+            return self._copytrade_empty_block()
+        getter = getattr(agent, "get_copytrade_snapshot", None)
+        if not callable(getter):
+            return self._copytrade_empty_block()
+        try:
+            block = getter()
+            base = self._copytrade_empty_block()
+            base.update(block or {})
+            return base
+        except Exception as e:
+            logger.debug("copytrade snapshot failed: %s", e)
+            return self._copytrade_empty_block()
 
     def _snap_balance(self) -> dict:
         """Web UI v2 balance panel — wholesale replacement of the v1 shape.

@@ -22,6 +22,7 @@ from .models import (
     OpportunityLiquidationDetail, OpportunityFundingDetail,
     OpportunityLpDetail, OpportunityLaunchDetail,
     WalletFlowEvent, WalletWatchlist, DiscoveryCandidate, ExchangeLabel,
+    CopyTradeEvent, CopyTradeActor, CopyTradeEvaluation,
 )
 
 
@@ -3383,4 +3384,177 @@ def label_set_staleness() -> dict:
         "age_days":         (round(age_days, 2) if age_days is not None else None),
         "warn_days":        warn_days,
         "is_stale":         bool(is_stale),
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# COPY-TRADE LEADERBOARD OBSERVER ($0 observer — follow/copytrade.py)
+# ══════════════════════════════════════════════════════════════════════════════
+# Sibling of the wallet-flow query helpers. Perp position-change DETAIL,
+# per-actor skill rollup, and — the distinguishing feature — the DENOMINATOR LOG
+# (every actor evaluated, including rejected, with a reason). Point-in-time skill
+# scoring itself routes through the SHARED wallet_flow_events log + the one
+# no-leak filter; these helpers never re-implement an as-of query.
+
+# ── Copy-trade events (perp position-change detail) ──────────────────────────
+
+def _copytrade_event_to_dict(r, *, raw_times: bool = False) -> dict:
+    def _t(v):
+        if v is None:
+            return None
+        return v if raw_times else v.isoformat()
+    return {
+        "id":           r.id,
+        "source_id":    r.source_id,
+        "venue":        r.venue,
+        "actor_id":     r.actor_id,
+        "action":       r.action,
+        "asset":        r.asset,
+        "notional_usd": r.notional_usd,
+        "leverage":     r.leverage,
+        "liq_distance": r.liq_distance,
+        "occurred_at":  _t(r.occurred_at),
+        "detected_at":  _t(r.detected_at),
+        "resolved_at":  _t(r.resolved_at),
+        "outcome":      r.outcome,
+        "meta":         r.meta or {},
+    }
+
+
+def insert_copytrade_event(row: dict) -> int:
+    """Append one observed perp position-change. Returns the row id. Stored as
+    suggestive evidence — `action` is the observed class, never an intent."""
+    with get_session() as s:
+        ev = CopyTradeEvent(
+            source_id=row["source_id"],
+            venue=row["venue"],
+            actor_id=row["actor_id"],
+            action=row["action"],
+            asset=row.get("asset"),
+            notional_usd=row.get("notional_usd"),
+            leverage=row.get("leverage"),
+            liq_distance=row.get("liq_distance"),
+            occurred_at=row["occurred_at"],
+            detected_at=row["detected_at"],
+            resolved_at=row.get("resolved_at"),
+            outcome=row.get("outcome"),
+            meta=row.get("meta"),
+        )
+        s.add(ev)
+        s.flush()
+        return int(ev.id)
+
+
+def get_recent_copytrade_events(limit: int = 20) -> list[dict]:
+    """Newest perp position-change events for the live panel (low-volume push)."""
+    with get_session() as s:
+        rows = (s.query(CopyTradeEvent)
+                .order_by(desc(CopyTradeEvent.detected_at))
+                .limit(limit).all())
+        return [_copytrade_event_to_dict(r) for r in rows]
+
+
+# ── Per-actor skill rollup ───────────────────────────────────────────────────
+
+def _copytrade_actor_to_dict(r) -> dict:
+    return {
+        "actor_id":             r.actor_id,
+        "venue":                r.venue,
+        "first_seen":           r.first_seen.isoformat() if r.first_seen else None,
+        "last_evaluated_at":    r.last_evaluated_at.isoformat() if r.last_evaluated_at else None,
+        "closed_trades":        int(r.closed_trades or 0),
+        "skill_score":          r.skill_score,
+        "latency_delta_s":      r.latency_delta_s,
+        "drawdown":             r.drawdown,
+        "followable":           bool(r.followable),
+        "sizing_interpretable": bool(r.sizing_interpretable),
+    }
+
+
+def upsert_copytrade_actor(row: dict) -> None:
+    """Insert or refresh one actor's skill rollup. Keyed by (actor_id, venue)."""
+    with get_session() as s:
+        r = (s.query(CopyTradeActor)
+             .filter_by(actor_id=row["actor_id"], venue=row["venue"]).first())
+        if r is None:
+            r = CopyTradeActor(actor_id=row["actor_id"], venue=row["venue"])
+            s.add(r)
+        r.last_evaluated_at    = row.get("last_evaluated_at") or datetime.utcnow()
+        r.closed_trades        = int(row.get("closed_trades", 0) or 0)
+        r.skill_score          = row.get("skill_score")
+        r.latency_delta_s      = row.get("latency_delta_s")
+        r.drawdown             = row.get("drawdown")
+        r.followable           = bool(row.get("followable", False))
+        r.sizing_interpretable = bool(row.get("sizing_interpretable", True))
+
+
+def get_copytrade_actors() -> list[dict]:
+    """Every actor rollup, most-recently-evaluated first."""
+    with get_session() as s:
+        rows = (s.query(CopyTradeActor)
+                .order_by(desc(CopyTradeActor.last_evaluated_at)).all())
+        return [_copytrade_actor_to_dict(r) for r in rows]
+
+
+def get_skilled_copytrade_actors() -> list[dict]:
+    """Actors with a non-null skill score (cleared the survival gate) — the set
+    the corroboration view crosses against the spot wallet watcher. Includes the
+    "real but unfollowable" actors (skilled but latency-killed), flagged as such
+    via followable=False; surfacing them honestly is the point."""
+    with get_session() as s:
+        rows = (s.query(CopyTradeActor)
+                .filter(CopyTradeActor.skill_score.isnot(None))
+                .order_by(desc(CopyTradeActor.skill_score)).all())
+        return [_copytrade_actor_to_dict(r) for r in rows]
+
+
+# ── THE DENOMINATOR LOG ──────────────────────────────────────────────────────
+
+def insert_copytrade_evaluation(row: dict) -> int:
+    """Record ONE evaluated actor in the denominator log — surfaced OR rejected,
+    always with a reason and the sample size. This is the anti-survivorship
+    record: skill is never computed from a winners-only pool."""
+    with get_session() as s:
+        ev = CopyTradeEvaluation(
+            actor_id=row["actor_id"],
+            venue=row["venue"],
+            decision=row["decision"],
+            reason=row.get("reason"),
+            sample_size=row.get("sample_size"),
+            evaluated_at=row.get("evaluated_at") or datetime.utcnow(),
+        )
+        s.add(ev)
+        s.flush()
+        return int(ev.id)
+
+
+def get_copytrade_denominator(limit: int = 500) -> dict:
+    """The population view: evaluated N, surfaced M, and WHY the N−M were
+    rejected (reason histogram), over the most recent `limit` evaluations.
+    Never empty-unsafe — returns zeroed counts when nothing's been evaluated."""
+    with get_session() as s:
+        rows = (s.query(CopyTradeEvaluation)
+                .order_by(desc(CopyTradeEvaluation.evaluated_at))
+                .limit(limit).all())
+    evaluated = len(rows)
+    surfaced = sum(1 for r in rows if r.decision == "surfaced")
+    reasons: dict[str, int] = {}
+    recent: list[dict] = []
+    for r in rows:
+        if r.decision == "rejected":
+            reasons[r.reason or "unknown"] = reasons.get(r.reason or "unknown", 0) + 1
+        recent.append({
+            "actor_id":     r.actor_id,
+            "venue":        r.venue,
+            "evaluated_at": r.evaluated_at.isoformat() if r.evaluated_at else None,
+            "decision":     r.decision,
+            "reason":       r.reason,
+            "sample_size":  r.sample_size,
+        })
+    return {
+        "evaluated":        evaluated,
+        "surfaced":         surfaced,
+        "rejected":         evaluated - surfaced,
+        "rejection_reasons": reasons,
+        "evaluations":      recent,
     }

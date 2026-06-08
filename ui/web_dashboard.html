@@ -1617,8 +1617,93 @@ async function refreshWalletflowCandidates(){
   if(STATE && STATE.ts && activeAgentId === "follow") updateUI(STATE);
 }
 
+/* ---------- copy-trade leaderboard observer panel ----------
+   Read-only $0 OBSERVER over ON-CHAIN perp venues. Three layers, ALL visible:
+   (1) live position changes (SUGGESTIVE, true on-chain notional/leverage);
+   (2) surfaced (skilled) actors with sample size + latency-δ shown AS PROMINENTLY
+   as the score, and "skilled but unfollowable" rendered as such;
+   (3) THE DENOMINATOR — evaluated N / surfaced M / why the N−M were rejected, a
+   population view not a highlight reel. Honest scope: latency usually eats the
+   edge, so this surfaces SKILL (corroboration), rarely followable entries.
+   Per-actor as-of reconstruction is on-demand REST (localhost-guarded). */
+function copytradePanelHtml(c){
+  c = c || {};
+  if(!c.enabled) return `<span class="muted">Copy-trade observer disabled (COPYTRADE_ENABLED=False)</span>`;
+  const den = c.denominator || {};
+  const srcs = c.sources || [];
+  const venues = (srcs[0] && srcs[0].venues) || [];
+  const stubbed = (srcs[0] && srcs[0].venues_stubbed) || [];
+  const header =
+    `<div><b>COPY-TRADE LEADERBOARD OBSERVER</b> <span class="tag warn">OBSERVER · $0</span> · ` +
+    `<span class="dim">running</span> ${c.running?"yes":"no"} · ` +
+    `<span class="dim">venues</span> ${venues.join(", ")||"—"}` +
+    (stubbed.length?` <span class="tag warn" title="behind the same seam, not implemented in v1">stubbed: ${stubbed.join(", ")}</span>`:``) +
+    `</div>`;
+
+  // Honest-scope caveat — rendered, not buried.
+  const caveat = `<div class="muted" style="font-size:11px;margin:4px 0 6px">` +
+    `On-chain perps only (true notional/leverage — CEX ROI%-only is OUT). ` +
+    `Latency usually eats leaderboard edges, so this surfaces genuine SKILL ` +
+    `(corroboration), rarely "follow this now". Observes + logs — never trades.</div>`;
+
+  // Layer 1 — live position changes (SUGGESTIVE, true on-chain sizing).
+  const evs = c.events || [];
+  const evHtml = evs.length
+    ? `<table><thead><tr><th>detected</th><th>actor</th><th>action</th><th>asset</th>` +
+      `<th>notional</th><th>lev</th><th>liqΔ</th></tr></thead><tbody>` +
+      evs.map(e => `<tr><td class="dim">${esc((e.detected_at||"").slice(0,19))}</td>` +
+        `<td title="${esc(e.actor_id)}">${esc((e.actor_id||"").slice(0,8))}…</td>` +
+        `<td>${esc(e.action)}</td><td>${esc((e.asset||"—")).slice(0,10)}</td>` +
+        `<td>${fmtUsd(e.notional_usd)}</td><td>${e.leverage==null?"—":e.leverage+"×"}</td>` +
+        `<td>${e.liq_distance==null?"—":(100*e.liq_distance).toFixed(1)+"%"}</td></tr>`).join("") +
+      `</tbody></table>`
+    : `<span class="muted">no position changes yet</span>`;
+
+  // Layer 2 — surfaced (skilled) actors: sample + δ shown AS prominently as score.
+  const acts = c.surfaced_actors || [];
+  const actHtml = acts.length
+    ? `<table><thead><tr><th>actor</th><th>venue</th><th>skill</th>` +
+      `<th>closed</th><th>δ</th><th>drawdown</th><th>followable</th></tr></thead><tbody>` +
+      acts.map(a => {
+        const unfoll = !a.followable;
+        const tag = unfoll
+          ? ` <span class="tag warn" title="edge dies inside the latency window">real but unfollowable</span>`
+          : ` <span class="tag ok">followable</span>`;
+        return `<tr><td title="${esc(a.actor_id)}">${esc((a.actor_id||"").slice(0,10))}…</td>` +
+          `<td class="dim">${esc(a.venue)}</td>` +
+          `<td><b>${a.skill_score==null?"—":a.skill_score}</b></td>` +
+          `<td>${a.closed_trades||0}</td>` +
+          `<td>${a.latency_delta_s==null?"—":a.latency_delta_s+"s"}</td>` +
+          `<td>${a.drawdown==null?"—":a.drawdown}</td><td>${tag}</td></tr>`;
+      }).join("") + `</tbody></table>`
+    : `<span class="muted">no actors surfaced (none cleared the survival gate)</span>`;
+
+  // Layer 3 — THE DENOMINATOR (population view, not a highlight reel).
+  const reasons = den.rejection_reasons || {};
+  const reasonHtml = Object.keys(reasons).length
+    ? Object.entries(reasons).map(([r,n]) =>
+        `<span class="tag loss" style="margin:2px">${esc(r)}: ${n}</span>`).join(" ")
+    : `<span class="dim">no rejections recorded</span>`;
+  const denHtml =
+    `<div>evaluated <b>${den.evaluated||0}</b> · surfaced <b>${den.surfaced||0}</b> · ` +
+    `rejected <b>${den.rejected||0}</b></div>` +
+    `<div style="margin:4px 0">${reasonHtml}</div>` +
+    `<div class="muted" style="font-size:11px">Skill is computed over the FULL ` +
+    `evaluated population — never a survivor-only pool. Full per-actor reasons ` +
+    `at <span class="dim">/api/copytrade/denominator</span>.</div>`;
+
+  return header + caveat +
+    `<h2 class="dim" style="margin-top:8px">Live position changes — suggestive, not confirmed</h2>` +
+    `<div class="scroll" style="max-height:200px">${evHtml}</div>` +
+    `<h2 class="dim" style="margin-top:10px">Surfaced actors — sample &amp; δ shown with the score</h2>` +
+    `<div class="scroll" style="max-height:220px">${actHtml}</div>` +
+    `<h2 class="dim" style="margin-top:10px">The denominator — evaluated N / surfaced M / why rejected</h2>` +
+    denHtml;
+}
+
 function followDetailHtml(state){
-  return `<div class="card">${walletflowPanelHtml(state.walletflow)}</div>`;
+  return `<div class="card">${walletflowPanelHtml(state.walletflow)}</div>` +
+    `<div class="card" style="margin-top:10px">${copytradePanelHtml(state.copytrade)}</div>`;
 }
 
 /* ---------- balance agent panel ---------- */

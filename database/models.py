@@ -1069,3 +1069,101 @@ class ExchangeLabel(Base):
     __table_args__ = (
         Index("ix_exchange_labels_label", "label"),
     )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# COPY-TRADE LEADERBOARD OBSERVER ($0 observer — follow/copytrade.py)
+# ──────────────────────────────────────────────────────────────────────────────
+# Sibling of the wallet-flow tables. Reads ON-CHAIN PERP venues (true notional /
+# leverage / liquidation distance are public, which solves the CEX leaderboard's
+# sizing-opacity flaw). NOTHING here records trading intent — a position-change
+# is SUGGESTIVE evidence of an actor's behaviour, never a followable order. The
+# distinguishing table is copytrade_evaluations: the DENOMINATOR LOG, recording
+# EVERY actor evaluated (surfaced AND rejected, with reason) so skill estimates
+# are never computed from a survivor-only pool. Point-in-time skill scoring reads
+# the SHARED wallet_flow_events log (source_id="copytrade") via the one no-leak
+# filter; these tables hold the perp-specific detail + the denominator.
+
+
+class CopyTradeEvent(Base):
+    """One observed perp position-change by a ranked on-chain trader. Stored as
+    SUGGESTIVE evidence only — `action` is the observed class (open | close |
+    increase | decrease), never an inferred intent. notional_usd / leverage /
+    liq_distance are TRUE (on-chain positions are public), the data CEX
+    leaderboards hide.
+
+    Two-clock discipline matches WalletFlowEvent: occurred_at is venue/block
+    time, detected_at is when WE observed it (T + δ). The resolved track record
+    used for point-in-time skill lives in the shared wallet_flow_events log; this
+    row is the perp-detail feed for the panel + as-of evidence.
+    """
+    __tablename__ = "copytrade_events"
+
+    id          = Column(Integer, primary_key=True)
+    source_id   = Column(String(30), nullable=False)   # "copytrade"
+    venue       = Column(String(20), nullable=False)   # hyperliquid | drift | ...
+    actor_id    = Column(String(80), nullable=False)   # trader address / id on the venue
+    action      = Column(String(20), nullable=False)   # open | close | increase | decrease
+    asset       = Column(String(40))
+    notional_usd = Column(Float)                        # TRUE notional (on-chain)
+    leverage    = Column(Float)
+    liq_distance = Column(Float)                        # fractional distance to liquidation
+    occurred_at = Column(DateTime, nullable=False)      # venue/block time
+    detected_at = Column(DateTime, nullable=False)      # when WE observed it (T + δ)
+    resolved_at = Column(DateTime)                      # outcome known (null until resolved)
+    outcome     = Column(String(10))                    # win | loss | flat (null until resolved)
+    meta        = Column(JSON)                           # venue extras (side, entry, rank, pnl)
+    created_at  = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        Index("ix_copytrade_events_actor", "actor_id", "occurred_at"),
+        Index("ix_copytrade_events_venue", "venue", "occurred_at"),
+        Index("ix_copytrade_events_action", "action"),
+    )
+
+
+class CopyTradeActor(Base):
+    """Per-actor skill rollup. followable is True only when the actor clears the
+    survival gate AND the edge survives the latency-δ window; sizing_interpretable
+    is True for on-chain perps (true notional visible) — it would be False for a
+    CEX ROI%-only leaderboard, which is why CEX is out of v1.
+    """
+    __tablename__ = "copytrade_actors"
+
+    actor_id            = Column(String(80), primary_key=True)
+    venue               = Column(String(20), primary_key=True)
+    first_seen          = Column(DateTime, default=datetime.utcnow)
+    last_evaluated_at   = Column(DateTime)
+    closed_trades       = Column(Integer, default=0)
+    skill_score         = Column(Float)                 # null below the survival gate (NO-SIGNAL)
+    latency_delta_s     = Column(Float)
+    drawdown            = Column(Float)
+    followable          = Column(Boolean, default=False)
+    sizing_interpretable = Column(Boolean, default=True)
+
+    __table_args__ = (
+        Index("ix_copytrade_actors_followable", "followable"),
+    )
+
+
+class CopyTradeEvaluation(Base):
+    """THE DENOMINATOR LOG. One row per actor EVALUATED — including REJECTED ones
+    — with the rejection reason. The point: skill estimates and any future
+    survivorship / multiple-comparisons correction must be computable over the
+    FULL evaluated population, not the surfaced winners. The UI reads this to show
+    "evaluated N, surfaced M, here's why N−M were rejected".
+    """
+    __tablename__ = "copytrade_evaluations"
+
+    id           = Column(Integer, primary_key=True)
+    actor_id     = Column(String(80), nullable=False)
+    venue        = Column(String(20), nullable=False)
+    evaluated_at = Column(DateTime, default=datetime.utcnow)
+    decision     = Column(String(10), nullable=False)   # surfaced | rejected
+    reason       = Column(String(40))                   # below_min_closed_trades | delta_too_high | drawdown_too_deep | sizing_uninterpretable | ...
+    sample_size  = Column(Integer)                      # resolved closed trades at evaluation time
+
+    __table_args__ = (
+        Index("ix_copytrade_evaluations_actor", "actor_id", "evaluated_at"),
+        Index("ix_copytrade_evaluations_decision", "decision"),
+    )
