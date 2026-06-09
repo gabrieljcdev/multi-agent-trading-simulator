@@ -46,7 +46,10 @@ def _make_exchange(name):
     }
     cls  = getattr(ccxt, name)
     conf = configs.get(name, {})
-    return cls({**conf, "enableRateLimit": True})
+    # Explicit timeout (ms) — the ccxt default (10s) was too tight for some
+    # venues' load_markets() under busy-startup latency on WSL2 (kraken/mexc).
+    timeout_ms = int(float(getattr(settings, "MARKET_DATA_CONNECT_TIMEOUT_S", 30.0)) * 1000)
+    return cls({**conf, "enableRateLimit": True, "timeout": timeout_ms})
 
 def _compute_indicators(df):
     if len(df) < 30:
@@ -370,14 +373,32 @@ class MarketData:
     async def start(self):
         self._running = True
         logger.info("Initialising market data...")
+        retries = int(getattr(settings, "MARKET_DATA_CONNECT_RETRIES", 3))
+        backoff = float(getattr(settings, "MARKET_DATA_CONNECT_BACKOFF_S", 2.0))
         for name in settings.ENABLED_EXCHANGES:
-            try:
+            # A fresh client per attempt — a venue whose first load_markets()
+            # flakes under startup latency (kraken/mexc on WSL2) gets retried
+            # cleanly rather than dropped, which previously left it out of
+            # _exchanges and mislabelled "nokey" in the UI for the whole run.
+            for attempt in range(1, retries + 1):
                 ex = _make_exchange(name)
-                await ex.load_markets()
-                self._exchanges[name] = ex
-                logger.info(f"  {name}: connected")
-            except Exception as e:
-                logger.error(f"  {name}: failed — {e}")
+                try:
+                    await ex.load_markets()
+                    self._exchanges[name] = ex
+                    logger.info(f"  {name}: connected"
+                                + (f" (attempt {attempt})" if attempt > 1 else ""))
+                    break
+                except Exception as e:
+                    try:
+                        await ex.close()
+                    except Exception:
+                        pass
+                    if attempt < retries:
+                        logger.warning(f"  {name}: connect attempt {attempt}/{retries} "
+                                       f"failed ({e}); retrying in {backoff}s")
+                        await asyncio.sleep(backoff)
+                    else:
+                        logger.error(f"  {name}: failed after {retries} attempts — {e}")
         if not self._exchanges:
             raise RuntimeError("No exchanges connected")
         self._active_pairs = await self._resolve_pairs()

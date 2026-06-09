@@ -2675,9 +2675,12 @@ class WebServer:
             live = {}
         out = []
         for name in getattr(settings, "ENABLED_EXCHANGES", []):
+            # "down" = not present in the market-data layer (load_markets failed
+            # / not yet connected). This is NOT a key check — public market data
+            # needs no key — so don't mislabel a connect failure as "nokey".
             out.append({
                 "name":       name.title(),
-                "status":     "live" if name in live else "nokey",
+                "status":     "live" if name in live else "down",
                 "ping_ms":    None,
                 "last_feed_s": None,
             })

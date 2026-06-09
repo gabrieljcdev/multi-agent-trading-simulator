@@ -122,6 +122,15 @@ EXCHANGE_BALANCES = {
 
 ENABLED_EXCHANGES  = ["binance", "kraken", "bybit", "kucoin", "mexc"]
 MIN_LIQUIDITY_USD  = 50_000     # Minimum order book depth to trade a pair
+
+# market_data.start() load_markets() resilience. The default ccxt 10s timeout +
+# no retry made kraken (and intermittently mexc) fail their first load_markets()
+# under busy-startup latency on WSL2 (same root cause the binance fetchCurrencies
+# workaround addresses) — leaving them out of _exchanges and mislabelled in the
+# UI. A longer per-attempt timeout + a few fresh-client retries recovers them.
+MARKET_DATA_CONNECT_TIMEOUT_S = 30.0   # test: 15, 30, 45   per-attempt load_markets timeout (ccxt client timeout too)
+MARKET_DATA_CONNECT_RETRIES   = 3      # test: 1, 3, 5      fresh-client attempts before giving up on a venue
+MARKET_DATA_CONNECT_BACKOFF_S = 2.0    # test: 1, 2, 5      sleep between connect attempts
 ORDER_BOOK_DEPTH   = 10         # Levels to stream per side for OFI
 ORDER_BOOK_STREAM_PAIRS    = 20    # test: 5-50   (top-N active pairs to stream books for)
 ORDER_BOOK_WATCH_TIMEOUT_S = 30.0  # test: 10-60  (max wait for one symbol's book update)
