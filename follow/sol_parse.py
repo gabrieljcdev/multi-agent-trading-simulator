@@ -297,22 +297,58 @@ def _mint_initialized(tx: dict) -> Optional[str]:
     return None
 
 
+def _token_amount(row: dict) -> int:
+    try:
+        return int((row.get("uiTokenAmount") or {}).get("amount") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _buyer_from_balances(tx: dict, mint: str) -> Optional[str]:
+    """The wallet whose `mint` balance INCREASED in this tx — i.e. who received
+    the token. Uses meta pre/postTokenBalances, so it is robust to the token
+    moving via an INNER-instruction CPI (pump.fun bonding-curve buys move the
+    token by CPI, not a top-level spl-token transfer). Prefers the fee payer
+    when it is among the gainers (the typical buyer); else the largest gainer
+    (the bonding curve / pool LOSES tokens on a buy, so it is never picked)."""
+    meta = tx.get("meta") or {}
+    pre = {r.get("owner"): _token_amount(r)
+           for r in (meta.get("preTokenBalances") or [])
+           if r.get("mint") == mint and r.get("owner")}
+    post = {r.get("owner"): _token_amount(r)
+            for r in (meta.get("postTokenBalances") or [])
+            if r.get("mint") == mint and r.get("owner")}
+    gainers = {o: post[o] - pre.get(o, 0) for o in post if post[o] > pre.get(o, 0)}
+    if not gainers:
+        return None
+    fee_payer = _fee_payer(tx)
+    if fee_payer and fee_payer in gainers:
+        return fee_payer
+    return max(gainers, key=gainers.get)
+
+
 def early_buyer(tx: dict, mint: str) -> Optional[str]:
-    """Best-effort: the wallet that BOUGHT `mint` in this tx — the fee payer of a
-    tx that moves the token, EXCLUDING the launchpad create itself (the mint
-    initialization is the creator, not a buyer). Returns None if the tx is the
-    create, doesn't touch `mint`, or is unparseable. PURE + tolerant (no network
-    / DB / clock) — the meme scorer's early-buyer derivation layers the funder
-    lookup on top of this. The fee payer is used (not the SPL destination, which
-    is a token account, not the owner wallet)."""
+    """Best-effort: the wallet that BOUGHT `mint` in this tx, EXCLUDING the
+    launchpad create itself (the mint initialization is the creator, not a
+    buyer). Primary signal is the net token-balance delta (handles pump.fun's
+    CPI-moved tokens); falls back to a top-level spl-token transfer of the mint
+    for payloads without pre/post balances. Returns None if the tx is the
+    create, doesn't acquire `mint`, or is unparseable. PURE + tolerant (no
+    network / DB / clock) — the meme scorer layers the funder lookup on top."""
     if not isinstance(tx, dict) or not mint:
         return None
     try:
         if _mint_initialized(tx) == mint:
             return None                              # the create tx, not a buy
-        if not any(t.get("mint") == mint for t in _spl_transfers(tx)):
-            return None                              # tx doesn't move this token
-        return _fee_payer(tx)
+        buyer = _buyer_from_balances(tx, mint)
+        if buyer:
+            return buyer
+        # Fallback: a top-level spl-token transfer of the mint (payloads with no
+        # pre/post token balances). Destination is a token account, so use the
+        # fee payer as the buyer wallet.
+        if any(t.get("mint") == mint for t in _spl_transfers(tx)):
+            return _fee_payer(tx)
+        return None
     except Exception:
         return None
 

@@ -35,6 +35,34 @@ def _buy_tx(buyer: str, mint: str, block_time: int) -> dict:
     }
 
 
+def _pump_buy_tx(buyer: str, mint: str, block_time: int,
+                 curve: str = "BONDING_CURVE", gain: int = 99) -> dict:
+    """A pump.fun-style buy: the token moves via CPI (no top-level spl-token
+    transfer), so the only honest signal is the pre/post token-balance delta —
+    the buyer's mint balance goes up, the bonding curve's goes down."""
+    return {
+        "blockTime": block_time,
+        "transaction": {"message": {
+            "accountKeys": [{"pubkey": buyer, "signer": True}],
+            "instructions": [
+                {"program": "spl-associated-token-account",
+                 "parsed": {"type": "createIdempotent"}},
+                {"programId": "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"},  # pump.fun, unparsed
+            ],
+        }},
+        "meta": {
+            "preTokenBalances": [
+                {"owner": curve, "mint": mint, "uiTokenAmount": {"amount": str(1000 + gain)}},
+                {"owner": buyer, "mint": mint, "uiTokenAmount": {"amount": "0"}},
+            ],
+            "postTokenBalances": [
+                {"owner": curve, "mint": mint, "uiTokenAmount": {"amount": "1000"}},
+                {"owner": buyer, "mint": mint, "uiTokenAmount": {"amount": str(gain)}},
+            ],
+        },
+    }
+
+
 def _create_tx(creator: str, mint: str) -> dict:
     """The launchpad create — initializeMint by the creator (NOT a buy)."""
     return {
@@ -52,6 +80,12 @@ def _create_tx(creator: str, mint: str) -> dict:
 
 def test_early_buyer_returns_fee_payer_for_a_buy():
     assert sol_parse.early_buyer(_buy_tx("BUYER1", "MINT", 1001), "MINT") == "BUYER1"
+
+
+def test_early_buyer_from_balance_delta_pumpfun_cpi():
+    # token moved via CPI (no top-level transfer) — buyer identified by the
+    # net token-balance gain; the bonding curve loses tokens, so it's not picked
+    assert sol_parse.early_buyer(_pump_buy_tx("BUYER1", "MINT", 1001), "MINT") == "BUYER1"
 
 
 def test_early_buyer_excludes_the_create_tx():
