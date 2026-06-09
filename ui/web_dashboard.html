@@ -449,15 +449,16 @@ let logFilter = "ALL";
 // Web UI v3 — every registered agent renders in the grid. The v2 filter
 // that hid arb/xchain/funding_arb/balance is gone now that each gets its
 // own detail page (rather than an inline dashboard panel).
-const AGENT_ORDER = ["signal","arb","scalp","xchain","funding_arb","balance","opportunity_scanner"];
+const AGENT_ORDER = ["signal","arb","scalp","xchain","funding_arb","balance","opportunity_scanner","follow"];
 const AGENT_NAME = {
   signal:"Signal Agent", arb:"Arb Agent", scalp:"Scalp Agent",
   xchain:"Cross-Chain Agent", funding_arb:"Funding-Rate Arb", balance:"Balance Agent",
   opportunity_scanner:"Opportunity Scanner",
+  follow:"Follow Observers",
 };
 // Set of agent_ids that observe-but-don't-trade — renders the card at
 // 70% opacity (per v2 OBS convention) so the grid still reads scannable.
-const OBSERVATION_AGENTS = new Set(["xchain","funding_arb","opportunity_scanner"]);
+const OBSERVATION_AGENTS = new Set(["xchain","funding_arb","opportunity_scanner","follow"]);
 // Web UI v3 — null means "show the dashboard"; any agent_id means "show
 // that agent's detail page in place of the dashboard content". Lives in
 // JS memory only; survives WebSocket reconnects but resets on refresh.

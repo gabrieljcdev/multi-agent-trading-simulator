@@ -125,6 +125,29 @@ def test_precondition_three_observers_importable():
 
 
 # ─────────────────────────────────────────────────────────────────────────
+# 1b. Reachability — every REGISTERED agent appears in the grid's AGENT_ORDER.
+# The observer panels (and their viz drawers) are reached by clicking the
+# `follow` card; a registered agent missing from AGENT_ORDER renders no card
+# and is unreachable in the UI (the exact gap that hid the observer tabs).
+# ─────────────────────────────────────────────────────────────────────────
+
+def test_every_registered_agent_is_in_grid_order():
+    import re
+    from pathlib import Path
+    from agents import REGISTERED_AGENTS
+
+    html = Path("ui/web_dashboard.html").read_text(encoding="utf-8")
+    m = re.search(r"const AGENT_ORDER\s*=\s*\[([^\]]*)\]", html)
+    assert m, "AGENT_ORDER array not found in web_dashboard.html"
+    order = set(re.findall(r'"([^"]+)"', m.group(1)))
+    registered = {a.agent_id for a in REGISTERED_AGENTS}
+    missing = registered - order
+    assert not missing, f"registered agents missing from AGENT_ORDER (unreachable): {missing}"
+    # the follow observer host specifically must be reachable
+    assert "follow" in order
+
+
+# ─────────────────────────────────────────────────────────────────────────
 # 2. Snapshot UNCHANGED — the heavy viz data must never enter the 2Hz push
 # ─────────────────────────────────────────────────────────────────────────
 
