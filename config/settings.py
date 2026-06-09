@@ -84,31 +84,36 @@ SESSION_MIN_ACTIVE_PAIRS     = 2      # Need at least N viable pairs
 # ══════════════════════════════════════════════════════════════════════════════
 
 # Simulated per-venue cash ledger (sim mode). Spans every venue the funds
-# touch and sums to STARTING_CAPITAL (5000) so the fund allocations are
-# fully backed in sim. NOTE: this is a per-venue ledger, NOT a per-fund one
-# — funds share venues (MEXC backs scalp + mexc-arb; kraken/bybit back
-# signal + arb). Per-fund sizing lives with each agent (e.g. OrderRouter
-# sizes the signal agent off FUND_SIGNAL_CAPITAL, not this sum), so a
-# bigger ledger never lets one fund risk beyond its own allocation.
+# touch — CEX venues AND the L2 chains the cross-chain fund holds inventory on
+# — and sums to STARTING_CAPITAL (5900) so the fund allocations are fully
+# backed in sim. NOTE: this is a per-venue ledger, NOT a per-fund one — funds
+# share venues (MEXC backs scalp + mexc-arb; kraken/bybit back signal + arb;
+# binance backs signal + funding). Per-fund sizing lives with each agent (e.g.
+# OrderRouter sizes the signal agent off FUND_SIGNAL_CAPITAL, not this sum), so
+# a bigger ledger never lets one fund risk beyond its own allocation.
 #
 # Ring-fence coverage (each fund's venue subset ≥ its allocation):
-#   signal venues  binance+kraken+bybit              = 2600  ≥ 1600
+#   signal venues  binance+kraken+bybit              = 3400  ≥ 1500
 #   arb venues     kraken+bybit+bitget+bitstamp+
-#                  gateio+bitfinex                   = 3400  ≥ 2000
-#   mexc-scalp     mexc                              = 1000  ≥  500
-#   mexc-arb       mexc                              = 1000  ≥  500
+#                  gateio+bitfinex                   = 3000  ≥ 1600
+#   mexc-scalp+arb mexc                              = 1000  ≥ 1000
+#   funding        binance                           = 1400  ≥  900
+#   cross-chain    arbitrum+base+optimism            =  500  ≥  500
 # The 400 reserve is co-located on kraken + bybit (the regulated shared
 # venues), 200 each.
 EXCHANGE_BALANCES = {
-    "binance":   600.0,   # signal-only
+    "binance":  1400.0,   # signal + funding (delta-neutral spot+perp)
     "kraken":   1000.0,   # signal + arb (shared) + 200 reserve
     "bybit":    1000.0,   # signal + arb (shared) + 200 reserve
     "kucoin":      0.0,   # unused
-    "bitget":    400.0,   # arb
-    "bitstamp":  350.0,   # arb
+    "bitget":    200.0,   # arb
+    "bitstamp":  150.0,   # arb
     "gateio":    350.0,   # arb
     "bitfinex":  300.0,   # arb
     "mexc":     1000.0,   # mexc-scalp 500 + mexc-arb 500 (counterparty-capped)
+    "arbitrum":  200.0,   # cross-chain fund (on-chain inventory)
+    "base":      200.0,   # cross-chain fund
+    "optimism":  100.0,   # cross-chain fund
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -269,8 +274,8 @@ ARB_FUNDING_CONSECUTIVE_LOSS_HALT = 4
 # one is a passive rate reader inside the arb fund; this is its own agent
 # with its own observation ledger and circuit breakers.
 
-FUNDING_OBSERVATION_MODE       = True       # test: True/False  (NEVER False this phase)
-FUNDING_CAPITAL_USD            = 0.0        # test: 0-5000
+FUNDING_OBSERVATION_MODE       = False      # test: True/False  (live sim play fund — operator-enabled)
+FUNDING_CAPITAL_USD            = 900.0      # test: 0-5000
 # Widened from majors-only after 2026-05-29 observation pull showed BTC at
 # 4% APR / ETH at 7% — both below the original 12% gate, leaving the obs
 # table empty. Altcoin perps (esp. memecoins + L2 governance) routinely
@@ -806,13 +811,13 @@ PREDICTIVE_PENALTY_WEAK         = 15
 # in one fund cannot draw from another, profits stay in their own fund, and
 # circuit breakers are per-fund. MEXC is shared between MEXC-scalp and MEXC-arb
 # (un-mitigated counterparty risk → both pools stay capped per
-# build_balance_agent.md). XCHAIN + FUNDING stay observation-only this soak.
-FUND_SIGNAL_CAPITAL     = 1600.0  # test: 0–3000  signal agent — binance/bybit/kraken
-FUND_ARB_CAPITAL        = 2000.0  # test: 0–4000  cross-exchange arb — kraken/bybit/bitget/bitstamp/gateio/bitfinex
+# build_balance_agent.md). XCHAIN + FUNDING are now live (sim) play funds.
+FUND_SIGNAL_CAPITAL     = 1500.0  # test: 0–3000  signal agent — binance/bybit/kraken
+FUND_ARB_CAPITAL        = 1600.0  # test: 0–4000  cross-exchange arb — kraken/bybit/bitget/bitstamp/gateio/bitfinex
 FUND_MEXC_SCALP_CAPITAL = 500.0   # test: 0–1000  scalping, MEXC only (observation until SCALP_CAPITAL>0)
 FUND_MEXC_ARB_CAPITAL   = 500.0   # test: 0–1000  MEXC-only arb (counterparty-capped; un-wired until soak data justifies a dedicated agent)
-FUND_XCHAIN_CAPITAL     = 0.0     # test: 0       observation-only this soak — see XCHAIN_CAPITAL (line ~932)
-FUND_FUNDING_CAPITAL    = 0.0     # test: 0       observation-only this soak — see FUNDING_CAPITAL_USD (line ~264)
+FUND_XCHAIN_CAPITAL     = 500.0   # test: 0–1000  cross-chain arb — arbitrum/base/optimism (live sim; see XCHAIN_CAPITAL)
+FUND_FUNDING_CAPITAL    = 900.0   # test: 0–2000  funding-rate arb — binance delta-neutral (live sim; see FUNDING_CAPITAL_USD)
 
 # Per-fund daily-loss halt: each fund halts independently at this % of its
 # OWN size. Enforced by Coordinator._check_fund_circuit_breakers, alongside
@@ -822,9 +827,9 @@ FUND_DAILY_LOSS_HALT_PCT = 10.0   # test: 5–20
 # Total starting equity for the portfolio — sum of all FUND_* + uncommitted
 # reserve. Drives CircuitBreakerState baseline + falls back as initial value
 # when the DB has no prior portfolio_snapshot (see core/bot.py startup).
-# Reserve = STARTING_CAPITAL - sum(FUND_*) = 400 (8%) held out of deployed
+# Reserve = STARTING_CAPITAL - sum(FUND_*) = 400 (~7%) held out of deployed
 # pool; COMPOUND_RESERVE_PCT logic will absorb this once BalanceAgent ships.
-STARTING_CAPITAL     = 5000.0    # test: 200–10000   (sum(FUND_*) = 4600; +400 reserve)
+STARTING_CAPITAL     = 5900.0    # test: 200–10000   (sum(FUND_*) = 5500; +400 reserve)
 
 # Legacy aliases — existing code/tests read these names. Pointed at the
 # fund constants so there is a single source of truth for each pool.
@@ -1214,7 +1219,7 @@ SCALP_MIN_DIRECTIONAL_ACC_1M_V2    = 0.57   # was 0.55
 # bridge mid-trade (XCHAIN_INVENTORY_DRIFT_PCT triggers the BalanceAgent to
 # CCTP/canonical-bridge during idle windows).
 XCHAIN_LIVE_ENABLED            = False  # test: False         (hard gate; keep False)
-XCHAIN_CAPITAL                 = 0.0    # test: 0, 100, 250   (0 = observation mode)
+XCHAIN_CAPITAL                 = 500.0  # test: 0, 100, 250, 500   (0 = observation mode; live sim play fund)
 XCHAIN_MIN_NET_EDGE_BPS        = 15.0   # test: 8, 12, 15, 20, 30
 XCHAIN_GAS_BUDGET_BPS          = 5.0    # test: 3, 5, 8       (gas-as-%-of-notional cap)
 XCHAIN_SLIPPAGE_TOLERANCE_BPS  = 10.0   # test: 5, 10, 20     (per-leg price impact tolerance)

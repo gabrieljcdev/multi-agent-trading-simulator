@@ -33,11 +33,13 @@ def test_starting_capital_is_sum_of_funds_plus_reserve():
     COMPOUND_RESERVE_PCT logic ships in BalanceAgent."""
     deployed = (settings.FUND_SIGNAL_CAPITAL + settings.FUND_ARB_CAPITAL
                 + settings.FUND_MEXC_SCALP_CAPITAL
-                + settings.FUND_MEXC_ARB_CAPITAL)
-    assert deployed == 4600.0
+                + settings.FUND_MEXC_ARB_CAPITAL
+                + settings.FUND_XCHAIN_CAPITAL
+                + settings.FUND_FUNDING_CAPITAL)
+    assert deployed == 5500.0
     reserve = settings.STARTING_CAPITAL - deployed
     assert reserve >= 0, "STARTING_CAPITAL must cover all FUND_* allocations"
-    assert settings.STARTING_CAPITAL == 5000.0
+    assert settings.STARTING_CAPITAL == 5900.0
 
 
 def test_legacy_aliases_track_fund_constants():
