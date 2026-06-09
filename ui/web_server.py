@@ -311,12 +311,16 @@ class WebServer:
             web.post("/api/walletflow/candidate/confirm", self.handle_walletflow_confirm),
             web.post("/api/walletflow/candidate/reject",  self.handle_walletflow_reject),
             web.get("/api/walletflow/health",           self.handle_walletflow_health),
+            # On-demand viz aggregation (charts) — read-only, derived from stored
+            # events, NEVER in the 2Hz snapshot. Same localhost privacy guard.
+            web.get("/api/walletflow/viz/flow_series",  self.handle_walletflow_viz_flow),
             # Copy-trade leaderboard observer — surfaces TRADER IDENTITIES, so
             # localhost-guarded (403 otherwise), same privacy rule as walletflow.
             web.get("/api/copytrade/actor/{actor_id}", self.handle_copytrade_actor),
             web.get("/api/copytrade/surfaced",         self.handle_copytrade_surfaced),
             web.get("/api/copytrade/denominator",      self.handle_copytrade_denominator),
             web.get("/api/copytrade/health",           self.handle_copytrade_health),
+            web.get("/api/copytrade/viz/skill",        self.handle_copytrade_viz_skill),
             # Meme-coin rug-rate scorer — surfaces wallet/funder IDENTITIES, so
             # localhost-guarded (403 otherwise), same privacy rule as walletflow.
             web.get("/api/meme/launch/{mint}", self.handle_meme_launch),
@@ -1106,6 +1110,49 @@ class WebServer:
             return round(deltas[idx], 2)
         return {"p50": _pct(0.5), "p90": _pct(0.9), "n": len(deltas)}
 
+    async def handle_walletflow_viz_flow(self, request) -> web.Response:
+        """GET /api/walletflow/viz/flow_series → ON-DEMAND chart data: exchange
+        inflow-vs-outflow net flow bucketed over time, plus the watchlist
+        provenance breakdown (candidate/confirmed/manual/rejected + trust
+        expiring soon). Pure read-side aggregation over already-stored events —
+        adds NOTHING to the 2Hz snapshot. Localhost-guarded (wallet-identifying).
+        Empty-safe: zeroed buckets/counts when nothing is stored."""
+        guard = self._walletflow_guard()
+        if guard is not None:
+            return guard
+        out = {"ok": True,
+               "series":     {"window_h": 0, "buckets": [], "n_events": 0},
+               "provenance": {"counts": {"candidate": 0, "confirmed": 0,
+                                         "manual": 0, "rejected": 0},
+                              "expiring_soon": 0, "total": 0},
+               "best_effort": False, "gaps_24h": 0}
+        try:
+            out["series"] = db_queries.get_wallet_flow_series(
+                buckets=int(getattr(settings, "WEB_UI_VIZ_FLOW_BUCKETS", 24)),
+                window_h=int(getattr(settings, "WEB_UI_VIZ_FLOW_WINDOW_H", 24)),
+                scan_limit=int(getattr(settings, "WEB_UI_VIZ_EVENT_SCAN_LIMIT", 500)))
+        except Exception as e:
+            logger.debug("walletflow viz series failed: %s", e)
+        try:
+            out["provenance"] = db_queries.get_watchlist_provenance_counts(
+                expiry_soon_h=int(getattr(settings, "WEB_UI_VIZ_TRUST_EXPIRY_SOON_H", 24)))
+        except Exception as e:
+            logger.debug("walletflow viz provenance failed: %s", e)
+        # Best-effort / gap markers — same honesty surface as the live panel.
+        try:
+            agent = self._get_agent("follow")
+            snap = (agent.get_walletflow_snapshot()
+                    if agent is not None and hasattr(agent, "get_walletflow_snapshot")
+                    else {})
+            srcs = snap.get("sources", []) or []
+            out["best_effort"] = any(s.get("best_effort") for s in srcs)
+            out["gaps_24h"] = sum(int(s.get("gaps_24h", 0) or 0) for s in srcs)
+        except Exception as e:
+            logger.debug("walletflow viz health markers failed: %s", e)
+        return web.json_response(
+            out, dumps=lambda o: json.dumps(_jsonable(o), default=str,
+                                            allow_nan=False))
+
     # ── Copy-trade leaderboard observer (/api/copytrade/*) ───────────────
     # PRIVACY HARD RULE: this panel serves trader identities. Every endpoint
     # 403s unless the server binds to a loopback host — identical to the
@@ -1210,6 +1257,47 @@ class WebServer:
         except Exception as e:
             logger.debug("copytrade health failed: %s", e)
         return web.json_response(out)
+
+    async def handle_copytrade_viz_skill(self, request) -> web.Response:
+        """GET /api/copytrade/viz/skill → ON-DEMAND chart data for the luck-vs-
+        skill scatter and THE DENOMINATOR view: surfaced actors as points
+        (skill vs sample-size vs latency-δ, followable flagged) over the FULL
+        evaluated population (denominator: evaluated N / surfaced M / rejection
+        reasons). Population view, never a winners-only reel. Pure read-side
+        aggregation — adds NOTHING to the snapshot. Localhost-guarded.
+        Empty-safe: empty points + zeroed denominator when nothing's stored."""
+        guard = self._copytrade_guard()
+        if guard is not None:
+            return guard
+        out = {"ok": True, "points": [],
+               "denominator": {"evaluated": 0, "surfaced": 0, "rejected": 0,
+                               "rejection_reasons": {}}}
+        try:
+            actors = db_queries.get_skilled_copytrade_actors()
+            out["points"] = [{
+                "actor_id":   a.get("actor_id"),
+                "venue":      a.get("venue"),
+                "skill":      a.get("skill_score"),
+                "sample":     a.get("closed_trades", 0),
+                "delta_s":    a.get("latency_delta_s"),
+                "drawdown":   a.get("drawdown"),
+                "followable": bool(a.get("followable")),
+            } for a in actors]
+        except Exception as e:
+            logger.debug("copytrade viz points failed: %s", e)
+        try:
+            den = db_queries.get_copytrade_denominator(limit=500)
+            out["denominator"] = {
+                "evaluated":         den.get("evaluated", 0),
+                "surfaced":          den.get("surfaced", 0),
+                "rejected":          den.get("rejected", 0),
+                "rejection_reasons": den.get("rejection_reasons", {}),
+            }
+        except Exception as e:
+            logger.debug("copytrade viz denominator failed: %s", e)
+        return web.json_response(
+            out, dumps=lambda o: json.dumps(_jsonable(o), default=str,
+                                            allow_nan=False))
 
     # ── Meme-coin rug-rate scorer (/api/meme/*) ──────────────────────────
     # PRIVACY HARD RULE: this panel serves wallet/funder identities. Every

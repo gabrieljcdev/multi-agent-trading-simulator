@@ -7,14 +7,27 @@ never SSL, never internet-exposed. Mirrors the terminal dashboard
 sources.
 
 The push snapshot is live state, not history; the one exception is the
-on-demand REST reads, which DO serve historical / as-of analysis on
-request rather than over the 2Hz push. The wallet-flow watcher
-(`/api/walletflow/*`) is the widest such surface — per-wallet skill
-scores, evidence, and a point-in-time as-of reconstruction. Because that
-data is wallet-IDENTIFYING, every `/api/walletflow/*` endpoint is bound
-to the privacy guard: it returns **403** unless `WEB_UI_HOST` is a
-loopback host (`localhost` / `127.0.0.1` / `::1`). LAN binds get no
-wallet data.
+on-demand REST reads, which DO serve historical / as-of analysis — and,
+since the unified-observer-UI pass, on-demand **charts** — on request
+rather than over the 2Hz push. The three $0 observer panels (wallet-flow
+`/api/walletflow/*`, copy-trade `/api/copytrade/*`, meme rug-rate
+`/api/meme/*`) are the widest such surface — per-actor skill scores,
+evidence, point-in-time as-of reconstruction, and the viz aggregation
+endpoints below. Because that data is identity-bearing (wallet / trader /
+funder), every one of those endpoints is bound to the privacy guard: it
+returns **403** unless `WEB_UI_HOST` is a loopback host (`localhost` /
+`127.0.0.1` / `::1`). LAN binds get no observer data.
+
+> **Scope note (second deliberate departure from real-time-only).** The
+> observer tabs now render on-demand historical **SVG charts** —
+> net-flow-over-time, a skill-vs-sample-size scatter, the denominator
+> view, the funder-cluster graph, and the replay TP/FP/coverage plot.
+> This amends the original "no chart/graph rendering" and "no historical
+> analysis" notes. The charts are still **vanilla inline SVG with no
+> chart library and no CDN import** — the no-dependency rule is intact;
+> only the "real-time-only" scope moved. Heavy visuals are fetched over
+> REST when the operator expands a tab's chart drawer and are **never**
+> computed in or pushed through the 2Hz snapshot.
 
 The single HTML file `ui/web_dashboard.html` is served at `/` and
 opens a WebSocket to `/ws`. Snapshots arrive every
@@ -302,7 +315,7 @@ UI. The render function dispatched per agent_id:
 | `funding_arb` | full `fundingPanelHtml(funding)` |
 | `balance`     | full `balancePanelHtml(balance)` — includes the arm/confirm/cancel control block, which now lives on this detail page rather than on the dashboard |
 | `opportunity_scanner` | full `opportunityPanelHtml(opportunities)` — the read-only panel (standard + exploratory views, reasoning feed); this detail page is now its ONLY surface — the duplicate dashboard card was removed |
-| `follow` | full `walletflowPanelHtml(walletflow)` — the read-only $0 OBSERVER panel: live flow signals (labelled suggestive-not-confirmed), net-flow spikes, system health, and the candidate-review queue (warnings + Confirm/Reject, wired via `bindWalletflowReview()` to the localhost-guarded `/api/walletflow/*` endpoints). Per-wallet skill + as-of reconstruction are on-demand REST, not pushed |
+| `follow` | the three stacked $0 OBSERVER panels — `walletflowPanelHtml(walletflow)`, `copytradePanelHtml(copytrade)`, `memePanelHtml(meme)` — each carrying a collapsed **▸ Visualizations** drawer (`observerVizDrawer`). Live layers (suggestive-not-confirmed flow / position changes / AVOID·NO-SIGNAL decisions, plus the candidate-review queue) come from the snapshot; the chart drawers and per-wallet/actor/launch as-of reconstructions are on-demand REST (`bindObserverViz()` + `bindWalletflowReview()`), localhost-guarded, never pushed. The drawers render inline SVG charts (one shared vanilla helper set: `vizFlowChart`, `vizBarsH`, `vizScatter`, `vizCluster`) with a consistent colour language (risk=`--neg`, neutral/NO-SIGNAL=`--warn`, good/followable=`--pos`, censored/cut/gaps=`--tx2`) and uncertainty shown as prominently as conclusions |
 
 The four `*PanelHtml` functions (`arbFundPanelHtml`, `xchainPanelHtml`,
 `fundingPanelHtml`, `balancePanelHtml`) are unchanged from v2 — they
@@ -439,6 +452,9 @@ the error string. Never raises to the aiohttp layer.
 | `POST /api/walletflow/candidate/confirm` `{address}` | candidate → confirmed (operator action — the ONLY path to confirmed). `{"ok": bool, ...}`. **403** off-loopback. |
 | `POST /api/walletflow/candidate/reject` `{address}` | candidate → rejected (permanent; never re-proposed). `{"ok": bool, ...}`. **403** off-loopback. |
 | `GET /api/walletflow/health` | `{"ok": true, "label_staleness", "coverage", "latency_delta_s"}` — label-set staleness, source coverage, latency-δ p50/p90. **403** off-loopback. |
+| `GET /api/walletflow/viz/flow_series` | `{"ok": true, "series": {window_h, buckets:[{t, inflow_usd, outflow_usd, net_usd, events}], n_events}, "provenance": {counts:{candidate,confirmed,manual,rejected}, expiring_soon, total}, "best_effort", "gaps_24h"}` — **on-demand chart data**: time-bucketed exchange net-flow + watchlist provenance, derived read-side from stored flow events via `queries.get_wallet_flow_series` / `get_watchlist_provenance_counts`. NOT in the snapshot. **403** off-loopback. |
+| Copy-trade on-demand (all **403** off-loopback): `GET /api/copytrade/actor/{id}?as_of=` (point-in-time skill + as-of via the shared `skill_scorer.resolved_actions_as_of`), `/surfaced`, `/denominator`, `/health`, and `GET /api/copytrade/viz/skill` → `{"ok": true, "points":[{actor_id, venue, skill, sample, delta_s, drawdown, followable}], "denominator":{evaluated, surfaced, rejected, rejection_reasons}}` — the luck-vs-skill scatter population + denominator chart data. |
+| Meme on-demand (all **403** off-loopback): `GET /api/meme/launch/{mint}` (per-launch cluster + each funder's rug-rate via the shared `meme_scorer.rug_rate_as_of`), `GET /api/meme/asof/{funder}?as_of=` (the as-of inspector — SAME shared fn), `GET /api/meme/health` (sampling best-effort/gap flag + replay TP/FP/coverage). The meme charts (cluster graph, rug-rate evidence, replay plot, as-of inspector) reuse these existing endpoints — no new meme endpoint was added. |
 
 The wallet-flow confirm/reject endpoints are operator WRITES — distinct from
 the opportunity panel's read-only feed. They mutate watchlist provenance only
@@ -700,6 +716,10 @@ WEB_UI_PORT                       8765                  bind port
 WEB_UI_PUSH_INTERVAL_S            0.5                   broadcast cadence
 WEB_UI_SCALP_FEED_HISTORY         30                    closed-trade cap on the scalp panel
 WEB_UI_CAPITAL_MOVEMENTS_N        15                    rows in the Capital Movements list
+WEB_UI_VIZ_FLOW_BUCKETS           24                    time buckets in the wallet-flow net-flow chart
+WEB_UI_VIZ_FLOW_WINDOW_H          24                    lookback window (hours) for that chart
+WEB_UI_VIZ_EVENT_SCAN_LIMIT       500                   newest flow events scanned to build the series
+WEB_UI_VIZ_TRUST_EXPIRY_SOON_H    24                    confirmed-wallet trust expiring within this = "soon"
 
 REBALANCE_CONFIRM_WINDOW_S        3                     arm→confirm click window
 REBALANCE_ARM_TIMEOUT_S           10                    in-memory arm-token TTL

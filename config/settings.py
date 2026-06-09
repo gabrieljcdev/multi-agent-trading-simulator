@@ -1511,6 +1511,16 @@ WEB_UI_SCALP_FEED_HISTORY = 30         # test: 10, 20, 30, 50
 # Rows in the dashboard's Capital Movements list (snapshot capital.recent_movements).
 WEB_UI_CAPITAL_MOVEMENTS_N = 15        # test: 10-50
 
+# ── Observer-tab on-demand visualizations (unified observer UI) ─────────────
+# Heavy charts (wallet-flow / copy-trade / meme) are rendered ON DEMAND when the
+# operator opens an observer tab and fetched over REST under
+# /api/{walletflow,copytrade,meme}/viz/* — NEVER pushed through the 2Hz snapshot.
+# These tune the read-side aggregation the viz endpoints derive (no new tables).
+WEB_UI_VIZ_FLOW_BUCKETS         = 24   # test: 12, 24, 48   time buckets in the wallet-flow net-flow series
+WEB_UI_VIZ_FLOW_WINDOW_H        = 24   # test: 6, 12, 24    lookback window for that series, hours
+WEB_UI_VIZ_EVENT_SCAN_LIMIT     = 500  # test: 200, 500, 1000  newest flow events scanned to build the series
+WEB_UI_VIZ_TRUST_EXPIRY_SOON_H  = 24   # test: 12, 24, 48   confirmed-wallet trust expiring within this is "soon"
+
 # ── LED price grid (web UI drawer; GET /api/ticker) ─────────────────────────
 # Prices are PROXIED through the bot (browser never calls a venue directly).
 # A dedicated worker thread (ui/web_server._TickerWorker, own event loop so

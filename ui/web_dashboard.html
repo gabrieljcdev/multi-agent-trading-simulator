@@ -129,6 +129,26 @@
   /* bars */
   .bar{height:8px;background:var(--bg2);border-radius:4px;overflow:hidden;margin:3px 0 8px}
   .bar > i{display:block;height:100%}
+  /* unified observer visualizations (on-demand SVG charts; ONE approach,
+     no chart lib / no CDN — consistent with the no-dependency UI rule) */
+  .vizdrawer{margin-top:12px;border-top:1px dashed var(--line);padding-top:8px}
+  .viztoggle{font-size:11px}
+  .vizbars{margin:4px 0}
+  .vizbar-row{display:flex;align-items:center;gap:8px;margin:3px 0}
+  .vizbar-lbl{flex:0 0 200px;font-size:11px;color:var(--tx1);overflow:hidden;
+    text-overflow:ellipsis;white-space:nowrap}
+  .vizbar-track{flex:1;height:10px;background:var(--bg2);border-radius:3px;overflow:hidden}
+  .vizbar-track > i{display:block;height:100%}
+  .vizbar-val{flex:0 0 56px;text-align:right;font-size:11px;font-weight:bold}
+  .vizlegend{font-size:10px;color:var(--tx2);margin:2px 0 4px}
+  .vizlegend span{margin-right:10px;white-space:nowrap}
+  .vizlegend i{display:inline-block;width:9px;height:9px;border-radius:50%;
+    margin-right:3px;vertical-align:middle}
+  .vizlegend i.ring{background:transparent;border:1px dashed var(--neg)}
+  .vizchips{display:flex;flex-wrap:wrap;gap:4px}
+  .memeDrill{font-size:11px;padding:2px 8px;background:var(--bg2);
+    border-color:var(--line)}
+  .memeDrill.av{color:var(--neg);border-color:var(--neg);font-weight:bold}
   /* dots */
   .dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:6px}
   .dot.live{background:var(--pos);animation:pulse 1.6s infinite}
@@ -1555,7 +1575,8 @@ function walletflowPanelHtml(w){
     `<div class="dim" style="font-size:11px;margin-top:4px">label set: ` +
       `${stale.count||0} addrs · last verified ${esc(stale.last_verified_at||"never")} · ` +
       `${stale.is_stale?"STALE — verify before trusting":"fresh"}</div>` +
-    walletflowCandidateReviewHtml();
+    walletflowCandidateReviewHtml() +
+    observerVizDrawer("walletflow");
 }
 
 function walletflowCandidateReviewHtml(){
@@ -1698,7 +1719,8 @@ function copytradePanelHtml(c){
     `<h2 class="dim" style="margin-top:10px">Surfaced actors — sample &amp; δ shown with the score</h2>` +
     `<div class="scroll" style="max-height:220px">${actHtml}</div>` +
     `<h2 class="dim" style="margin-top:10px">The denominator — evaluated N / surfaced M / why rejected</h2>` +
-    denHtml;
+    denHtml +
+    observerVizDrawer("copytrade");
 }
 
 /* ---------- meme-coin cluster rug-rate scorer panel ----------
@@ -1772,7 +1794,275 @@ function memePanelHtml(m){
     `<div class="dim" style="font-size:11px;margin-top:4px">Per-launch cluster ` +
     `+ the as-of inspector at <span class="dim">/api/meme/launch/&lt;mint&gt;</span> ` +
     `and <span class="dim">/api/meme/asof/&lt;funder&gt;</span>; replay TP/FP/coverage ` +
-    `at <span class="dim">/api/meme/health</span>.</div>`;
+    `at <span class="dim">/api/meme/health</span>.</div>` +
+    observerVizDrawer("meme");
+}
+
+/* ============================================================
+   UNIFIED OBSERVER VISUALIZATIONS (on-demand, NEVER in the 2Hz snapshot)
+   ONE charting approach across all three observer tabs: inline SVG, vanilla
+   JS, zero dependencies (no chart lib, no CDN) — consistent with the
+   established "no chart libraries / no CDN imports" UI rule and the
+   localhost-only / offline constraint. Heavy visuals are fetched over REST
+   when the operator EXPANDS a tab's chart drawer (lazy, once); the snapshot
+   is never touched. Shared colour language:
+     risk    (AVOID / rug / inflow=pre-sell)      → --neg
+     neutral (NO-SIGNAL / uncertain, NOT "safe")  → --warn
+     good    (followable / accumulation outflow)  → --pos
+     muted   (censored / pending / cut / gaps)    → --tx2
+   Uncertainty is rendered AS PROMINENTLY as conclusions everywhere: sample
+   size, resolved-vs-censored, latency-δ, best-effort/gap flags, NO-SIGNAL≠safe.
+   ============================================================ */
+const VIZ = { risk:'var(--neg)', neutral:'var(--warn)', good:'var(--pos)',
+              muted:'var(--tx2)', line:'var(--line)', ink:'var(--tx0)' };
+
+// on-demand caches (null = not yet fetched; same convention as walletflowCandidates)
+let walletflowViz = null, copytradeViz = null, memeViz = null;
+let memeDrill = null;     // {mint, data} per-launch cluster drill-in (lazy per launch)
+let observerVizOpen = { walletflow:false, copytrade:false, meme:false };
+
+function vizEmpty(msg){
+  return `<div class="muted" style="padding:12px;text-align:center">${esc(msg||'no data yet')}</div>`;
+}
+
+// Horizontal labelled bars — provenance, rejection reasons, replay TP/FP/coverage.
+function vizBarsH(rows, opts){
+  rows = (rows||[]).filter(r=>r);
+  if(!rows.length) return vizEmpty((opts&&opts.empty)||'nothing to chart');
+  const max = Math.max(1, ...rows.map(r=>+r.value||0));
+  return `<div class="vizbars">` + rows.map(r=>{
+    const w = Math.round(100*(+r.value||0)/max);
+    const col = r.color||VIZ.muted;
+    return `<div class="vizbar-row"><span class="vizbar-lbl" title="${esc(r.label)}">${esc(r.label)}</span>` +
+      `<span class="vizbar-track"><i style="width:${w}%;background:${col}"></i></span>` +
+      `<span class="vizbar-val">${esc(r.display!=null?r.display:r.value)}</span></div>`;
+  }).join('') + `</div>`;
+}
+
+// Net exchange flow over time — vertical bars off a zero baseline: up/red = net
+// inflow (pre-sell tell), down/green = net outflow (accumulation tell).
+function vizFlowChart(series){
+  const bk = (series && series.buckets) || [];
+  if(!bk.length || !bk.some(b=>b.events)) return vizEmpty('no exchange flow in the window');
+  const W=640,H=170,padL=52,padR=12,padT=10,padB=20;
+  const iw=W-padL-padR, ih=H-padT-padB;
+  const maxA = Math.max(1, ...bk.map(b=>Math.abs(+b.net_usd||0)));
+  const zeroY = padT+ih*0.5, bw=iw/bk.length;
+  const bars = bk.map((b,i)=>{
+    const v=+b.net_usd||0, h=(Math.abs(v)/maxA)*(ih*0.5);
+    const xx=padL+i*bw+bw*0.15, w=bw*0.7, yy = v>=0 ? zeroY-h : zeroY;
+    const col = v>0?VIZ.risk:(v<0?VIZ.good:VIZ.muted);
+    const tip = `${b.t}: net ${fmtUsd(v)} (in ${fmtUsd(b.inflow_usd)}, out ${fmtUsd(b.outflow_usd)}, ${b.events} ev)`;
+    return `<rect x="${xx.toFixed(1)}" y="${yy.toFixed(1)}" width="${w.toFixed(1)}" height="${Math.max(0.6,h).toFixed(1)}" fill="${col}"><title>${esc(tip)}</title></rect>`;
+  }).join('');
+  const axis = `<line x1="${padL}" y1="${zeroY}" x2="${W-padR}" y2="${zeroY}" stroke="${VIZ.line}"/>` +
+    `<text x="4" y="${padT+8}" fill="${VIZ.risk}" font-size="9">+${fmtUsd(maxA)} in</text>` +
+    `<text x="4" y="${padT+ih}" fill="${VIZ.good}" font-size="9">−${fmtUsd(maxA)} out</text>`;
+  return `<svg viewBox="0 0 ${W} ${H}" width="100%" style="max-height:180px" preserveAspectRatio="none" role="img" aria-label="net exchange flow over time">${axis}${bars}</svg>`;
+}
+
+// Skill vs sample-size vs latency-δ scatter — low-sample dots render hollow/
+// faded so luck looks as uncertain as it is; followable vs unfollowable coloured.
+function vizScatter(points){
+  points = (points||[]).filter(p=>p && p.skill!=null);
+  if(!points.length) return vizEmpty('no actors surfaced (none cleared the survival gate)');
+  const W=640,H=220,padL=44,padR=12,padT=12,padB=26;
+  const iw=W-padL-padR, ih=H-padT-padB;
+  const maxS=Math.max(1,...points.map(p=>+p.sample||0));
+  const maxK=Math.max(1,...points.map(p=>+p.skill||0));
+  const maxD=Math.max(1,...points.map(p=>+p.delta_s||0));
+  const x=s=>padL+iw*((+s||0)/maxS), y=k=>padT+ih*(1-(+k||0)/maxK);
+  const dots=points.map(p=>{
+    const r=4+6*((+p.delta_s||0)/maxD);
+    const col=p.followable?VIZ.good:VIZ.neutral;
+    const low=(+p.sample||0)<5;
+    const tip=`${(p.actor_id||'').slice(0,10)}… skill ${p.skill} · sample ${p.sample} · δ ${p.delta_s==null?'—':p.delta_s+'s'} · ${p.followable?'followable':'real but UNFOLLOWABLE'}${low?' · LOW SAMPLE (uncertain)':''}`;
+    return `<circle cx="${x(p.sample).toFixed(1)}" cy="${y(p.skill).toFixed(1)}" r="${r.toFixed(1)}" fill="${col}" fill-opacity="${low?0.3:0.7}" stroke="${low?VIZ.risk:col}" stroke-dasharray="${low?'2 2':'0'}"><title>${esc(tip)}</title></circle>`;
+  }).join('');
+  const axes=`<line x1="${padL}" y1="${padT+ih}" x2="${W-padR}" y2="${padT+ih}" stroke="${VIZ.line}"/>` +
+    `<line x1="${padL}" y1="${padT}" x2="${padL}" y2="${padT+ih}" stroke="${VIZ.line}"/>` +
+    `<text x="${padL}" y="${H-4}" fill="${VIZ.muted}" font-size="9">sample size (closed trades) →</text>` +
+    `<text x="6" y="${padT+8}" fill="${VIZ.muted}" font-size="9">skill ↑</text>`;
+  return `<svg viewBox="0 0 ${W} ${H}" width="100%" style="max-height:230px" role="img" aria-label="actor skill vs sample-size vs latency-delta">${axes}${dots}</svg>`;
+}
+
+// One-hop funder cluster — funder node + early-buyer leaves; the ∅ group is
+// wallets with no shared funder post stop-list (cut / terminal), drawn dashed.
+function vizCluster(buyers){
+  buyers = (buyers||[]);
+  if(!buyers.length) return vizEmpty('no early-buyer cluster captured');
+  const groups={};
+  buyers.forEach(b=>{ const f=b.funder||'∅'; (groups[f]=groups[f]||[]).push(b); });
+  const fs=Object.keys(groups);
+  const W=640, rowH=120, H=Math.max(rowH, rowH*fs.length);
+  let svg='';
+  fs.forEach((f,gi)=>{
+    const cy=rowH*gi+rowH/2, cx=120, cut=(f==='∅'), fcol=cut?VIZ.muted:VIZ.ink;
+    const leaves=groups[f];
+    leaves.forEach((b,i)=>{
+      const t=leaves.length===1?0.5:i/(leaves.length-1);
+      const ang=(-0.6+1.2*t)*Math.PI/2;
+      const lx=cx+170*Math.cos(ang)+70, ly=cy+70*Math.sin(ang);
+      svg+=`<line x1="${cx}" y1="${cy}" x2="${lx.toFixed(1)}" y2="${ly.toFixed(1)}" stroke="${VIZ.line}" stroke-dasharray="${cut?'3 3':'0'}"/>`;
+      svg+=`<circle cx="${lx.toFixed(1)}" cy="${ly.toFixed(1)}" r="6" fill="${VIZ.muted}"><title>buyer ${esc((b.wallet||'').slice(0,14))}…</title></circle>`;
+    });
+    svg+=`<circle cx="${cx}" cy="${cy}" r="14" fill="${fcol}"><title>${cut?'no shared funder (stop-listed / cut)':'funder '+esc(f)}</title></circle>`;
+    svg+=`<text x="${cx}" y="${cy+30}" text-anchor="middle" fill="${VIZ.muted}" font-size="9">${cut?'cut / terminal':esc(f.slice(0,8))+'…'}</text>`;
+  });
+  return `<svg viewBox="0 0 ${W} ${H}" width="100%" style="max-height:${Math.min(380,H)}px" role="img" aria-label="one-hop funder cluster">${svg}</svg>`;
+}
+
+function walletflowVizHtml(){
+  const v=walletflowViz;
+  if(v==null) return `<div class="muted">loading charts…</div>`;
+  const gap = v.best_effort
+    ? `<div class="tag warn" title="public RPC is lossy; flow history is incomplete">data: best-effort (public RPC), ${v.gaps_24h||0} gap${(v.gaps_24h||0)===1?'':'s'}/24h</div>` : ``;
+  const c = (v.provenance||{}).counts || {};
+  const provRows=[
+    {label:'confirmed', value:c.confirmed||0, color:VIZ.good,    display:c.confirmed||0},
+    {label:'manual',    value:c.manual||0,    color:VIZ.good,    display:c.manual||0},
+    {label:'candidate', value:c.candidate||0, color:VIZ.neutral, display:c.candidate||0},
+    {label:'rejected',  value:c.rejected||0,  color:VIZ.muted,   display:c.rejected||0},
+  ];
+  const expSoon=(v.provenance||{}).expiring_soon||0;
+  return gap +
+    `<h2 class="dim">Net exchange flow over time — inflow = pre-sell tell, outflow = accumulation</h2>` +
+    `<div class="vizlegend"><span><i style="background:${VIZ.risk}"></i>net inflow (to exchange)</span>` +
+      `<span><i style="background:${VIZ.good}"></i>net outflow (withdrawal)</span></div>` +
+    vizFlowChart(v.series) +
+    `<h2 class="dim" style="margin-top:10px">Watchlist provenance</h2>` +
+    vizBarsH(provRows,{empty:'no watchlist entries'}) +
+    (expSoon ? `<div class="tag warn" style="margin-top:4px">${expSoon} confirmed wallet${expSoon===1?'':'s'} with trust expiring soon</div>` : ``) +
+    `<div class="muted" style="font-size:11px;margin-top:6px">On-demand REST reads, never pushed. Flow is SUGGESTIVE, never confirmed intent.</div>`;
+}
+
+function copytradeVizHtml(){
+  const v=copytradeViz;
+  if(v==null) return `<div class="muted">loading charts…</div>`;
+  const den=v.denominator||{};
+  const reasonRows=Object.entries(den.rejection_reasons||{})
+    .map(([r,n])=>({label:r, value:n, color:VIZ.muted, display:n}));
+  const popRows=[{label:'surfaced', value:den.surfaced||0, color:VIZ.good, display:den.surfaced||0}]
+    .concat(reasonRows);
+  return `<h2 class="dim">Skill vs sample-size vs latency-δ — luck looks uncertain by design</h2>` +
+    `<div class="vizlegend"><span><i style="background:${VIZ.good}"></i>followable</span>` +
+      `<span><i style="background:${VIZ.neutral}"></i>real but unfollowable</span>` +
+      `<span><i class="ring"></i>low sample (uncertain)</span>` +
+      `<span>● size = latency-δ</span></div>` +
+    vizScatter(v.points) +
+    `<h2 class="dim" style="margin-top:10px">The denominator — evaluated ${den.evaluated||0} · surfaced ${den.surfaced||0} · rejected ${den.rejected||0}</h2>` +
+    `<div class="muted" style="font-size:11px;margin-bottom:4px">A population view, not a winners reel — skill is read off the FULL evaluated set.</div>` +
+    vizBarsH(popRows,{empty:'nothing evaluated yet'});
+}
+
+function memeReplayHtml(health){
+  const test = ((health&&health.replay)||{}).test || {};
+  const has = ['true_positive_rate','false_positive_rate','coverage'].some(k=>test[k]!=null);
+  if(!has) return vizEmpty('replay not run yet (needs resolved launches)');
+  const pct=x=>x==null?'—':(100*x).toFixed(0)+'%';
+  const rows=[
+    {label:'true-positive (rugs flagged pre-T)', value:(test.true_positive_rate||0)*100, color:VIZ.good,    display:pct(test.true_positive_rate)},
+    {label:'false-positive (survivors flagged)', value:(test.false_positive_rate||0)*100, color:VIZ.risk,    display:pct(test.false_positive_rate)},
+    {label:'coverage (rugs eligible to catch)',  value:(test.coverage||0)*100,            color:VIZ.neutral, display:pct(test.coverage)},
+  ];
+  return vizBarsH(rows) +
+    `<div class="muted" style="font-size:11px;margin-top:2px">Held-out TEST set (${test.n||0} launches, ${test.n_rugs||0} rugs) — threshold tuning never touches it.</div>`;
+}
+
+function memeDrillHtml(data){
+  const evid=(data.cluster||[]).map(rr=>{
+    const conf=rr.confidence||'none';
+    return `<div class="card" style="margin:6px 0;padding:8px">` +
+      `<div><b title="${esc(rr.funder||'')}">${esc((rr.funder||'').slice(0,10))}…</b> ` +
+      `rug-rate <b>${rr.rate==null?'—':(+rr.rate).toFixed(2)}</b></div>` +
+      `<div class="dim" style="font-size:11px">resolved <b>${rr.resolved_sample||0}</b> · ` +
+      `censored <b>${rr.censored||0}</b> (excluded from denominator, NOT counted non-rug) · ` +
+      `hard ${rr.hard_rugs||0} / soft ${rr.soft_rugs||0} · confidence ${esc(conf)}` +
+      `${conf==='soft'?' <span class="tag warn">soft only — gameable floors</span>':''}</div></div>`;
+  }).join('') || vizEmpty('no funder rug-rate evidence');
+  return vizCluster(data.buyers||[]) +
+    `<h2 class="dim" style="margin-top:8px">Per-funder rug-rate — resolved vs censored + hard/soft (as prominent as the rate)</h2>` +
+    evid;
+}
+
+function memeVizHtml(state){
+  const v=memeViz;
+  if(v==null) return `<div class="muted">loading charts…</div>`;
+  const banner=`<div class="tag warn" title="sampling under-catches the fastest rug-and-die launches">` +
+    `sampling MISSES the fastest rugs — rug-rates run LIGHT on fast rugs. NO-SIGNAL ≠ safe.</div>`;
+  let drill;
+  if(memeDrill==null) drill=`<div class="muted" style="font-size:11px">Select a decision below to inspect its one-hop funder cluster + as-of rug-rate.</div>`;
+  else if(memeDrill.data==null) drill=`<div class="muted">loading cluster…</div>`;
+  else drill=memeDrillHtml(memeDrill.data);
+  const ds=((state||{}).meme||{}).decisions || [];
+  const list = ds.length
+    ? ds.map(d=>{
+        const avoid=d.decision==='avoid';
+        return `<button class="memeDrill ${avoid?'av':''}" data-mint="${esc(d.launch_mint)}">` +
+          `${avoid?'AVOID':'NO-SIGNAL'} · ${esc((d.launch_mint||'').slice(0,8))}…</button>`;
+      }).join('')
+    : `<span class="muted">no decisions to inspect yet</span>`;
+  return banner +
+    `<h2 class="dim" style="margin-top:8px">Replay — TP / FP / coverage (held-out set)</h2>` +
+    memeReplayHtml(v.health) +
+    `<h2 class="dim" style="margin-top:10px">Funder-cluster drill-in (one hop, on-demand)</h2>` +
+    `<div class="vizchips">${list}</div>` +
+    `<div style="margin-top:8px">${drill}</div>`;
+}
+
+// Collapsed-by-default drawer appended to each observer panel. Open state +
+// fetched data survive the 2Hz re-render via module-level vars (same convention
+// as the opportunity notes feed). Charts are fetched once, lazily, on open.
+function observerVizDrawer(tab){
+  const open=observerVizOpen[tab];
+  const btn=`<button class="viztoggle" data-viztab="${tab}">${open?'▾ Hide charts':'▸ Visualizations'}</button>`;
+  if(!open) return `<div class="vizdrawer">${btn}</div>`;
+  const body = tab==='walletflow' ? walletflowVizHtml()
+             : tab==='copytrade'  ? copytradeVizHtml()
+             :                      memeVizHtml(STATE||{});
+  return `<div class="vizdrawer">${btn}<div style="margin-top:8px">${body}</div></div>`;
+}
+
+async function fetchObserverViz(tab){
+  try{
+    if(tab==='walletflow'){
+      const d=await (await fetch('/api/walletflow/viz/flow_series')).json();
+      walletflowViz=(d&&d.ok)?d:{};
+    }else if(tab==='copytrade'){
+      const d=await (await fetch('/api/copytrade/viz/skill')).json();
+      copytradeViz=(d&&d.ok)?d:{};
+    }else{
+      const d=await (await fetch('/api/meme/health')).json();
+      memeViz={health:(d&&d.ok)?d:{}};
+    }
+  }catch(e){
+    if(tab==='walletflow') walletflowViz={};
+    else if(tab==='copytrade') copytradeViz={};
+    else memeViz={health:{}};
+  }
+}
+
+function bindObserverViz(){
+  document.querySelectorAll('.viztoggle').forEach(b=>{
+    b.onclick=async ()=>{
+      const tab=b.dataset.viztab;
+      observerVizOpen[tab]=!observerVizOpen[tab];
+      if(observerVizOpen[tab]) await fetchObserverViz(tab);   // lazy-load on open
+      if(STATE&&STATE.ts) updateUI(STATE);
+    };
+  });
+  document.querySelectorAll('.memeDrill').forEach(b=>{
+    b.onclick=async ()=>{
+      const mint=b.dataset.mint;
+      memeDrill={mint, data:null};
+      if(STATE&&STATE.ts) updateUI(STATE);
+      try{
+        const d=await (await fetch('/api/meme/launch/'+encodeURIComponent(mint))).json();
+        memeDrill={mint, data:(d&&d.ok)?d:{}};
+      }catch(e){ memeDrill={mint, data:{}}; }
+      if(STATE&&STATE.ts) updateUI(STATE);
+    };
+  });
 }
 
 function followDetailHtml(state){
@@ -2153,7 +2443,7 @@ function renderAgentDetail(state, id){
   if(id === "opportunity_scanner") bindOppNotesFilters();
   // Wallet-flow candidate-review queue is an on-demand pull + button wireup,
   // (re)bound right after this render (same convention as the opp notes feed).
-  if(id === "follow") bindWalletflowReview();
+  if(id === "follow"){ bindWalletflowReview(); bindObserverViz(); }
 }
 
 function signalDetailHtml(state){

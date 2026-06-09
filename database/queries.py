@@ -3074,6 +3074,27 @@ def get_watchlist_by_provenance(provenance: str) -> list[dict]:
         return [_wallet_watchlist_to_dict(r) for r in rows]
 
 
+def get_watchlist_provenance_counts(expiry_soon_h: int = 24) -> dict:
+    """Read-side aggregation for the wallet-flow viz layer: watchlist rows
+    grouped by provenance state (candidate|confirmed|manual|rejected), plus a
+    count of CONFIRMED entries whose trust expires within `expiry_soon_h`.
+    Derived on demand from wallet_watchlist — no new table, never stored. The
+    provenance state-machine itself lives in follow/provenance.py; this only
+    counts it for display."""
+    counts = {"candidate": 0, "confirmed": 0, "manual": 0, "rejected": 0}
+    expiring_soon = 0
+    soon = datetime.utcnow() + timedelta(hours=int(expiry_soon_h))
+    with get_session() as s:
+        rows = s.query(WalletWatchlist).all()
+        for r in rows:
+            counts[r.provenance] = counts.get(r.provenance, 0) + 1
+            if (r.provenance == "confirmed" and r.expires_at is not None
+                    and r.expires_at <= soon):
+                expiring_soon += 1
+    return {"counts": counts, "expiring_soon": expiring_soon,
+            "total": sum(counts.values())}
+
+
 def get_signal_eligible_wallets() -> set[str]:
     """Addresses the watcher may emit/act on — ONLY manual + confirmed.
     Candidate and rejected wallets are excluded (the HARD INVARIANT)."""
@@ -3253,6 +3274,55 @@ def get_wallet_net_flows(windows_h: list[int]) -> list[dict]:
                     "events":      a["events"],
                 })
     return out
+
+
+def get_wallet_flow_series(buckets: int = 24, window_h: int = 24,
+                           scan_limit: int = 500) -> dict:
+    """Read-side aggregation for the wallet-flow viz layer: exchange inflow vs
+    outflow bucketed into `buckets` equal time slices over the last `window_h`
+    hours (newest `scan_limit` events scanned). inflow = transfer_in to a
+    labelled venue (pre-sell tell); outflow = withdrawal (accumulation tell);
+    net = inflow − outflow. Derived on demand from wallet_flow_events — no new
+    table, never pushed in the snapshot. Empty-safe (returns zeroed buckets)."""
+    buckets = max(1, int(buckets))
+    now = datetime.utcnow()
+    start = now - timedelta(hours=int(window_h))
+    span_s = max(1.0, (now - start).total_seconds())
+    width_s = span_s / buckets
+    series = [{"inflow_usd": 0.0, "outflow_usd": 0.0, "net_usd": 0.0,
+               "events": 0} for _ in range(buckets)]
+    with get_session() as s:
+        rows = (s.query(WalletFlowEvent)
+                .filter(WalletFlowEvent.occurred_at >= start)
+                .filter(WalletFlowEvent.action.in_(("transfer_in", "transfer_out")))
+                .order_by(desc(WalletFlowEvent.occurred_at))
+                .limit(int(scan_limit)).all())
+        for r in rows:
+            if r.occurred_at is None:
+                continue
+            idx = int((r.occurred_at - start).total_seconds() // width_s)
+            idx = min(buckets - 1, max(0, idx))
+            usd = float(r.size_usd or 0.0)
+            b = series[idx]
+            if r.action == "transfer_in":
+                b["inflow_usd"] += usd
+            else:
+                b["outflow_usd"] += usd
+            b["events"] += 1
+    out = []
+    for i, b in enumerate(series):
+        t = start + timedelta(seconds=width_s * (i + 0.5))
+        net = b["inflow_usd"] - b["outflow_usd"]
+        out.append({
+            "t":           t.isoformat(),
+            "inflow_usd":  round(b["inflow_usd"], 2),
+            "outflow_usd": round(b["outflow_usd"], 2),
+            "net_usd":     round(net, 2),
+            "events":      b["events"],
+        })
+    total_events = sum(b["events"] for b in series)
+    return {"window_h": int(window_h), "buckets": out,
+            "n_events": total_events}
 
 
 # ── Discovery candidates ─────────────────────────────────────────────────────
