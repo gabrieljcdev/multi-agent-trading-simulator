@@ -229,6 +229,9 @@ class CryptoBot:
         # _position_watcher_loop and _future_price_tracker_loop keep
         # running so open trades still get SL/TP/trailing exits.
         self._manually_halted: bool = False
+        # Coordinator exposure gate, mirrored from SignalAgentWrapper the same
+        # way as _manually_halted. _cycle short-circuits on either flag.
+        self._entries_blocked: bool = False
 
         # Wire SignalEngine callback to our handler
         self._signal_engine.on_signal(self._on_signal)
@@ -481,6 +484,9 @@ class CryptoBot:
         # future-price tracker run on their own loops and keep firing exits.
         if self._manually_halted:
             logger.debug("Manually halted — cycle skipped")
+            return
+        if self._entries_blocked:
+            logger.debug("Entries blocked (exposure cap) — cycle skipped")
             return
         self._cb_state.reset_if_new_day()
 

@@ -302,6 +302,8 @@ class CrossChainArbEngine:
         # loop skips evaluation passes while set. Observation mode means
         # there are no positions to manage — halt affects evaluation only.
         self._manually_halted: bool = False
+        # Coordinator exposure gate, mirrored from CrossChainArbAgent.
+        self._entries_blocked: bool = False
 
     # ── Public API ──────────────────────────────────────────────────────
 
@@ -410,7 +412,7 @@ class CrossChainArbEngine:
                 # Web UI v3.1 — operator halt skips per-symbol evaluation.
                 # No positions to manage in observation mode, so the whole
                 # scan body is the entry / evaluation path.
-                if self._manually_halted:
+                if self._manually_halted or self._entries_blocked:
                     await asyncio.sleep(interval)
                     continue
 

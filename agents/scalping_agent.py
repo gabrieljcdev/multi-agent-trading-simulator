@@ -1313,7 +1313,8 @@ class ScalpingAgent(BaseAgent):
         # Web UI v3.1: operator-initiated halt skips new entries silently.
         # _manage_position is on a separate path (driven by self._loop) and
         # keeps running so SL/TP/exit logic still fires for open positions.
-        if self._manually_halted:
+        # entries_blocked also covers the coordinator's exposure gate.
+        if self.entries_blocked:
             return
         approved = self._approved_scalp_exchanges()
         now = time.time()

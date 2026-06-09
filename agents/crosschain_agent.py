@@ -165,6 +165,11 @@ class CrossChainArbAgent(BaseAgent):
                 logger.debug("CrossChainArbAgent resume_manual propagate: %s", e)
         return state
 
+    def _propagate_entries_blocked(self, blocked: bool) -> None:
+        # Mirror the coordinator's exposure gate into the cross-chain engine.
+        if self._engine is not None:
+            self._engine._entries_blocked = bool(blocked)
+
     def clear_circuit_breakers(self) -> None:
         """Resume operator-override: zero engine.cb so the next scan tick
         evaluates clean. Status flips back to RUNNING so the dashboard

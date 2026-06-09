@@ -305,7 +305,7 @@ class FundingArbAgent(BaseAgent):
         FUNDING_MIN_APR floor, depth ok, symbol not already held. Bounded
         by FUNDING_MAX_CONCURRENT open positions and the remaining margin
         budget (FUNDING_SIM_CAPITAL_USD − margin in use)."""
-        if self._halted or self._manually_halted:
+        if self._halted or self.entries_blocked:
             return
         floor = float(settings.FUNDING_MIN_APR)
         budget = float(settings.FUNDING_SIM_CAPITAL_USD)

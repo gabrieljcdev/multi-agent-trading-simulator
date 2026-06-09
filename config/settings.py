@@ -1286,6 +1286,12 @@ XCHAIN_RPC_ENV_VARS = {
 PORTFOLIO_DAILY_LOSS_HALT_PCT  = 3.0     # test: 2.0–5.0
 PORTFOLIO_MAX_EXPOSURE_PCT     = 80.0    # test: 60–95
 PORTFOLIO_MONITOR_INTERVAL_SEC = 30      # test: 15–120
+# Per-fund deployment cap: an agent stops opening NEW entries once its open-
+# position notional reaches this % of its own allocation (exits/management keep
+# running). Enforced by Coordinator._enforce_exposure via the agents' shared
+# _entries_blocked gate — the "block_new_entries" hook the exposure CB needed.
+# 100 = a fund may deploy up to its full allocation but no further.
+FUND_MAX_EXPOSURE_PCT          = 100.0   # test: 80, 100, 120
 
 # Kill switch
 KILL_SWITCH_CONFIRM_REQUIRED = False     # set True in live mode for safety

@@ -87,6 +87,11 @@ class BaseAgent(ABC):
         # management paths keep running so open positions stay tracked.
         # In-memory only; resets to False on restart.
         self._manually_halted: bool       = False
+        # Coordinator-driven exposure gate (Coordinator._enforce_exposure).
+        # Like _manually_halted, flipping this skips entry-creation paths only
+        # while exits/management keep running — but it's owned by the portfolio
+        # / per-fund exposure CB, not the operator. In-memory; resets on restart.
+        self._entries_blocked: bool       = False
 
     # ── Public API ──────────────────────────────────────────────────────
 
@@ -215,6 +220,39 @@ class BaseAgent(ABC):
     @property
     def manually_halted(self) -> bool:
         return self._manually_halted
+
+    # ── Exposure gate (Coordinator-driven) — do not override; override the
+    # _propagate hook instead to push the flag into a wrapped bot/engine ──
+
+    def set_entries_blocked(self, blocked: bool, reason: str = "") -> None:
+        """Block / unblock NEW entries for this agent (exits keep running).
+        Called by Coordinator._enforce_exposure when the portfolio or this
+        fund is over-exposed. Logs only on transition; never raises."""
+        blocked = bool(blocked)
+        if blocked == self._entries_blocked:
+            return
+        self._entries_blocked = blocked
+        try:
+            self._propagate_entries_blocked(blocked)
+        except Exception as e:
+            logger.debug("propagate_entries_blocked failed for %s: %s",
+                         getattr(self, "agent_id", "?"), e)
+        logger.info("%s: entries %s%s", getattr(self, "agent_id", "?"),
+                    "BLOCKED — over exposure cap" if blocked else "unblocked",
+                    f" ({reason})" if reason and blocked else "")
+
+    def _propagate_entries_blocked(self, blocked: bool) -> None:
+        """Hook for wrappers to mirror the flag into a wrapped bot/engine
+        (parallel to how halt_manual is mirrored). No-op default — agents that
+        run their own entry loop check self._entries_blocked directly."""
+        pass
+
+    @property
+    def entries_blocked(self) -> bool:
+        """True when new entries must be skipped — operator halt OR the
+        coordinator's exposure gate. The single check an entry path should
+        consult."""
+        return self._manually_halted or self._entries_blocked
 
     # ── Standard lifecycle — do not override ────────────────────────────
 

@@ -241,6 +241,8 @@ class ArbEngine:
         # loop skips opportunity discovery while set. Arb has no standing
         # positions to manage — the flag affects entry only.
         self._manually_halted: bool = False
+        # Coordinator exposure gate, mirrored from ArbAgentWrapper.
+        self._entries_blocked: bool = False
 
     # ── Public API ──────────────────────────────────────────────────────
 
@@ -330,7 +332,7 @@ class ArbEngine:
                 # Web UI v3.1 — operator halt skips opportunity discovery.
                 # No standing positions to manage on the arb fund, so the
                 # whole loop body is the entry path.
-                if self._manually_halted:
+                if self._manually_halted or self._entries_blocked:
                     await asyncio.sleep(interval)
                     continue
                 if self._active_arbs >= settings.ARB_MAX_CONCURRENT:

@@ -155,6 +155,12 @@ class SignalAgentWrapper(BaseAgent):
                 logger.debug("SignalAgent resume_manual propagate: %s", e)
         return state
 
+    def _propagate_entries_blocked(self, blocked: bool) -> None:
+        # Mirror the coordinator's exposure gate into the bot, same way as
+        # _manually_halted. _cycle short-circuits on it.
+        if self._bot is not None:
+            self._bot._entries_blocked = bool(blocked)
+
     def clear_circuit_breakers(self) -> None:
         """Resume operator-override: wipe the bot's CB halt + the
         counters that drive it. The peak-equity baseline is also reset
@@ -399,6 +405,12 @@ class ArbAgentWrapper(BaseAgent):
             except Exception as e:
                 logger.debug("ArbAgent resume_manual propagate: %s", e)
         return state
+
+    def _propagate_entries_blocked(self, blocked: bool) -> None:
+        # Mirror the coordinator's exposure gate into the arb engine, same way
+        # as _manually_halted. The engine's scan loop skips opens on it.
+        if self._engine is not None:
+            self._engine._entries_blocked = bool(blocked)
 
     def clear_circuit_breakers(self) -> None:
         """Resume operator-override: zero the daily-loss + consecutive-loss

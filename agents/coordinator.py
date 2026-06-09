@@ -293,6 +293,9 @@ class Coordinator:
                 # portfolio-wide backstop (global emergency halt).
                 await self._check_fund_circuit_breakers(agent_stats)
                 await self._check_portfolio_circuit_breakers(stats)
+                # Exposure gate: block new entries (exits keep running) for any
+                # fund / the whole book that is over its deployment cap.
+                self._enforce_exposure(agent_stats, stats)
             except Exception as e:
                 logger.error(f"portfolio monitor: {e}", exc_info=True)
 
@@ -341,17 +344,47 @@ class Coordinator:
                     return_exceptions=True,
                 )
 
-        # Exposure CB is a soft block; per-agent entry gating isn't
-        # universal yet (CryptoBot doesn't check it). Log it and bump
-        # status to WARNING via get_portfolio_stats. The block_new_entries
-        # enforcement is a TODO once agents grow that hook.
-        exp = stats.get("total_exposure_pct", 0.0)
-        if exp >= settings.PORTFOLIO_MAX_EXPOSURE_PCT:
-            logger.warning(
-                f"Portfolio exposure {exp:.1f}% >= "
-                f"{settings.PORTFOLIO_MAX_EXPOSURE_PCT}% — "
-                "block_new_entries enforcement not yet wired into agents"
-            )
+        # NOTE: exposure is no longer a log-only soft block — it is enforced
+        # per-fund + portfolio-wide by _enforce_exposure() (called right after
+        # this in the monitor loop), which blocks new entries while exits keep
+        # running. The daily-loss halt above remains the hard global stop.
+
+    def _enforce_exposure(self, agent_stats: list[AgentStats],
+                          stats: dict) -> None:
+        """Block / unblock NEW entries per agent based on deployment exposure
+        (exits + management keep running — this is the 'block_new_entries' hook
+        the exposure CB always needed). Two gates:
+
+          • portfolio-wide: total exposure >= PORTFOLIO_MAX_EXPOSURE_PCT blocks
+            every agent (the whole book is over-deployed);
+          • per-fund: an agent whose own deployed notional reaches
+            FUND_MAX_EXPOSURE_PCT of its allocation blocks only itself.
+
+        Idempotent and transition-logged via BaseAgent.set_entries_blocked;
+        a recovered agent (exposure back under the cap) is unblocked
+        automatically. Never raises — one bad agent can't stall the loop."""
+        port_exp = float(stats.get("total_exposure_pct", 0.0) or 0.0)
+        port_cap = float(getattr(settings, "PORTFOLIO_MAX_EXPOSURE_PCT", 80.0))
+        fund_cap = float(getattr(settings, "FUND_MAX_EXPOSURE_PCT", 100.0))
+        portfolio_over = port_exp >= port_cap
+        for s in agent_stats:
+            agent = self.get_agent(s.agent_id)
+            if agent is None:
+                continue
+            alloc = float(getattr(s, "capital_allocated", 0.0) or 0.0)
+            deployed = float(getattr(s, "capital_deployed", 0.0) or 0.0)
+            fund_exp = (deployed / alloc * 100.0) if alloc > 0 else 0.0
+            fund_over = alloc > 0 and fund_exp >= fund_cap
+            blocked = portfolio_over or fund_over
+            reason = (f"portfolio {port_exp:.0f}% >= {port_cap:.0f}%"
+                      if portfolio_over else
+                      f"fund {fund_exp:.0f}% >= {fund_cap:.0f}% "
+                      f"(${deployed:,.0f}/${alloc:,.0f})")
+            try:
+                agent.set_entries_blocked(blocked, reason)
+            except Exception as e:
+                logger.debug("set_entries_blocked(%s) failed: %s",
+                             s.agent_id, e)
 
     # ── Safe wrappers — one bad agent must not crash the coordinator ───
 
