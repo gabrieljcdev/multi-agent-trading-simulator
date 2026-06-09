@@ -536,6 +536,13 @@ COPYTRADE_RPC_MAX_RPS = 4                        # test: [2, 4, 8]   Drift (Sola
 MEME_ENABLED = True
 MEME_LAUNCH_POLL_S = 30                  # test: [15, 30, 60]   sampling cadence
 MEME_EARLY_BUYER_WINDOW_S = 300          # how long after detect counts as "early"; test:[120,300,600]
+# Live early-buyer derivation (MemeScorer._derive_buyer_funders) — bounds the
+# per-mint RPC crawl: how many of the mint's newest signatures to scan, and the
+# cap on early buyers derived per launch (each buyer costs one funder crawl).
+# Best-effort: the free public RPC under-serves this, so it catches SOME early
+# buyers, never guaranteed all — surfaced as a gap, never as completeness.
+MEME_BUYER_MAX_SIGNATURES = 60           # test:[30,60,120]  newest mint txns scanned per launch
+MEME_BUYER_MAX_PER_LAUNCH = 12           # test:[5,12,25]    cap on early buyers derived per launch
 MEME_MATURATION_HORIZON_H = 24           # survival cutoff DEFAULT; calibration may override; test:[12,24,48]
 MEME_SLOWDEATH_WINDOW_H = 6              # sustained-floor window; test:[3,6,12]
 MEME_LIQ_FLOOR_USD = 1000                # test:[500,1000,2000]

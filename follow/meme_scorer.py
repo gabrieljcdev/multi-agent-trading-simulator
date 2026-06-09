@@ -645,13 +645,64 @@ class MemeScorer(BaseStreamingDataSource):
 
     async def _derive_buyer_funders(self, launch: Launch
                                     ) -> dict[str, Optional[str]]:
-        """Best-effort early-buyer -> funder map for a launch. v1 leaves the
-        early-buyer discovery as a documented sampling gap (deriving buyers needs
-        per-mint token-transfer crawling the public RPC under-serves); the
-        clustering + scoring path is fully wired and exercised via process_launch's
-        injected map. Returns {} when no buyers are derivable — surfaced as a gap,
-        never as 'no cluster found = clean'."""
-        return {}
+        """Best-effort early-buyer -> funder map for a launch, crawled live off
+        the rate-limited public RPC. Two hops, both throttled by the shared
+        limiter (a slow background crawl is acceptable for a $0 observer):
+
+          1. the mint's newest signatures (for a freshly-sampled launch these ARE
+             the early activity) → keep buys inside MEME_EARLY_BUYER_WINDOW_S,
+             excluding the create itself and the creator;
+          2. each unique buyer's first funder (the rug-rate-bearing identity),
+             stop-listed via cluster_funder so terminal-funded wallets drop out.
+
+        Bounded by MEME_BUYER_MAX_SIGNATURES / MEME_BUYER_MAX_PER_LAUNCH. Returns
+        {} (a documented gap, never 'no cluster = clean') on any failure — the
+        public RPC under-serves per-mint crawling, so this catches SOME early
+        buyers, never guaranteed all. Never raises out."""
+        rpc = self._rpc
+        if rpc is None or not launch.mint:
+            return {}
+        window_s = float(getattr(settings, "MEME_EARLY_BUYER_WINDOW_S", 300) or 300)
+        max_sigs = int(getattr(settings, "MEME_BUYER_MAX_SIGNATURES", 60) or 60)
+        max_buyers = int(getattr(settings, "MEME_BUYER_MAX_PER_LAUNCH", 12) or 12)
+        detected = float(launch.detected_at or time.time())
+        try:
+            sigs = await rpc.get_signatures_for_address(launch.mint, limit=max_sigs)
+        except Exception as e:
+            logger.debug("meme: get_signatures(%s) failed: %s", launch.mint, e)
+            return {}
+        # Oldest-first within the fetched window so we take the EARLIEST buyers.
+        sigs = sorted((s for s in (sigs or []) if isinstance(s, dict)),
+                      key=lambda s: s.get("blockTime") or 0)
+        buyers: dict[str, Optional[str]] = {}
+        for s in sigs:
+            if len(buyers) >= max_buyers:
+                break
+            if s.get("err"):                          # failed tx — not a real buy
+                continue
+            bt = s.get("blockTime")
+            if bt is not None and (float(bt) - detected) > window_s:
+                continue                              # past the early window
+            sig = s.get("signature")
+            if not sig:
+                continue
+            try:
+                tx = await rpc.get_transaction(sig)
+            except Exception as e:
+                logger.debug("meme: get_transaction(%s) failed: %s", sig, e)
+                continue
+            buyer = sol_parse.early_buyer(tx, launch.mint)
+            if not buyer or buyer == launch.creator or buyer in buyers:
+                continue
+            buyers[buyer] = None                      # funder resolved below
+        # Hop 2 — each unique buyer's first funder (cached + stop-listed).
+        for wallet in list(buyers.keys()):
+            try:
+                buyers[wallet] = await cluster_funder(wallet, rpc)
+            except Exception as e:
+                logger.debug("meme: cluster_funder(%s) failed: %s", wallet, e)
+                buyers[wallet] = None
+        return buyers
 
     # ── Stats (for the snapshot) ────────────────────────────────────────────
 

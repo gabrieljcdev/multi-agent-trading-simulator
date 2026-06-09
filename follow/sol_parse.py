@@ -297,6 +297,26 @@ def _mint_initialized(tx: dict) -> Optional[str]:
     return None
 
 
+def early_buyer(tx: dict, mint: str) -> Optional[str]:
+    """Best-effort: the wallet that BOUGHT `mint` in this tx — the fee payer of a
+    tx that moves the token, EXCLUDING the launchpad create itself (the mint
+    initialization is the creator, not a buyer). Returns None if the tx is the
+    create, doesn't touch `mint`, or is unparseable. PURE + tolerant (no network
+    / DB / clock) — the meme scorer's early-buyer derivation layers the funder
+    lookup on top of this. The fee payer is used (not the SPL destination, which
+    is a token account, not the owner wallet)."""
+    if not isinstance(tx, dict) or not mint:
+        return None
+    try:
+        if _mint_initialized(tx) == mint:
+            return None                              # the create tx, not a buy
+        if not any(t.get("mint") == mint for t in _spl_transfers(tx)):
+            return None                              # tx doesn't move this token
+        return _fee_payer(tx)
+    except Exception:
+        return None
+
+
 def launch_events(tx: dict, *, launchpads: Optional[list[str]] = None) -> list[dict]:
     """Decode a launchpad (pump.fun) create tx into new-launch records:
     {mint, creator, launchpad, signature}. PURE + tolerant — a malformed or
