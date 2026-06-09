@@ -434,7 +434,7 @@ OPPORTUNITY_PANEL_MAX_ROWS = 12               # test: 5-30   max rows per view i
 # and surfaces it for the operator. All thresholds live here; no magic numbers
 # in the follow/ modules.
 
-WALLETFLOW_ENABLED = False                  # default off — master enable for the observer
+WALLETFLOW_ENABLED = True                   # default off — master enable for the observer
 WALLETFLOW_HELIUS_KEY_ENV = "HELIUS_API_KEY"   # env var the Helius stream key is read from
 
 # Net-flow aggregation windows (hours) — rolling per-token, per-exchange inflow-outflow
@@ -493,7 +493,7 @@ WALLETFLOW_PARSE_LAUNCHPADS = ["pumpfun"]      # launchpad instruction formats p
 # latency usually eats leaderboard edges, so the realistic output is "this actor
 # is genuinely skilled" (corroboration), rarely "follow this trade now".
 
-COPYTRADE_ENABLED = False                        # default off — master enable for the observer
+COPYTRADE_ENABLED = True                         # default off — master enable for the observer
 COPYTRADE_VENUES = ["hyperliquid", "drift"]      # gmx/dydx stubbed behind the same seam, NOT active
 COPYTRADE_MIN_CLOSED_TRADES = 50                 # test: [30, 50, 75]   resolved closed trades below this -> NO-SIGNAL (fatal survival gate)
 COPYTRADE_MAX_FOLLOWABLE_DELTA_S = 60            # test: [30, 60, 120]  latency-δ past which an actor is "real but unfollowable"
@@ -524,7 +524,7 @@ COPYTRADE_RPC_MAX_RPS = 4                        # test: [2, 4, 8]   Drift (Sola
 # FASTEST rug-and-die launches (they live between polls), so live rug-rates run
 # LIGHT on fast rugs and the maturation window calibrates toward slower deaths —
 # documented in code + surfaced in the UI health layer (best-effort/gap flag).
-MEME_ENABLED = False
+MEME_ENABLED = True
 MEME_LAUNCH_POLL_S = 30                  # test: [15, 30, 60]   sampling cadence
 MEME_EARLY_BUYER_WINDOW_S = 300          # how long after detect counts as "early"; test:[120,300,600]
 MEME_MATURATION_HORIZON_H = 24           # survival cutoff DEFAULT; calibration may override; test:[12,24,48]
