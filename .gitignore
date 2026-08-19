@@ -5,6 +5,11 @@ env/
 
 # Secrets — keep the template, not the real keys
 config/keys.env
+config/keys.env.*
+*.backup
+
+# Prompt library (kept local, not published)
+prompts/
 
 # Local data
 data/
